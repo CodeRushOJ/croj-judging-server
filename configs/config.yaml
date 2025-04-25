@@ -1,0 +1,19 @@
+database:
+  host: localhost
+  port: 3306
+  user: admin
+  password: admin123
+  name: code_rush_oj
+
+rocketmq:
+  name-server: "localhost:9876"
+  topic: "submission_topic" # 需要明确指定 Topic
+  # producer:
+  #  group: submission-producer-group # 如果需要生产者，则取消注释
+  consumer:
+    group: submission-consumer-group
+
+zookeeper:
+  servers:
+    - "10.233.4.142:2181"
+  path: "/judges"        # 判题沙盒在 ZK 中的路径 
