@@ -38,70 +38,88 @@ func (s *JudgeService) ProcessTask(ctx context.Context, taskIDStr string) error 
 		return fmt.Errorf("invalid task ID format '%s': %w", taskIDStr, err)
 	}
 
-	// 1. 从数据库获取任务详情
-	task, err := s.db.GetTaskByID(taskID)
+	// 1. 从数据库获取 Submission 详情 (使用 taskID 作为 SubmissionID)
+	submission, err := s.db.GetSubmissionByID(taskID)
 	if err != nil {
-		return fmt.Errorf("failed to get task %d from db: %w", taskID, err)
+		// 如果获取 Submission 失败，记录错误并返回，以便 RocketMQ 重试
+		return fmt.Errorf("failed to get submission %d from db: %w", taskID, err)
 	}
-	if task == nil {
-		// 任务不存在，可能已经被处理或是一个无效 ID
-		fmt.Printf("Task %d not found, skipping processing.\n", taskID)
+	if submission == nil {
+		// Submission 不存在，可能已经被处理或是一个无效 ID
+		fmt.Printf("Submission %d not found, skipping processing.\n", taskID)
 		return nil // 返回 nil，避免 RocketMQ 重试
 	}
 
-	// 检查任务是否已经是最终状态，避免重复处理
-	if task.Status != model.StatusPending {
-		fmt.Printf("Task %d already processed or in progress (status: %d), skipping.\n", taskID, task.Status)
+	// 检查 Submission 是否已经是最终状态，避免重复处理
+	if submission.Status != model.StatusPending {
+		fmt.Printf("Submission %d already processed or in progress (status: %d), skipping.\n", taskID, submission.Status)
 		return nil // 返回 nil，避免 RocketMQ 重试
 	}
 
-	// (可选) 可以先更新任务状态为 "Judging" 或类似状态，但这需要数据库支持或特殊处理
-	// task.Status = model.StatusJudging // 假设有此状态
-	// if err := s.db.UpdateTask(task); err != nil {
-	// 	fmt.Printf("Warning: Failed to update task %d status to Judging: %v\n", taskID, err)
+	// (可选) 更新状态为 "Judging"
+	// submission.Status = model.StatusJudging
+	// if err := s.db.UpdateSubmission(submission); err != nil { // 假设有 UpdateSubmission 或调整 UpdateTask
+	// 	fmt.Printf("Warning: Failed to update submission %d status to Judging: %v\n", taskID, err)
 	// }
 
 	// 检查 context 是否已取消
 	select {
 	case <-ctx.Done():
-		fmt.Printf("Task %d processing cancelled.\n", taskID)
-		// 可以选择是否将状态更新为错误状态
-		// task.Status = model.StatusSystemError
-		// task.ErrorMessage = "Processing cancelled due to context" // 使用指针
-		// s.db.UpdateTask(task)
+		fmt.Printf("Submission %d processing cancelled.\n", taskID)
+		// 可选：更新状态为错误
+		// submission.Status = model.StatusSystemError
+		// errMsg := "Processing cancelled due to context"
+		// submission.ErrorMessage = &errMsg
+		// s.db.UpdateSubmission(submission) // 假设有 UpdateSubmission 或调整 UpdateTask
 		return ctx.Err()
 	default:
 		// 继续执行
 	}
 
-	// 2. 通过调度器选择一个判题沙盒 (如果需要与沙盒交互才需要)
-	// sandboxAddr, err := s.scheduler.SelectSandbox()
-	// if err != nil {
-	// 	task.Status = model.StatusSystemError
-	// 	errMsg := fmt.Sprintf("Failed to select sandbox: %v", err)
-	// 	task.ErrorMessage = &errMsg
-	// 	s.db.UpdateTask(task) // 尽力更新
-	// 	return fmt.Errorf("failed to select sandbox for task %d: %w", taskID, err)
-	// }
-	// fmt.Printf("Task %d would be dispatched to sandbox %s.\n", taskID, sandboxAddr)
+	// 2. 通过调度器选择判题沙盒等逻辑 (如果需要)
+	// ...
 
-	// 3. **测试：直接修改数据库状态为 Accepted**
-	fmt.Printf("Task %d: Simulating successful judge, updating status to Accepted.\n", taskID)
-	task.Status = model.StatusAccepted
-	// 可以设置一些模拟结果
+	// 3. **模拟判题过程，并更新 Submission 状态**
+	//    (实际应用中这里会调用沙盒进行判题)
+	fmt.Printf("Submission %d: Simulating successful judge, updating status to Accepted.\n", taskID)
+	submission.Status = model.StatusAccepted
 	simulatedTime := 123
 	simulatedMemory := 1024
-	task.RunTime = &simulatedTime
-	task.Memory = &simulatedMemory
+	submission.RunTime = &simulatedTime
+	submission.Memory = &simulatedMemory
 	judgeMsg := "Simulated Accepted"
-	task.JudgeInfo = &judgeMsg // 假设 JudgeInfo 存储简单消息
-	task.ErrorMessage = nil    // 清除之前的错误信息
+	submission.JudgeInfo = &judgeMsg
+	submission.ErrorMessage = nil
 
-	if err := s.db.UpdateTask(task); err != nil {
-		// 数据库更新失败是严重问题
-		return fmt.Errorf("failed to update task %d result in db: %w", taskID, err)
+	// 4. 在单个事务中更新 Submission 结果并处理 Problem Accepted Count
+	if err := s.db.UpdateSubmissionResultInTx(submission); err != nil {
+		// 事务失败，可能是数据库错误或逻辑问题 (如 problem 不存在)
+		// 记录严重错误，并返回错误以便 RocketMQ 重试（或者根据策略决定）
+		fmt.Printf("Critical: Failed to complete transaction for submission %d: %v\n", taskID, err)
+		return fmt.Errorf("transaction failed for submission %d: %w", taskID, err)
 	}
 
-	fmt.Printf("Task %d processed and updated to Accepted successfully.\n", taskID)
+	// 原来的更新逻辑已被合并到事务中
+	/*
+	// 更新 Submission 到数据库
+	// 重要：确保 UpdateTask 能正确更新 Submission 表，或者替换为 UpdateSubmission
+	if err := s.db.UpdateTask((*model.Task)(submission)); err != nil { // 注意这里的类型转换，如果 UpdateTask 参数是 *model.Task
+		// 如果 Task 和 Submission 结构兼容或 UpdateTask 内部处理了，可以这样转换
+		// 否则需要一个 UpdateSubmission 函数
+		return fmt.Errorf("failed to update submission %d result in db: %w", taskID, err)
+	}
+
+	// 4. 如果判题结果是 Accepted，增加对应 Problem 的 Accepted Count
+	if submission.Status == model.StatusAccepted {
+		if err := s.db.IncrementProblemAcceptedCount(submission.ProblemID);
+ err != nil {
+			// 记录错误，但不一定需要阻塞主流程或导致消息重试
+			// 因为主要判题流程已完成，这里是附属操作
+			fmt.Printf("Warning: Failed to increment accepted count for problem %d after successful submission %d: %v\n", submission.ProblemID, taskID, err)
+		}
+	}
+	*/
+
+	fmt.Printf("Submission %d processed and transaction committed successfully.\n", taskID)
 	return nil
 }
