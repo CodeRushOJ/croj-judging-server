@@ -6,8 +6,8 @@ database:
   name: code_rush_oj
 
 rocketmq:
-  name-server: "localhost:9876"
-  topic: "submission_topic" # 需要明确指定 Topic
+  name-server: "127.0.0.1:9876"
+  topic: "submission-topic" # 需要明确指定 Topic
   # producer:
   #  group: submission-producer-group # 如果需要生产者，则取消注释
   consumer:
