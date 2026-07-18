@@ -20,6 +20,7 @@ sandbox-discovery:
   service: croj-sandbox
   port-name: grpc
   refresh-interval: 5s
+  execute-timeout: 35s
   kubeconfig: ""
 `)
 	if err := os.WriteFile(path, contents, 0o600); err != nil {
@@ -29,6 +30,7 @@ sandbox-discovery:
 	t.Setenv("DATABASE_PORT", "3307")
 	t.Setenv("DATABASE_PASSWORD", "runtime-only")
 	t.Setenv("SANDBOX_SERVICE", "sandbox-workers")
+	t.Setenv("SANDBOX_EXECUTE_TIMEOUT", "40s")
 
 	config, err := LoadConfig(path)
 	if err != nil {
@@ -42,6 +44,9 @@ sandbox-discovery:
 	}
 	if config.SandboxDiscovery.Service != "sandbox-workers" {
 		t.Fatal("sandbox Service override not applied")
+	}
+	if config.SandboxDiscovery.ExecuteTimeout != "40s" {
+		t.Fatal("sandbox execute timeout override not applied")
 	}
 }
 

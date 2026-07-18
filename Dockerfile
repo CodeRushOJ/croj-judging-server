@@ -2,8 +2,9 @@
 FROM golang:1.26.3-bookworm AS build
 
 WORKDIR /src
+ARG GOPROXY=https://proxy.golang.org,direct
 COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod go mod download
+RUN --mount=type=cache,target=/go/pkg/mod GOPROXY="$GOPROXY" go mod download
 COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
