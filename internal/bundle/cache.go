@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 type Object struct {
@@ -65,6 +66,9 @@ func NewCache(directory string, maxBytes, maxObjectBytes int64, ttl time.Duratio
 	}
 	if err := os.Chmod(directory, 0o700); err != nil {
 		return nil, fmt.Errorf("protect bundle cache directory: %w", err)
+	}
+	if err := cleanupRestartOrphans(directory); err != nil {
+		return nil, err
 	}
 	return &Cache{
 		directory:      directory,
@@ -168,7 +172,8 @@ func (cache *Cache) resolveOne(ctx context.Context, metadata Metadata) (string, 
 }
 
 func (cache *Cache) validateMetadata(metadata Metadata) error {
-	if strings.TrimSpace(metadata.ObjectKey) == "" || metadata.SizeBytes <= 0 || metadata.SizeBytes > cache.maxObjectBytes || metadata.SizeBytes > cache.maxBytes {
+	if strings.TrimSpace(metadata.ObjectKey) == "" || len(metadata.ObjectKey) > 512 || strings.ContainsRune(metadata.ObjectKey, '\x00') || !utf8.ValidString(metadata.ObjectKey) ||
+		metadata.SizeBytes <= 0 || metadata.SizeBytes > cache.maxObjectBytes || metadata.SizeBytes > cache.maxBytes {
 		return fmt.Errorf("bundle metadata size or object key is invalid")
 	}
 	checksum, err := hex.DecodeString(metadata.SHA256)
@@ -176,6 +181,37 @@ func (cache *Cache) validateMetadata(metadata Metadata) error {
 		return fmt.Errorf("bundle metadata SHA-256 is invalid")
 	}
 	return nil
+}
+
+func cleanupRestartOrphans(directory string) error {
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return fmt.Errorf("scan bundle cache directory: %w", err)
+	}
+	for _, entry := range entries {
+		if !isKnownCacheName(entry.Name()) {
+			continue
+		}
+		if entry.IsDir() {
+			return fmt.Errorf("bundle cache entry %q is unexpectedly a directory", entry.Name())
+		}
+		if err := os.Remove(filepath.Join(directory, entry.Name())); err != nil {
+			return fmt.Errorf("remove stale bundle cache entry: %w", err)
+		}
+	}
+	return nil
+}
+
+func isKnownCacheName(name string) bool {
+	if strings.HasPrefix(name, ".bundle-download-") {
+		return true
+	}
+	if len(name) != 68 || !strings.HasSuffix(name, ".zip") {
+		return false
+	}
+	checksum := name[:64]
+	decoded, err := hex.DecodeString(checksum)
+	return err == nil && len(decoded) == sha256.Size && checksum == strings.ToLower(checksum)
 }
 
 func verifyCachedFile(filename string, metadata Metadata) error {
