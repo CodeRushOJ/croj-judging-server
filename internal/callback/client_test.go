@@ -124,6 +124,9 @@ func TestNewClientRejectsUnsafeConfiguration(t *testing.T) {
 	for name, values := range map[string][2]string{
 		"missing api path": {"http://backend:7999", testServiceToken},
 		"short token":      {"http://backend:7999/api", "too-short"},
+		"query":            {"http://backend:7999/api?target=elsewhere", testServiceToken},
+		"fragment":         {"http://backend:7999/api#fragment", testServiceToken},
+		"userinfo":         {"http://user:pass@backend:7999/api", testServiceToken},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := NewClient(values[0], values[1], time.Second, http.DefaultClient); err == nil {

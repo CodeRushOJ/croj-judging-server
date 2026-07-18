@@ -44,9 +44,9 @@ func (p *ExecutionPipeline) Execute(ctx context.Context, submission *model.Task,
 		return callback.Result{}, err
 	}
 	status := mapCallbackStatus(response.Status)
-	compileError := truncateRunes(strings.TrimSpace(response.CompileError), 32_768)
+	compileError := callback.TruncateUTF16(strings.TrimSpace(response.CompileError), 32_768)
 	if status == callback.StatusCompileError && compileError == "" {
-		compileError = truncateRunes(firstDiagnostic(response.Error, response.Stderr), 32_768)
+		compileError = callback.TruncateUTF16(firstDiagnostic(response.Error, response.Stderr), 32_768)
 		if compileError == "" {
 			compileError = "compiler failed without diagnostics"
 		}
@@ -60,8 +60,8 @@ func (p *ExecutionPipeline) Execute(ctx context.Context, submission *model.Task,
 		ExitCode:       exitCode,
 		TimeUsedMillis: boundedMetric(response.TimeUsed, 86_400_000),
 		MemoryUsedKB:   boundedMetric(response.MemoryUsed, math.MaxInt32),
-		Stdout:         truncateRunes(response.Stdout, 65_536),
-		Stderr:         truncateRunes(response.Stderr, 65_536),
+		Stdout:         callback.TruncateUTF16(response.Stdout, 65_536),
+		Stderr:         callback.TruncateUTF16(response.Stderr, 65_536),
 		CompileError:   compileError,
 	}, nil
 }
@@ -209,15 +209,4 @@ func truncate(value string, limit int) string {
 		return value
 	}
 	return value[:limit]
-}
-
-func truncateRunes(value string, limit int) string {
-	if limit <= 0 {
-		return ""
-	}
-	runes := []rune(value)
-	if len(runes) <= limit {
-		return value
-	}
-	return string(runes[:limit])
 }
