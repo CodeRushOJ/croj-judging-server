@@ -66,6 +66,21 @@ func (d *Database) GetProblemByID(problemID int64) (*model.Problem, error) {
 	return problem, nil
 }
 
+// GetProblemVersionByID returns the immutable execution snapshot selected by
+// the submission. The judge must never derive limits or judge mode from the
+// mutable t_problem row.
+func (d *Database) GetProblemVersionByID(problemVersionID int64) (*model.ProblemVersion, error) {
+	problemVersion := &model.ProblemVersion{}
+	result := d.DB.First(problemVersion, problemVersionID)
+	if result.Error != nil {
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get problem version %d: %w", problemVersionID, result.Error)
+	}
+	return problemVersion, nil
+}
+
 func (d *Database) GetTestBundleByProblemVersionID(problemVersionID int64) (*model.TestBundle, error) {
 	testBundle := &model.TestBundle{}
 	result := d.DB.Where("problem_version_id = ?", problemVersionID).First(testBundle)

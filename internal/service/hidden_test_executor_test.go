@@ -21,7 +21,7 @@ func (provider fakeArtifactProvider) Open(context.Context, *model.TestBundle) (b
 
 func TestHiddenTestExecutorReturnsSystemErrorForInvalidBundle(t *testing.T) {
 	executor := NewHiddenTestExecutor(fakeArtifactProvider{err: bundle.Invalid(errors.New("bad ZIP"))}, &BundlePipeline{})
-	result, err := executor.Execute(context.Background(), validBundleSubmission(), validBundleProblem(), &model.TestBundle{})
+	result, err := executor.Execute(context.Background(), validBundleSubmission(), validExecutionConfig(), &model.TestBundle{})
 	if err != nil || result.Status != callback.StatusSystemError {
 		t.Fatalf("result=%+v error=%v", result, err)
 	}
@@ -30,7 +30,7 @@ func TestHiddenTestExecutorReturnsSystemErrorForInvalidBundle(t *testing.T) {
 func TestHiddenTestExecutorKeepsTransientStorageFailureRetryable(t *testing.T) {
 	wantErr := errors.New("object store unavailable")
 	executor := NewHiddenTestExecutor(fakeArtifactProvider{err: wantErr}, &BundlePipeline{})
-	_, err := executor.Execute(context.Background(), validBundleSubmission(), validBundleProblem(), &model.TestBundle{})
+	_, err := executor.Execute(context.Background(), validBundleSubmission(), validExecutionConfig(), &model.TestBundle{})
 	if !errors.Is(err, wantErr) || callback.IsPermanent(err) {
 		t.Fatalf("error=%v permanent=%v", err, callback.IsPermanent(err))
 	}
@@ -50,7 +50,7 @@ func TestHiddenTestExecutorClosesArtifactWhenPipelineFails(t *testing.T) {
 	artifact := &trackingArtifact{memoryArtifact: exactArtifact(1)}
 	pipeline := NewBundlePipeline(&sequenceSelector{}, &sequenceExecutor{}, 1)
 	executor := NewHiddenTestExecutor(fakeArtifactProvider{artifact: artifact}, pipeline)
-	if _, err := executor.Execute(context.Background(), validBundleSubmission(), validBundleProblem(), &model.TestBundle{}); err == nil {
+	if _, err := executor.Execute(context.Background(), validBundleSubmission(), validExecutionConfig(), &model.TestBundle{}); err == nil {
 		t.Fatal("expected pipeline error")
 	}
 	if !artifact.closed {

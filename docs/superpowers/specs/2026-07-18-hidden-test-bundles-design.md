@@ -14,9 +14,9 @@ Exact checker uses the current sandbox compatibility rule: normalize CRLF/CR to 
 
 ## Storage and cache
 
-The database remains read-only. `GetTestBundleByProblemVersionID` loads the unique metadata row. S3-compatible storage uses MinIO Go client configuration for endpoint, bucket, region, TLS, access key, and secret key. Downloads stream to a cache-directory temporary file through a byte limit and SHA-256 hasher; metadata size, actual size, configured compressed maximum, and checksum must all agree before atomic rename.
+The database remains read-only. `GetProblemVersionByID` loads the submission-pinned immutable snapshot, verifies its ID/problem ownership and `PUBLISHED` state, and strictly parses `limits_json` and `judge_config_json`; mutable `t_problem` fields never drive execution. `GetTestBundleByProblemVersionID` then loads the unique metadata row. S3-compatible storage uses MinIO Go client configuration for endpoint, bucket, region, TLS, access key, and secret key. Downloads stream to a cache-directory temporary file through a byte limit and SHA-256 hasher; metadata size, actual size, configured compressed maximum, and checksum must all agree before atomic rename.
 
-Cache keys are lowercase SHA-256 values. A process-local keyed flight coalesces concurrent misses. The cache validates every hit's size and checksum, deletes corrupt entries, and re-downloads. Completed entries are bounded by byte capacity and TTL; access updates LRU ordering, eviction removes only finalized files. Temporary files are always cleaned after failure.
+Cache keys are lowercase SHA-256 values. A process-local keyed flight coalesces concurrent misses. Every caller independently validates its row's expected size and SHA-256 before receiving a shared artifact; identical bytes may therefore be reused across different object keys, which remain locators rather than cache identity. The cache validates every hit's size and checksum, deletes corrupt entries, and re-downloads. Completed entries are bounded by byte capacity and TTL; access updates LRU ordering, eviction removes only finalized files. Temporary files are always cleaned after failure.
 
 ## ZIP safety
 

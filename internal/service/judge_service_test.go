@@ -8,11 +8,13 @@ import (
 
 	"github.com/CodeRushOJ/croj-judging-server/internal/callback"
 	"github.com/CodeRushOJ/croj-judging-server/pkg/model"
+	"gorm.io/datatypes"
 )
 
 type fakeSubmissionStore struct {
 	submission *model.Task
-	problem    *model.Problem
+	version    *model.ProblemVersion
+	versionErr error
 	bundle     *model.TestBundle
 	bundleErr  error
 }
@@ -21,8 +23,8 @@ func (store *fakeSubmissionStore) GetSubmissionByID(int64) (*model.Task, error) 
 	return store.submission, nil
 }
 
-func (store *fakeSubmissionStore) GetProblemByID(int64) (*model.Problem, error) {
-	return store.problem, nil
+func (store *fakeSubmissionStore) GetProblemVersionByID(int64) (*model.ProblemVersion, error) {
+	return store.version, store.versionErr
 }
 
 func (store *fakeSubmissionStore) GetTestBundleByProblemVersionID(int64) (*model.TestBundle, error) {
@@ -33,10 +35,12 @@ type fakeResultExecutor struct {
 	result callback.Result
 	err    error
 	calls  int
+	config ExecutionConfig
 }
 
-func (executor *fakeResultExecutor) Execute(context.Context, *model.Task, *model.Problem, *model.TestBundle) (callback.Result, error) {
+func (executor *fakeResultExecutor) Execute(_ context.Context, _ *model.Task, config ExecutionConfig, _ *model.TestBundle) (callback.Result, error) {
 	executor.calls++
+	executor.config = config
 	return executor.result, executor.err
 }
 
@@ -55,7 +59,7 @@ func (publisher *fakeResultPublisher) Publish(_ context.Context, result callback
 func TestJudgeServicePublishesStableEventResultWithoutDatabaseWrite(t *testing.T) {
 	store := &fakeSubmissionStore{
 		submission: validBundleTask(),
-		problem:    &model.Problem{ID: 42},
+		version:    validProblemVersion(),
 		bundle:     &model.TestBundle{ProblemVersionID: 7},
 	}
 	executor := &fakeResultExecutor{result: callback.Result{Status: callback.StatusAccepted}}
@@ -71,11 +75,15 @@ func TestJudgeServicePublishesStableEventResultWithoutDatabaseWrite(t *testing.T
 	if executor.calls != 1 || publisher.calls != 1 {
 		t.Fatalf("executor calls=%d publisher calls=%d", executor.calls, publisher.calls)
 	}
+	if executor.config.TimeLimitMillis != 2500 || executor.config.MemoryLimitMB != 128 {
+		t.Fatalf("executor did not use immutable limits: %+v", executor.config)
+	}
 }
 
 func TestJudgeServicePublishesSystemErrorForMissingImmutableBundle(t *testing.T) {
 	for name, mutate := range map[string]func(*fakeSubmissionStore){
 		"null problem version": func(store *fakeSubmissionStore) { store.submission.ProblemVersionID = nil },
+		"missing version row":  func(store *fakeSubmissionStore) { store.version = nil },
 		"missing bundle":       func(store *fakeSubmissionStore) { store.bundle = nil },
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -94,14 +102,50 @@ func TestJudgeServicePublishesSystemErrorForMissingImmutableBundle(t *testing.T)
 	}
 }
 
+func TestJudgeServiceRejectsMismatchedDraftAndUnsupportedImmutableVersions(t *testing.T) {
+	tests := map[string]func(*model.ProblemVersion){
+		"version mismatch": func(version *model.ProblemVersion) { version.ID = 8 },
+		"problem mismatch": func(version *model.ProblemVersion) { version.ProblemID = 999 },
+		"draft":            func(version *model.ProblemVersion) { version.State = "DRAFT" },
+		"special judge": func(version *model.ProblemVersion) {
+			version.JudgeConfigJSON = datatypes.JSON([]byte(`{"specialJudge":true,"specialJudgeCode":"x","specialJudgeLanguage":"go","judgeMode":0}`))
+		},
+		"OI": func(version *model.ProblemVersion) {
+			version.JudgeConfigJSON = datatypes.JSON([]byte(`{"specialJudge":false,"specialJudgeCode":null,"specialJudgeLanguage":null,"judgeMode":1}`))
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			store := validStore()
+			mutate(store.version)
+			executor := &fakeResultExecutor{}
+			publisher := &fakeResultPublisher{}
+			judgeService := NewJudgeService(store, executor, publisher, NewTaskRegistry(16, time.Hour))
+			if err := judgeService.ProcessEvent(context.Background(), validSubmissionEvent()); err != nil {
+				t.Fatal(err)
+			}
+			if publisher.result.Status != callback.StatusSystemError || executor.calls != 0 {
+				t.Fatalf("result=%+v calls=%d", publisher.result, executor.calls)
+			}
+		})
+	}
+}
+
 func TestJudgeServiceRetriesTransientBundleMetadataFailure(t *testing.T) {
-	store := validStore()
-	store.bundleErr = errors.New("database unavailable")
-	publisher := &fakeResultPublisher{}
-	judgeService := NewJudgeService(store, &fakeResultExecutor{}, publisher, NewTaskRegistry(16, time.Hour))
-	err := judgeService.ProcessEvent(context.Background(), validSubmissionEvent())
-	if err == nil || callback.IsPermanent(err) || publisher.calls != 0 {
-		t.Fatalf("error=%v permanent=%v publisher calls=%d", err, callback.IsPermanent(err), publisher.calls)
+	for name, mutate := range map[string]func(*fakeSubmissionStore){
+		"version": func(store *fakeSubmissionStore) { store.versionErr = errors.New("database unavailable") },
+		"bundle":  func(store *fakeSubmissionStore) { store.bundleErr = errors.New("database unavailable") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			store := validStore()
+			mutate(store)
+			publisher := &fakeResultPublisher{}
+			judgeService := NewJudgeService(store, &fakeResultExecutor{}, publisher, NewTaskRegistry(16, time.Hour))
+			err := judgeService.ProcessEvent(context.Background(), validSubmissionEvent())
+			if err == nil || callback.IsPermanent(err) || publisher.calls != 0 {
+				t.Fatalf("error=%v permanent=%v publisher calls=%d", err, callback.IsPermanent(err), publisher.calls)
+			}
+		})
 	}
 }
 
@@ -140,8 +184,18 @@ func TestJudgeServiceDoesNotRepeatPermanentCallbackFailure(t *testing.T) {
 func validStore() *fakeSubmissionStore {
 	return &fakeSubmissionStore{
 		submission: validBundleTask(),
-		problem:    &model.Problem{ID: 42},
+		version:    validProblemVersion(),
 		bundle:     &model.TestBundle{ProblemVersionID: 7},
+	}
+}
+
+func validProblemVersion() *model.ProblemVersion {
+	return &model.ProblemVersion{
+		ID:              7,
+		ProblemID:       42,
+		State:           "PUBLISHED",
+		LimitsJSON:      datatypes.JSON([]byte(`{"timeLimit":2500,"memoryLimit":128,"totalScore":100}`)),
+		JudgeConfigJSON: datatypes.JSON([]byte(`{"specialJudge":false,"specialJudgeCode":null,"specialJudgeLanguage":null,"judgeMode":0}`)),
 	}
 }
 

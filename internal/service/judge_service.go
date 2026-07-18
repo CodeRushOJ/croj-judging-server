@@ -11,12 +11,12 @@ import (
 
 type SubmissionStore interface {
 	GetSubmissionByID(int64) (*model.Task, error)
-	GetProblemByID(int64) (*model.Problem, error)
+	GetProblemVersionByID(int64) (*model.ProblemVersion, error)
 	GetTestBundleByProblemVersionID(int64) (*model.TestBundle, error)
 }
 
 type ResultExecutor interface {
-	Execute(context.Context, *model.Task, *model.Problem, *model.TestBundle) (callback.Result, error)
+	Execute(context.Context, *model.Task, ExecutionConfig, *model.TestBundle) (callback.Result, error)
 }
 
 type ResultPublisher interface {
@@ -70,26 +70,33 @@ func (service *JudgeService) execute(ctx context.Context, event model.Submission
 	if submission.ProblemID != event.ProblemID || submission.UserID != event.UserID || submission.Language != event.Language {
 		return callback.Result{}, callback.Permanent(fmt.Errorf("SubmissionRequested metadata does not match submission %d", event.SubmissionID))
 	}
-	problem, err := service.store.GetProblemByID(event.ProblemID)
-	if err != nil {
-		return callback.Result{}, fmt.Errorf("get problem %d: %w", event.ProblemID, err)
-	}
-	if problem == nil {
-		return callback.Result{}, callback.Permanent(fmt.Errorf("problem %d does not exist", event.ProblemID))
-	}
 	if submission.ProblemVersionID == nil || *submission.ProblemVersionID <= 0 {
 		result := systemErrorResult("submission has no immutable problem version")
 		return withResultIdentity(result, event), nil
 	}
-	testBundle, err := service.store.GetTestBundleByProblemVersionID(*submission.ProblemVersionID)
+	problemVersionID := *submission.ProblemVersionID
+	problemVersion, err := service.store.GetProblemVersionByID(problemVersionID)
 	if err != nil {
-		return callback.Result{}, fmt.Errorf("get test bundle for problem version %d: %w", *submission.ProblemVersionID, err)
+		return callback.Result{}, fmt.Errorf("get problem version %d: %w", problemVersionID, err)
 	}
-	if testBundle == nil || testBundle.ProblemVersionID != *submission.ProblemVersionID {
+	if problemVersion == nil || problemVersion.ID != problemVersionID || problemVersion.ProblemID != event.ProblemID || problemVersion.State != "PUBLISHED" {
+		result := systemErrorResult("immutable problem version is unavailable")
+		return withResultIdentity(result, event), nil
+	}
+	executionConfig, err := ParseExecutionConfig(problemVersion)
+	if err != nil {
+		result := systemErrorResult("immutable problem version is invalid or unsupported")
+		return withResultIdentity(result, event), nil
+	}
+	testBundle, err := service.store.GetTestBundleByProblemVersionID(problemVersionID)
+	if err != nil {
+		return callback.Result{}, fmt.Errorf("get test bundle for problem version %d: %w", problemVersionID, err)
+	}
+	if testBundle == nil || testBundle.ProblemVersionID != problemVersionID {
 		result := systemErrorResult("immutable test bundle is unavailable")
 		return withResultIdentity(result, event), nil
 	}
-	result, err := service.executor.Execute(ctx, submission, problem, testBundle)
+	result, err := service.executor.Execute(ctx, submission, executionConfig, testBundle)
 	if err != nil {
 		return callback.Result{}, fmt.Errorf("execute submission %d attempt %d: %w", event.SubmissionID, event.AttemptNo, err)
 	}
