@@ -34,7 +34,7 @@ type Artifact struct {
 }
 
 func OpenArchive(filename string, databaseManifest []byte, limits ArchiveLimits) (*Artifact, error) {
-	if err := validateArchiveLimits(limits); err != nil {
+	if err := ValidateArchiveLimits(limits); err != nil {
 		return nil, err
 	}
 	if int64(len(databaseManifest)) > limits.MaxManifestBytes {
@@ -96,10 +96,11 @@ func (artifact *Artifact) validate(expected Manifest) error {
 		if exceedsCompressionRatio(file.UncompressedSize64, file.CompressedSize64, artifact.limits.MaxCompressionRatio) {
 			return fmt.Errorf("ZIP entry %q exceeds compression ratio limit", file.Name)
 		}
-		total += file.UncompressedSize64
-		if total > uint64(artifact.limits.MaxTotalBytes) {
+		maximumTotal := uint64(artifact.limits.MaxTotalBytes)
+		if file.UncompressedSize64 > maximumTotal || total > maximumTotal-file.UncompressedSize64 {
 			return fmt.Errorf("bundle exceeds total uncompressed size limit")
 		}
+		total += file.UncompressedSize64
 		artifact.files[file.Name] = file
 	}
 	manifestBytes, err := artifact.readBytes("manifest.json", artifact.limits.MaxManifestBytes)
@@ -172,7 +173,7 @@ func (artifact *Artifact) readBytes(name string, limit int64) ([]byte, error) {
 	return data, nil
 }
 
-func validateArchiveLimits(limits ArchiveLimits) error {
+func ValidateArchiveLimits(limits ArchiveLimits) error {
 	if limits.MaxFiles <= 0 || limits.MaxManifestBytes <= 0 || limits.MaxCaseBytes <= 0 || limits.MaxTotalBytes <= 0 || limits.MaxCompressionRatio == 0 {
 		return fmt.Errorf("archive limits must be positive")
 	}

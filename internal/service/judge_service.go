@@ -12,10 +12,11 @@ import (
 type SubmissionStore interface {
 	GetSubmissionByID(int64) (*model.Task, error)
 	GetProblemByID(int64) (*model.Problem, error)
+	GetTestBundleByProblemVersionID(int64) (*model.TestBundle, error)
 }
 
 type ResultExecutor interface {
-	Execute(context.Context, *model.Task, *model.Problem) (callback.Result, error)
+	Execute(context.Context, *model.Task, *model.Problem, *model.TestBundle) (callback.Result, error)
 }
 
 type ResultPublisher interface {
@@ -76,12 +77,28 @@ func (service *JudgeService) execute(ctx context.Context, event model.Submission
 	if problem == nil {
 		return callback.Result{}, callback.Permanent(fmt.Errorf("problem %d does not exist", event.ProblemID))
 	}
-	result, err := service.executor.Execute(ctx, submission, problem)
+	if submission.ProblemVersionID == nil || *submission.ProblemVersionID <= 0 {
+		result := systemErrorResult("submission has no immutable problem version")
+		return withResultIdentity(result, event), nil
+	}
+	testBundle, err := service.store.GetTestBundleByProblemVersionID(*submission.ProblemVersionID)
+	if err != nil {
+		return callback.Result{}, fmt.Errorf("get test bundle for problem version %d: %w", *submission.ProblemVersionID, err)
+	}
+	if testBundle == nil || testBundle.ProblemVersionID != *submission.ProblemVersionID {
+		result := systemErrorResult("immutable test bundle is unavailable")
+		return withResultIdentity(result, event), nil
+	}
+	result, err := service.executor.Execute(ctx, submission, problem, testBundle)
 	if err != nil {
 		return callback.Result{}, fmt.Errorf("execute submission %d attempt %d: %w", event.SubmissionID, event.AttemptNo, err)
 	}
+	return withResultIdentity(result, event), nil
+}
+
+func withResultIdentity(result callback.Result, event model.SubmissionRequested) callback.Result {
 	result.ResultID = event.EventID
 	result.SubmissionID = event.SubmissionID
 	result.AttemptNo = event.AttemptNo
-	return result, nil
+	return result
 }

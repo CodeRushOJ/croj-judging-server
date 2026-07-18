@@ -87,6 +87,20 @@ func TestOpenArchiveRejectsZipBombAndSizeLimits(t *testing.T) {
 		artifact.Close()
 		t.Fatal("expected compression ratio error")
 	}
+
+	limits = DefaultArchiveLimits()
+	limits.MaxTotalBytes = 100
+	if artifact, err := OpenArchive(writeZIP(t, entries), []byte(validManifest), limits); err == nil {
+		artifact.Close()
+		t.Fatal("expected total uncompressed size error")
+	}
+
+	limits = DefaultArchiveLimits()
+	limits.MaxFiles = 2
+	if artifact, err := OpenArchive(writeZIP(t, entries), []byte(validManifest), limits); err == nil {
+		artifact.Close()
+		t.Fatal("expected file count error")
+	}
 }
 
 type zipEntry struct {

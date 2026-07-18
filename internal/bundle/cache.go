@@ -83,7 +83,7 @@ func NewCache(directory string, maxBytes, maxObjectBytes int64, ttl time.Duratio
 
 func (cache *Cache) Resolve(ctx context.Context, metadata Metadata) (string, error) {
 	if err := cache.validateMetadata(metadata); err != nil {
-		return "", err
+		return "", Invalid(err)
 	}
 	metadata.SHA256 = strings.ToLower(metadata.SHA256)
 	cache.mu.Lock()
@@ -129,7 +129,7 @@ func (cache *Cache) resolveOne(ctx context.Context, metadata Metadata) (string, 
 	}
 	defer object.Body.Close()
 	if object.Size >= 0 && object.Size != metadata.SizeBytes {
-		return "", fmt.Errorf("bundle object metadata size mismatch")
+		return "", Invalid(fmt.Errorf("bundle object metadata size mismatch"))
 	}
 	temporary, err := os.CreateTemp(cache.directory, ".bundle-download-*")
 	if err != nil {
@@ -149,10 +149,10 @@ func (cache *Cache) resolveOne(ctx context.Context, metadata Metadata) (string, 
 		return "", fmt.Errorf("download bundle object: %w", copyErr)
 	}
 	if written != metadata.SizeBytes {
-		return "", fmt.Errorf("bundle object stream size mismatch")
+		return "", Invalid(fmt.Errorf("bundle object stream size mismatch"))
 	}
 	if actual := hex.EncodeToString(hasher.Sum(nil)); actual != metadata.SHA256 {
-		return "", fmt.Errorf("bundle object SHA-256 mismatch")
+		return "", Invalid(fmt.Errorf("bundle object SHA-256 mismatch"))
 	}
 	if err := temporary.Sync(); err != nil {
 		return "", fmt.Errorf("sync bundle cache file: %w", err)

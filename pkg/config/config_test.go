@@ -21,6 +21,23 @@ judge-result:
   callback-timeout: 10s
   cache-capacity: 10000
   cache-ttl: 6h
+test-bundles:
+  endpoint: minio:9000
+  bucket: judge-bundles
+  region: us-east-1
+  use-tls: false
+  access-key: ""
+  secret-key: ""
+  cache-dir: /tmp/croj-bundles
+  cache-max-bytes: 2147483648
+  max-object-bytes: 536870912
+  cache-ttl: 24h
+  max-files: 20001
+  max-manifest-bytes: 1048576
+  max-case-bytes: 67108864
+  max-uncompressed-bytes: 536870912
+  max-compression-ratio: 200
+  max-infra-attempts: 3
 sandbox-discovery:
   namespace: coderushoj
   service: croj-sandbox
@@ -40,6 +57,15 @@ sandbox-discovery:
 	t.Setenv("BACKEND_INTERNAL_URL", "http://backend.internal:7999/api")
 	t.Setenv("JUDGE_RESULT_SERVICE_TOKEN", "runtime-judge-result-token-32-bytes")
 	t.Setenv("ROCKETMQ_MAX_RECONSUME_TIMES", "12")
+	t.Setenv("OBJECT_STORAGE_ENDPOINT", "minio.internal:9000")
+	t.Setenv("OBJECT_STORAGE_BUCKET", "immutable-bundles")
+	t.Setenv("OBJECT_STORAGE_REGION", "cn-test-1")
+	t.Setenv("OBJECT_STORAGE_ACCESS_KEY", "judge-reader")
+	t.Setenv("OBJECT_STORAGE_SECRET_KEY", "runtime-only-minio-secret")
+	t.Setenv("OBJECT_STORAGE_USE_TLS", "true")
+	t.Setenv("JUDGE_BUNDLE_CACHE_DIR", "/tmp/runtime-bundles")
+	t.Setenv("JUDGE_BUNDLE_MAX_INFRA_ATTEMPTS", "4")
+	t.Setenv("JUDGE_BUNDLE_CACHE_MAX_BYTES", "1073741824")
 
 	config, err := LoadConfig(path)
 	if err != nil {
@@ -62,6 +88,9 @@ sandbox-discovery:
 	}
 	if config.RocketMQ.Consumer.MaxReconsumeTimes != 12 {
 		t.Fatalf("max reconsume times = %d", config.RocketMQ.Consumer.MaxReconsumeTimes)
+	}
+	if config.TestBundles.Endpoint != "minio.internal:9000" || config.TestBundles.Bucket != "immutable-bundles" || config.TestBundles.Region != "cn-test-1" || config.TestBundles.AccessKey != "judge-reader" || config.TestBundles.SecretKey != "runtime-only-minio-secret" || !config.TestBundles.UseTLS || config.TestBundles.CacheDir != "/tmp/runtime-bundles" || config.TestBundles.CacheMaxBytes != 1073741824 || config.TestBundles.MaxInfraAttempts != 4 {
+		t.Fatalf("test bundle overrides not applied: %+v", config.TestBundles)
 	}
 }
 

@@ -104,8 +104,8 @@ func TestCacheRejectsSizeAndChecksumMismatchWithoutFinalFile(t *testing.T) {
 			}
 			metadata := cacheMetadata("bundle.zip", data)
 			mutate(&metadata)
-			if _, err := cache.Resolve(context.Background(), metadata); err == nil {
-				t.Fatal("expected verification error")
+			if _, err := cache.Resolve(context.Background(), metadata); err == nil || !IsInvalid(err) {
+				t.Fatalf("expected invalid verification error, got %v", err)
 			}
 			entries, err := os.ReadDir(directory)
 			if err != nil {
@@ -159,8 +159,8 @@ func TestCacheRejectsUnsafeObjectKeyMetadata(t *testing.T) {
 	for name, key := range map[string]string{"empty": "", "NUL": "bad\x00key", "long": strings.Repeat("a", 513)} {
 		t.Run(name, func(t *testing.T) {
 			metadata := cacheMetadata(key, data)
-			if _, err := cache.Resolve(context.Background(), metadata); err == nil {
-				t.Fatal("expected unsafe object key error")
+			if _, err := cache.Resolve(context.Background(), metadata); err == nil || !IsInvalid(err) {
+				t.Fatalf("expected invalid object key error, got %v", err)
 			}
 		})
 	}

@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/CodeRushOJ/croj-judging-server/internal/bundle"
 	"github.com/CodeRushOJ/croj-judging-server/internal/callback"
 	"github.com/CodeRushOJ/croj-judging-server/internal/consumer"
 	"github.com/CodeRushOJ/croj-judging-server/internal/database"
@@ -72,7 +73,48 @@ func main() {
 			log.Printf("Failed to close sandbox client: %v", err)
 		}
 	}()
-	executionPipeline := service.NewExecutionPipeline(sandboxScheduler, sandboxClient)
+	bundleCacheTTL, err := time.ParseDuration(cfg.TestBundles.CacheTTL)
+	if err != nil || bundleCacheTTL <= 0 {
+		log.Fatalf("Invalid test bundle cache TTL: %q", cfg.TestBundles.CacheTTL)
+	}
+	objectStore, err := bundle.NewMinIOStore(bundle.MinIOConfig{
+		Endpoint:  cfg.TestBundles.Endpoint,
+		Bucket:    cfg.TestBundles.Bucket,
+		Region:    cfg.TestBundles.Region,
+		UseTLS:    cfg.TestBundles.UseTLS,
+		AccessKey: cfg.TestBundles.AccessKey,
+		SecretKey: cfg.TestBundles.SecretKey,
+	})
+	if err != nil {
+		log.Fatalf("Failed to initialize test bundle object storage: %v", err)
+	}
+	bundleCache, err := bundle.NewCache(
+		cfg.TestBundles.CacheDir,
+		cfg.TestBundles.CacheMaxBytes,
+		cfg.TestBundles.MaxObjectBytes,
+		bundleCacheTTL,
+		objectStore,
+	)
+	if err != nil {
+		log.Fatalf("Failed to initialize test bundle cache: %v", err)
+	}
+	archiveLimits := bundle.ArchiveLimits{
+		MaxFiles:            cfg.TestBundles.MaxFiles,
+		MaxManifestBytes:    cfg.TestBundles.MaxManifestBytes,
+		MaxCaseBytes:        cfg.TestBundles.MaxCaseBytes,
+		MaxTotalBytes:       cfg.TestBundles.MaxUncompressedBytes,
+		MaxCompressionRatio: cfg.TestBundles.MaxCompressionRatio,
+	}
+	if err := bundle.ValidateArchiveLimits(archiveLimits); err != nil {
+		log.Fatalf("Invalid test bundle archive limits: %v", err)
+	}
+	bundleProvider := bundle.NewProvider(bundleCache, archiveLimits)
+	bundlePipeline := service.NewBundlePipeline(
+		sandboxScheduler,
+		sandboxClient,
+		cfg.TestBundles.MaxInfraAttempts,
+	)
+	executionPipeline := service.NewHiddenTestExecutor(bundleProvider, bundlePipeline)
 	callbackTimeout, err := time.ParseDuration(cfg.JudgeResult.CallbackTimeout)
 	if err != nil || callbackTimeout <= 0 {
 		log.Fatalf("Invalid judge result callback timeout: %q", cfg.JudgeResult.CallbackTimeout)

@@ -62,7 +62,7 @@ func (pipeline *BundlePipeline) ExecuteArtifact(
 			result.Stderr = callback.TruncateUTF16(strings.Join(summaries, ";"), 65_536)
 			return result, nil
 		}
-		caseStatus := mapCallbackStatus(response.Status)
+		caseStatus := mapBundleStatus(response.Status)
 		if response.Status == "Accepted" && !outputsMatch(manifest.Checker, response.Stdout, expected) {
 			caseStatus = callback.StatusWrongAnswer
 		}
@@ -70,7 +70,7 @@ func (pipeline *BundlePipeline) ExecuteArtifact(
 		result.MemoryUsedKB = max(result.MemoryUsedKB, boundedMetric(response.MemoryUsed, 2_147_483_647))
 		result.ExitCode = int(response.ExitCode)
 		result.Status = caseStatus
-		summaries = append(summaries, fmt.Sprintf("case=%s status=%s", testCase.ID, caseStatus))
+		summaries = append(summaries, fmt.Sprintf("case=%s sandboxStatus=%s status=%s", testCase.ID, response.Status, caseStatus))
 		result.Stderr = callback.TruncateUTF16(strings.Join(summaries, ";"), 65_536)
 		if caseStatus == callback.StatusCompileError {
 			result.CompileError = callback.TruncateUTF16(strings.TrimSpace(response.CompileError), 32_768)
@@ -134,11 +134,18 @@ func (pipeline *BundlePipeline) executeCase(
 
 func isKnownContestantStatus(value string) bool {
 	switch value {
-	case "Accepted", "Compile Error", "Wrong Answer", "Time Limit Exceeded", "Memory Limit Exceeded", "Runtime Error":
+	case "Accepted", "Compile Error", "Wrong Answer", "Time Limit Exceeded", "Memory Limit Exceeded", "Runtime Error", "Output Limit Exceeded":
 		return true
 	default:
 		return false
 	}
+}
+
+func mapBundleStatus(value string) callback.Status {
+	if value == "Output Limit Exceeded" {
+		return callback.StatusRuntimeError
+	}
+	return mapCallbackStatus(value)
 }
 
 func outputsMatch(checker bundle.Checker, actual, expected string) bool {
