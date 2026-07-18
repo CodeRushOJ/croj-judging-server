@@ -91,9 +91,48 @@ func TestClientCloseRejectsNewExecutions(t *testing.T) {
 	}
 }
 
+func TestClientBoundsAndExpiresEndpointConnections(t *testing.T) {
+	client, stop := newBufconnClientWithLimits(t, time.Second, 2, 15*time.Millisecond, nil, func(context.Context, *sandboxpb.ExecuteRequest) (*sandboxpb.ExecuteResponse, error) {
+		return &sandboxpb.ExecuteResponse{Status: "Accepted"}, nil
+	})
+	defer stop()
+	for _, address := range []string{"10.0.0.1:50051", "10.0.0.2:50051", "10.0.0.3:50051"} {
+		if _, err := client.Execute(context.Background(), address, &sandboxpb.ExecuteRequest{}); err != nil {
+			t.Fatalf("Execute %s: %v", address, err)
+		}
+	}
+	client.mu.Lock()
+	if got := len(client.conns); got != 2 {
+		client.mu.Unlock()
+		t.Fatalf("connection cache length = %d, want 2", got)
+	}
+	client.mu.Unlock()
+
+	time.Sleep(20 * time.Millisecond)
+	if _, err := client.Execute(context.Background(), "10.0.0.4:50051", &sandboxpb.ExecuteRequest{}); err != nil {
+		t.Fatalf("Execute after idle expiry: %v", err)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if got := len(client.conns); got != 1 {
+		t.Fatalf("connection cache length after expiry = %d, want 1", got)
+	}
+}
+
 func newBufconnClient(
 	t *testing.T,
 	timeout time.Duration,
+	dials *atomic.Int32,
+	execute func(context.Context, *sandboxpb.ExecuteRequest) (*sandboxpb.ExecuteResponse, error),
+) (*Client, func()) {
+	return newBufconnClientWithLimits(t, timeout, 128, 5*time.Minute, dials, execute)
+}
+
+func newBufconnClientWithLimits(
+	t *testing.T,
+	timeout time.Duration,
+	maxConnections int,
+	idleTTL time.Duration,
 	dials *atomic.Int32,
 	execute func(context.Context, *sandboxpb.ExecuteRequest) (*sandboxpb.ExecuteResponse, error),
 ) (*Client, func()) {
@@ -111,7 +150,7 @@ func newBufconnClient(
 		}
 		return listener.Dial()
 	}
-	client := NewClient(timeout, grpc.WithContextDialer(dialer))
+	client := NewClientWithCache(timeout, maxConnections, idleTTL, grpc.WithContextDialer(dialer))
 	return client, func() {
 		_ = client.Close()
 		server.Stop()

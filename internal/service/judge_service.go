@@ -3,55 +3,85 @@ package service
 import (
 	"context"
 	"fmt"
-	"strconv"
+	"time"
 
+	"github.com/CodeRushOJ/croj-judging-server/internal/callback"
 	"github.com/CodeRushOJ/croj-judging-server/pkg/model"
 )
 
 type SubmissionStore interface {
 	GetSubmissionByID(int64) (*model.Task, error)
 	GetProblemByID(int64) (*model.Problem, error)
-	UpdateSubmissionResultInTx(*model.Task) error
 }
 
-type SubmissionExecutor interface {
-	Run(context.Context, *model.Task, *model.Problem) error
+type ResultExecutor interface {
+	Execute(context.Context, *model.Task, *model.Problem) (callback.Result, error)
+}
+
+type ResultPublisher interface {
+	Publish(context.Context, callback.Result) (callback.Disposition, error)
 }
 
 type JudgeService struct {
-	store    SubmissionStore
-	executor SubmissionExecutor
+	store     SubmissionStore
+	executor  ResultExecutor
+	publisher ResultPublisher
+	registry  *TaskRegistry
 }
 
-func NewJudgeService(store SubmissionStore, executor SubmissionExecutor) *JudgeService {
-	return &JudgeService{store: store, executor: executor}
+func NewJudgeService(
+	store SubmissionStore,
+	executor ResultExecutor,
+	publisher ResultPublisher,
+	registry *TaskRegistry,
+) *JudgeService {
+	if registry == nil {
+		registry = NewTaskRegistry(10_000, 6*time.Hour)
+	}
+	return &JudgeService{store: store, executor: executor, publisher: publisher, registry: registry}
 }
 
-func (s *JudgeService) ProcessTask(ctx context.Context, taskIDValue string) error {
-	taskID, err := strconv.ParseInt(taskIDValue, 10, 64)
-	if err != nil || taskID <= 0 {
-		return fmt.Errorf("invalid task ID %q", taskIDValue)
-	}
+func (service *JudgeService) ProcessEvent(ctx context.Context, event model.SubmissionRequested) error {
+	return service.registry.Process(
+		ctx,
+		event.DeduplicationKey(),
+		func(ctx context.Context) (callback.Result, error) {
+			return service.execute(ctx, event)
+		},
+		func(ctx context.Context, result callback.Result) error {
+			_, err := service.publisher.Publish(ctx, result)
+			return err
+		},
+	)
+}
 
-	submission, err := s.store.GetSubmissionByID(taskID)
+func (service *JudgeService) execute(ctx context.Context, event model.SubmissionRequested) (callback.Result, error) {
+	submission, err := service.store.GetSubmissionByID(event.SubmissionID)
 	if err != nil {
-		return fmt.Errorf("get submission %d: %w", taskID, err)
+		return callback.Result{}, fmt.Errorf("get submission %d: %w", event.SubmissionID, err)
 	}
-	if submission == nil || submission.Status != model.StatusPending {
-		return nil
+	if submission == nil {
+		return callback.Result{}, callback.Permanent(fmt.Errorf("submission %d does not exist", event.SubmissionID))
 	}
-	problem, err := s.store.GetProblemByID(submission.ProblemID)
+	if submission.Status != model.StatusPending {
+		return callback.Result{}, callback.Permanent(fmt.Errorf("submission %d is already terminal", event.SubmissionID))
+	}
+	if submission.ProblemID != event.ProblemID || submission.UserID != event.UserID || submission.Language != event.Language {
+		return callback.Result{}, callback.Permanent(fmt.Errorf("SubmissionRequested metadata does not match submission %d", event.SubmissionID))
+	}
+	problem, err := service.store.GetProblemByID(event.ProblemID)
 	if err != nil {
-		return fmt.Errorf("get problem %d for submission %d: %w", submission.ProblemID, taskID, err)
+		return callback.Result{}, fmt.Errorf("get problem %d: %w", event.ProblemID, err)
 	}
 	if problem == nil {
-		return fmt.Errorf("problem %d for submission %d does not exist", submission.ProblemID, taskID)
+		return callback.Result{}, callback.Permanent(fmt.Errorf("problem %d does not exist", event.ProblemID))
 	}
-	if err := s.executor.Run(ctx, submission, problem); err != nil {
-		return fmt.Errorf("execute submission %d: %w", taskID, err)
+	result, err := service.executor.Execute(ctx, submission, problem)
+	if err != nil {
+		return callback.Result{}, fmt.Errorf("execute submission %d attempt %d: %w", event.SubmissionID, event.AttemptNo, err)
 	}
-	if err := s.store.UpdateSubmissionResultInTx(submission); err != nil {
-		return fmt.Errorf("persist submission %d result: %w", taskID, err)
-	}
-	return nil
+	result.ResultID = event.EventID
+	result.SubmissionID = event.SubmissionID
+	result.AttemptNo = event.AttemptNo
+	return result, nil
 }

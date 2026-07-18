@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 
@@ -12,6 +13,7 @@ import (
 type Config struct {
 	RocketMQ         RocketMQConfig         `yaml:"rocketmq"`
 	Database         DatabaseConfig         `yaml:"database"`
+	JudgeResult      JudgeResultConfig      `yaml:"judge-result"`
 	SandboxDiscovery SandboxDiscoveryConfig `yaml:"sandbox-discovery"`
 	// 可以添加其他配置项，例如日志级别、沙盒路径等
 }
@@ -31,7 +33,8 @@ type RocketMQConfig struct {
 
 // ConsumerConfig RocketMQ 消费者特定配置
 type ConsumerConfig struct {
-	Group string `yaml:"group"`
+	Group             string `yaml:"group"`
+	MaxReconsumeTimes int32  `yaml:"max-reconsume-times"`
 }
 
 // DatabaseConfig 数据库相关配置
@@ -43,13 +46,23 @@ type DatabaseConfig struct {
 	Name     string `yaml:"name"`
 }
 
+type JudgeResultConfig struct {
+	BackendURL      string `yaml:"backend-url"`
+	ServiceToken    string `yaml:"service-token"`
+	CallbackTimeout string `yaml:"callback-timeout"`
+	CacheCapacity   int    `yaml:"cache-capacity"`
+	CacheTTL        string `yaml:"cache-ttl"`
+}
+
 type SandboxDiscoveryConfig struct {
-	Namespace       string `yaml:"namespace"`
-	Service         string `yaml:"service"`
-	PortName        string `yaml:"port-name"`
-	RefreshInterval string `yaml:"refresh-interval"`
-	ExecuteTimeout  string `yaml:"execute-timeout"`
-	Kubeconfig      string `yaml:"kubeconfig"`
+	Namespace         string `yaml:"namespace"`
+	Service           string `yaml:"service"`
+	PortName          string `yaml:"port-name"`
+	RefreshInterval   string `yaml:"refresh-interval"`
+	ExecuteTimeout    string `yaml:"execute-timeout"`
+	MaxConnections    int    `yaml:"max-connections"`
+	ConnectionIdleTTL string `yaml:"connection-idle-ttl"`
+	Kubeconfig        string `yaml:"kubeconfig"`
 }
 
 // LoadConfig 从指定路径加载配置文件
@@ -83,11 +96,23 @@ func (config *Config) applyEnvironment() error {
 	overrideString(&config.RocketMQ.NameServer, "ROCKETMQ_NAME_SERVER")
 	overrideString(&config.RocketMQ.Topic, "SUBMISSION_TOPIC")
 	overrideString(&config.RocketMQ.Consumer.Group, "ROCKETMQ_CONSUMER_GROUP")
+	if value, ok := os.LookupEnv("ROCKETMQ_MAX_RECONSUME_TIMES"); ok {
+		parsed, err := strconv.ParseInt(value, 10, 32)
+		if err != nil || parsed <= 0 || parsed > math.MaxInt32 {
+			return fmt.Errorf("ROCKETMQ_MAX_RECONSUME_TIMES must be an integer between 1 and %d", math.MaxInt32)
+		}
+		config.RocketMQ.Consumer.MaxReconsumeTimes = int32(parsed)
+	}
+	overrideString(&config.JudgeResult.BackendURL, "BACKEND_INTERNAL_URL")
+	overrideString(&config.JudgeResult.ServiceToken, "JUDGE_RESULT_SERVICE_TOKEN")
+	overrideString(&config.JudgeResult.CallbackTimeout, "JUDGE_RESULT_CALLBACK_TIMEOUT")
+	overrideString(&config.JudgeResult.CacheTTL, "JUDGE_TASK_CACHE_TTL")
 	overrideString(&config.SandboxDiscovery.Namespace, "SANDBOX_NAMESPACE")
 	overrideString(&config.SandboxDiscovery.Service, "SANDBOX_SERVICE")
 	overrideString(&config.SandboxDiscovery.PortName, "SANDBOX_PORT_NAME")
 	overrideString(&config.SandboxDiscovery.RefreshInterval, "SANDBOX_REFRESH_INTERVAL")
 	overrideString(&config.SandboxDiscovery.ExecuteTimeout, "SANDBOX_EXECUTE_TIMEOUT")
+	overrideString(&config.SandboxDiscovery.ConnectionIdleTTL, "SANDBOX_CONNECTION_IDLE_TTL")
 	overrideString(&config.SandboxDiscovery.Kubeconfig, "KUBECONFIG")
 	if value, ok := os.LookupEnv("DATABASE_PORT"); ok {
 		port, err := strconv.Atoi(value)
@@ -96,6 +121,12 @@ func (config *Config) applyEnvironment() error {
 		}
 		config.Database.Port = port
 	}
+	if err := overridePositiveInt(&config.JudgeResult.CacheCapacity, "JUDGE_TASK_CACHE_CAPACITY"); err != nil {
+		return err
+	}
+	if err := overridePositiveInt(&config.SandboxDiscovery.MaxConnections, "SANDBOX_MAX_CONNECTIONS"); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -103,4 +134,17 @@ func overrideString(target *string, environmentVariable string) {
 	if value, ok := os.LookupEnv(environmentVariable); ok {
 		*target = value
 	}
+}
+
+func overridePositiveInt(target *int, environmentVariable string) error {
+	value, ok := os.LookupEnv(environmentVariable)
+	if !ok {
+		return nil
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		return fmt.Errorf("%s must be a positive integer", environmentVariable)
+	}
+	*target = parsed
+	return nil
 }
