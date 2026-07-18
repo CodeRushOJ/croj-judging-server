@@ -92,7 +92,8 @@ func TestClientCloseRejectsNewExecutions(t *testing.T) {
 }
 
 func TestClientBoundsAndExpiresEndpointConnections(t *testing.T) {
-	client, stop := newBufconnClientWithLimits(t, time.Second, 2, 15*time.Millisecond, nil, func(context.Context, *sandboxpb.ExecuteRequest) (*sandboxpb.ExecuteResponse, error) {
+	const idleTTL = time.Hour
+	client, stop := newBufconnClientWithLimits(t, time.Second, 2, idleTTL, nil, func(context.Context, *sandboxpb.ExecuteRequest) (*sandboxpb.ExecuteResponse, error) {
 		return &sandboxpb.ExecuteResponse{Status: "Accepted"}, nil
 	})
 	defer stop()
@@ -108,7 +109,11 @@ func TestClientBoundsAndExpiresEndpointConnections(t *testing.T) {
 	}
 	client.mu.Unlock()
 
-	time.Sleep(20 * time.Millisecond)
+	client.mu.Lock()
+	for _, entry := range client.conns {
+		entry.lastUsed = time.Now().Add(-idleTTL)
+	}
+	client.mu.Unlock()
 	if _, err := client.Execute(context.Background(), "10.0.0.4:50051", &sandboxpb.ExecuteRequest{}); err != nil {
 		t.Fatalf("Execute after idle expiry: %v", err)
 	}
