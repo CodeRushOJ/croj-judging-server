@@ -89,6 +89,34 @@ func TestCacheCoalescesConcurrentDownload(t *testing.T) {
 	}
 }
 
+func TestCacheSingleflightWaiterRevalidatesItsOwnMetadata(t *testing.T) {
+	data := []byte("one shared download")
+	store := &fakeObjectStore{objects: map[string][]byte{"owner.zip": data}, delay: 20 * time.Millisecond}
+	cache, err := NewCache(t.TempDir(), 1<<20, 1<<20, time.Hour, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerMetadata := cacheMetadata("owner.zip", data)
+	ownerDone := make(chan error, 1)
+	go func() {
+		_, err := cache.Resolve(context.Background(), ownerMetadata)
+		ownerDone <- err
+	}()
+	time.Sleep(5 * time.Millisecond)
+	waiterMetadata := ownerMetadata
+	waiterMetadata.ObjectKey = "same-bytes-different-key.zip"
+	waiterMetadata.SizeBytes++
+	if _, err := cache.Resolve(context.Background(), waiterMetadata); err == nil || !IsInvalid(err) {
+		t.Fatalf("waiter accepted inconsistent metadata: %v", err)
+	}
+	if err := <-ownerDone; err != nil {
+		t.Fatal(err)
+	}
+	if store.calls.Load() != 1 {
+		t.Fatalf("downloads=%d", store.calls.Load())
+	}
+}
+
 func TestCacheRejectsSizeAndChecksumMismatchWithoutFinalFile(t *testing.T) {
 	data := []byte("bundle")
 	for name, mutate := range map[string]func(*Metadata){
