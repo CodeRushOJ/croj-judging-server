@@ -1,8 +1,8 @@
 # CodeRushOJ Judging Server
 
-Go 判题编排服务，负责消费 `submission-topic`、读取提交快照、发现可用沙箱并推进判题状态。仓库正在从早期 ZooKeeper + 模拟判题原型演进为 Kubernetes 原生、多副本安全的真实判题控制面。
+Go 判题编排服务，负责消费 `submission-topic`、读取提交快照、发现可用沙箱并推进判题状态。仓库正在从早期 ZooKeeper + 模拟判题原型演进为 Kubernetes 原生的真实判题控制面。
 
-> 当前状态：Kubernetes EndpointSlice 服务发现与并发安全轮询已实现；真实沙箱调用、提交抢占和完整测试点执行仍在后续 Issue 中，当前 `JudgeService` 仍保留模拟 Accepted 逻辑，不能作为生产判题结果使用。
+> 当前状态：Kubernetes EndpointSlice 发现、并发安全轮询和 `SandboxService.Execute` gRPC 调用已经接通，模拟 Accepted 已移除。当前兼容链路只执行一次源码请求，尚未读取不可变隐藏测试包，也尚未使用版本化消息和后端幂等结果回调，因此不能作为完整 OJ 判题链路或多副本生产方案。
 
 ## 架构
 
@@ -13,10 +13,15 @@ flowchart LR
     Judge --> API["Kubernetes API"]
     API --> ES["EndpointSlice for croj-sandbox"]
     ES --> Scheduler["Ready endpoint cache + round robin"]
-    Scheduler --> Sandbox["Sandbox Pods"]
+    Scheduler --> GRPC["Reusable gRPC connection"]
+    GRPC --> Sandbox["SandboxService.Execute"]
+    Sandbox --> Judge
+    Judge --> DB
 ```
 
 发现器只读取带 `kubernetes.io/service-name=croj-sandbox` 标签的 EndpointSlice，只保留 `Ready=true` 且非 `Terminating` 的 TCP 地址。Kubernetes API 暂时失败时，调度器保留最后一次成功快照；API 成功返回空集合时立即停止分配，避免继续调用已删除 Pod。
+
+每个 endpoint 复用一个 gRPC `ClientConn`，进程退出时统一关闭。每次 Execute 都受 `SANDBOX_EXECUTE_TIMEOUT` 限制；没有 Ready endpoint、deadline、Unavailable 等错误会返回 RocketMQ 重试路径，不会伪造终态。沙箱状态映射为后端现有的 AC/CE/WA/TLE/MLE/RE/System Error，`judge_info` 始终写入有效 JSON。
 
 ## 技术基线
 
@@ -42,6 +47,7 @@ flowchart LR
 | `SUBMISSION_TOPIC` / `ROCKETMQ_CONSUMER_GROUP` | 消费主题和消费组 | YAML |
 | `SANDBOX_NAMESPACE` / `SANDBOX_SERVICE` / `SANDBOX_PORT_NAME` | EndpointSlice 选择目标（默认 gRPC 端口名 `grpc`） | YAML |
 | `SANDBOX_REFRESH_INTERVAL` | 刷新周期，如 `5s` | YAML |
+| `SANDBOX_EXECUTE_TIMEOUT` | 单次 gRPC Execute 的总 deadline，如 `60s` | YAML |
 | `KUBECONFIG` | 集群外开发时的 kubeconfig 路径 | client-go 默认规则 |
 
 集群内优先使用 ServiceAccount token；集群外自动使用 `KUBECONFIG` 或 `$HOME/.kube/config`。
@@ -92,6 +98,7 @@ kubectl auth can-i list endpointslices.discovery.k8s.io \
 ## 故障排查
 
 - `no ready sandbox endpoints`：检查 Service selector、EndpointSlice 的 Ready/Terminating 条件和端口名 `grpc`。
+- `DeadlineExceeded` / `Unavailable`：检查 sandbox gRPC health、`SANDBOX_EXECUTE_TIMEOUT` 和 Pod 是否正在终止；消息会进入现有重试路径。
 - `forbidden: endpointslices is forbidden`：确认 Deployment 使用正确 ServiceAccount，并应用 RBAC。
 - 集群外无法读取 API：检查 `KUBECONFIG` 指向容器内可见路径，必要时以只读方式挂载 kubeconfig。
 - RocketMQ 消费失败：核对 NameServer、topic 和 consumer group；消息体应是十进制 submission ID。
@@ -99,7 +106,9 @@ kubectl auth can-i list endpointslices.discovery.k8s.io \
 
 ## 开发与版本
 
-- 需求与验收使用 GitHub Issues 管理；当前 Kubernetes 发现工作见 Issue #2。
+- 需求与验收使用 GitHub Issues 管理；Kubernetes 发现见 Issue #2，真实 gRPC Execute 见 Issue #4。
+- Issue #5 跟踪版本化 RocketMQ payload、稳定 `resultId` 和后端 authenticated/idempotent result callback。在其完成前，本服务仍直接写 MySQL，不能安全横向扩展。
+- 不可变隐藏测试包、多测试组/OI 计分与 special judge 是后续独立里程碑；当前 Execute 请求的 stdin/expected output 为空，只证明真实编译执行链路，不证明答案正确性。
 - 变更通过 `codex/*` 分支和 Draft PR 集成，不直接提交到 `main`。
 - 发布遵循 SemVer，并在 GitHub Release 与平台 `CHANGELOG.md` 中记录跨仓库兼容性。
 - 提交前必须通过 `go test -race ./...`、`go vet ./...` 和容器构建。

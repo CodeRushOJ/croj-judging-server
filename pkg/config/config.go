@@ -48,6 +48,7 @@ type SandboxDiscoveryConfig struct {
 	Service         string `yaml:"service"`
 	PortName        string `yaml:"port-name"`
 	RefreshInterval string `yaml:"refresh-interval"`
+	ExecuteTimeout  string `yaml:"execute-timeout"`
 	Kubeconfig      string `yaml:"kubeconfig"`
 }
 
@@ -86,6 +87,7 @@ func (config *Config) applyEnvironment() error {
 	overrideString(&config.SandboxDiscovery.Service, "SANDBOX_SERVICE")
 	overrideString(&config.SandboxDiscovery.PortName, "SANDBOX_PORT_NAME")
 	overrideString(&config.SandboxDiscovery.RefreshInterval, "SANDBOX_REFRESH_INTERVAL")
+	overrideString(&config.SandboxDiscovery.ExecuteTimeout, "SANDBOX_EXECUTE_TIMEOUT")
 	overrideString(&config.SandboxDiscovery.Kubeconfig, "KUBECONFIG")
 	if value, ok := os.LookupEnv("DATABASE_PORT"); ok {
 		port, err := strconv.Atoi(value)

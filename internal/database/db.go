@@ -72,6 +72,21 @@ func (d *Database) GetSubmissionByID(submissionID int64) (*model.Task, error) {
 	return submission, nil
 }
 
+// GetProblemByID returns the execution limits that are snapshotted into the
+// sandbox compatibility request. Versioned immutable problem data remains a
+// follow-up contract with the backend.
+func (d *Database) GetProblemByID(problemID int64) (*model.Problem, error) {
+	problem := &model.Problem{}
+	result := d.DB.First(problem, problemID)
+	if result.Error != nil {
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get problem %d: %w", problemID, result.Error)
+	}
+	return problem, nil
+}
+
 // UpdateSubmission 更新数据库中的提交状态或结果
 // 此函数现在只负责更新 Submission (Task) 本身，事务和 problem count 更新由 UpdateSubmissionResultInTx 处理
 func (d *Database) UpdateSubmission(tx *gorm.DB, submission *model.Task) error { // 参数类型改为 *model.Task
@@ -93,7 +108,7 @@ func (d *Database) UpdateSubmission(tx *gorm.DB, submission *model.Task) error {
 
 	// 使用传入的事务对象 tx 进行操作
 	// 使用 Model 和 Where 定位记录，然后用 Updates 更新
-	db := d.DB // 默认为原始 DB 连接
+	db := d.DB     // 默认为原始 DB 连接
 	if tx != nil { // 如果传入了事务对象，则使用事务对象
 		db = tx
 	}

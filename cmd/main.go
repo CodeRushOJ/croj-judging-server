@@ -12,10 +12,10 @@ import (
 	"github.com/CodeRushOJ/croj-judging-server/internal/consumer"
 	"github.com/CodeRushOJ/croj-judging-server/internal/database"
 	"github.com/CodeRushOJ/croj-judging-server/internal/discovery"
+	"github.com/CodeRushOJ/croj-judging-server/internal/sandbox"
 	"github.com/CodeRushOJ/croj-judging-server/internal/scheduler"
 	"github.com/CodeRushOJ/croj-judging-server/internal/service"
 	"github.com/CodeRushOJ/croj-judging-server/pkg/config"
-	// "github.com/CodeRushOJ/croj-judging-server/internal/sandbox" // 沙盒客户端在此服务中不再需要
 )
 
 func main() {
@@ -52,7 +52,18 @@ func main() {
 	sandboxScheduler := scheduler.New(discoveryClient)
 	fmt.Println("Scheduler initialized.")
 
-	judgeService := service.NewJudgeService(db, sandboxScheduler, nil)
+	executeTimeout, err := time.ParseDuration(cfg.SandboxDiscovery.ExecuteTimeout)
+	if err != nil || executeTimeout <= 0 {
+		log.Fatalf("Invalid sandbox execute timeout: %q", cfg.SandboxDiscovery.ExecuteTimeout)
+	}
+	sandboxClient := sandbox.NewClient(executeTimeout)
+	defer func() {
+		if err := sandboxClient.Close(); err != nil {
+			log.Printf("Failed to close sandbox client: %v", err)
+		}
+	}()
+	executionPipeline := service.NewExecutionPipeline(sandboxScheduler, sandboxClient)
+	judgeService := service.NewJudgeService(db, executionPipeline)
 	fmt.Println("Judge service initialized.")
 
 	// 启动 RocketMQ 消费者

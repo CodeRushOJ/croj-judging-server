@@ -1,65 +1,101 @@
 package sandbox
 
 import (
-	"bytes"
-	"encoding/json"
+	"context"
+	"errors"
 	"fmt"
-	"net/http"
+	"sync"
 	"time"
 
-	"github.com/CodeRushOJ/croj-judging-server/pkg/model"
+	sandboxpb "github.com/CodeRushOJ/croj-judging-server/proto"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
-// Client 结构体，用于与判题沙盒交互
+var ErrClientClosed = errors.New("sandbox client is closed")
+
+// Client owns one reusable gRPC connection per ready sandbox endpoint.
 type Client struct {
-	httpClient *http.Client
+	timeout     time.Duration
+	dialOptions []grpc.DialOption
+
+	mu     sync.Mutex
+	conns  map[string]*grpc.ClientConn
+	closed bool
 }
 
-// NewClient 创建一个新的判题沙盒客户端
-func NewClient() *Client {
+func NewClient(timeout time.Duration, dialOptions ...grpc.DialOption) *Client {
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	options := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+	options = append(options, dialOptions...)
 	return &Client{
-		httpClient: &http.Client{
-			Timeout: 30 * time.Second, // 设置请求超时
-		},
+		timeout:     timeout,
+		dialOptions: options,
+		conns:       make(map[string]*grpc.ClientConn),
 	}
 }
 
-// Judge 向指定的沙盒发送判题请求
-func (c *Client) Judge(sandboxAddr string, task *model.Task) (*model.JudgeResult, error) {
-	fmt.Printf("Sending judge request for task %d to sandbox %s...\n", task.ID, sandboxAddr)
+func (c *Client) Execute(ctx context.Context, address string, request *sandboxpb.ExecuteRequest) (*sandboxpb.ExecuteResponse, error) {
+	if address == "" {
+		return nil, fmt.Errorf("sandbox address is required")
+	}
+	if request == nil {
+		return nil, fmt.Errorf("sandbox execute request is required")
+	}
 
-	// 准备请求体
-	requestBody, err := json.Marshal(task) // 假设沙盒接收 Task 对象
+	connection, err := c.connection(address)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal judge request: %w", err)
+		return nil, err
 	}
-
-	// 构建 HTTP 请求
-	url := fmt.Sprintf("http://%s/judge", sandboxAddr) // 假设沙盒的判题接口是 /judge
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(requestBody))
+	rpcContext, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	response, err := sandboxpb.NewSandboxServiceClient(connection).Execute(rpcContext, request)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create judge request: %w", err)
+		return nil, fmt.Errorf("execute on sandbox %s: %w", address, err)
 	}
-	req.Header.Set("Content-Type", "application/json")
+	return response, nil
+}
 
-	// 发送请求
-	resp, err := c.httpClient.Do(req)
+func (c *Client) connection(address string) (*grpc.ClientConn, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return nil, ErrClientClosed
+	}
+	if connection := c.conns[address]; connection != nil {
+		return connection, nil
+	}
+	// EndpointSlice returns an already-resolved Pod address. Passthrough avoids
+	// sending that address through gRPC's default DNS resolver a second time.
+	connection, err := grpc.NewClient("passthrough:///"+address, c.dialOptions...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to send judge request to %s: %w", sandboxAddr, err)
+		return nil, fmt.Errorf("create gRPC client for sandbox %s: %w", address, err)
 	}
-	defer resp.Body.Close()
+	c.conns[address] = connection
+	return connection, nil
+}
 
-	// 处理响应
-	if resp.StatusCode != http.StatusOK {
-		// 可以读取响应体获取更详细的错误信息
-		return nil, fmt.Errorf("sandbox %s returned non-OK status: %d", sandboxAddr, resp.StatusCode)
+func (c *Client) Close() error {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil
 	}
-
-	var result model.JudgeResult
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode judge response from %s: %w", sandboxAddr, err)
+	c.closed = true
+	connections := make([]*grpc.ClientConn, 0, len(c.conns))
+	for _, connection := range c.conns {
+		connections = append(connections, connection)
 	}
+	c.conns = nil
+	c.mu.Unlock()
 
-	fmt.Printf("Received judge result for task %d from sandbox %s.\n", task.ID, sandboxAddr)
-	return &result, nil
+	var closeErrors []error
+	for _, connection := range connections {
+		if err := connection.Close(); err != nil {
+			closeErrors = append(closeErrors, err)
+		}
+	}
+	return errors.Join(closeErrors...)
 }

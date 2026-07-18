@@ -18,4 +18,5 @@ sandbox-discovery:
   service: "croj-sandbox"
   port-name: "grpc"
   refresh-interval: "5s"
+  execute-timeout: "60s"
   kubeconfig: ""
