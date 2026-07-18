@@ -95,7 +95,14 @@ func (cache *Cache) Resolve(ctx context.Context, metadata Metadata) (string, err
 		case <-ctx.Done():
 			return "", ctx.Err()
 		case <-done:
-			return flight.path, flight.err
+			if flight.err != nil {
+				return "", flight.err
+			}
+			if err := verifyCachedFile(flight.path, metadata); err != nil {
+				return "", Invalid(fmt.Errorf("bundle metadata disagrees with coalesced cache entry: %w", err))
+			}
+			cache.record(metadata.SHA256, flight.path, metadata.SizeBytes)
+			return flight.path, nil
 		}
 	}
 	flight := &cacheFlight{done: make(chan struct{})}
