@@ -35,11 +35,11 @@ func NewBundlePipeline(selector SandboxSelector, executor SandboxExecutor, maxIn
 func (pipeline *BundlePipeline) ExecuteArtifact(
 	ctx context.Context,
 	submission *model.Task,
-	problem *model.Problem,
+	executionConfig ExecutionConfig,
 	artifact CaseArtifact,
 ) (callback.Result, error) {
-	if submission == nil || problem == nil || artifact == nil {
-		return callback.Result{}, fmt.Errorf("submission, problem, and test artifact are required")
+	if submission == nil || artifact == nil || executionConfig.TimeLimitMillis <= 0 || executionConfig.MemoryLimitMB <= 0 {
+		return callback.Result{}, fmt.Errorf("submission, immutable execution config, and test artifact are required")
 	}
 	manifest := artifact.Manifest()
 	if err := manifest.Validate(); err != nil {
@@ -52,7 +52,7 @@ func (pipeline *BundlePipeline) ExecuteArtifact(
 		if err != nil {
 			return systemErrorResult("bundle case could not be read"), nil
 		}
-		response, infrastructureExhausted, err := pipeline.executeCase(ctx, submission, problem, manifest.Checker, input, expected)
+		response, infrastructureExhausted, err := pipeline.executeCase(ctx, submission, executionConfig, manifest.Checker, input, expected)
 		if err != nil {
 			return callback.Result{}, err
 		}
@@ -92,7 +92,7 @@ func (pipeline *BundlePipeline) ExecuteArtifact(
 func (pipeline *BundlePipeline) executeCase(
 	ctx context.Context,
 	submission *model.Task,
-	problem *model.Problem,
+	executionConfig ExecutionConfig,
 	checker bundle.Checker,
 	input string,
 	expected string,
@@ -110,8 +110,8 @@ func (pipeline *BundlePipeline) executeCase(
 			Language:       submission.Language,
 			SourceCode:     submission.Code,
 			Stdin:          input,
-			Timeout:        timeoutSeconds(problem.TimeLimit),
-			MemoryLimit:    boundedInt32(problem.MemoryLimit),
+			Timeout:        timeoutSeconds(executionConfig.TimeLimitMillis),
+			MemoryLimit:    boundedInt32(executionConfig.MemoryLimitMB),
 			ExpectedOutput: expectedForSandbox,
 		})
 		if err != nil {

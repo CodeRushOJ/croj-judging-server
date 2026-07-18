@@ -9,7 +9,7 @@ Go 判题编排服务，负责消费 `submission-topic`、读取提交快照、�
 ```mermaid
 flowchart LR
     MQ["RocketMQ submission-topic"] --> Judge["Judging Server"]
-    Judge -->|"只读 immutable metadata"| DB["MySQL submissions/problems/test_bundle"]
+    Judge -->|"只读 immutable metadata"| DB["MySQL submission/problem_version/test_bundle"]
     Judge --> Cache["SHA-256 disk cache"]
     Cache --> MinIO["S3 / MinIO immutable ZIP"]
     Judge --> API["Kubernetes API"]
@@ -34,7 +34,7 @@ flowchart LR
 
 未知字段、非 UUID `eventId`、不支持的版本和非法标识会被永久拒绝并 ACK。进程内任务注册表按 `eventId/submissionId/attemptNo` 合并并发重复消息；回调临时失败时复用完全相同的结果，`eventId` 直接作为稳定 `resultId`。后端返回 `200 APPLIED/DUPLICATE` 时完成，`400/403/404/409` 等契约错误视为永久结果并 ACK；网络错误、`401/408/425/429` 和 `5xx` 重试。RocketMQ 重试超过配置上限后投递到 consumer group 的 DLQ，后端 result receipt 是跨进程、跨副本的最终幂等权威。
 
-判题服务不再直接写 MySQL。它只读加载源码、题目限制、`submission.problem_version_id` 和唯一 `t_test_bundle` 元数据，建议使用只读数据库账号。
+判题服务不再直接写 MySQL。它只读加载提交源码、`submission.problem_version_id` 指定的唯一 `t_problem_version` 和对应 `t_test_bundle`，建议使用只读数据库账号。执行限制与判题模式只来自不可变版本的 `limits_json` / `judge_config_json`；版本 ID、题目 ID 必须与提交一致且状态必须为 `PUBLISHED`。可变 `t_problem` 不参与主判题链。
 
 ## 隐藏测试包 v1
 
@@ -55,7 +55,7 @@ flowchart LR
 
 读取 ZIP 前会拒绝未知字段、重复 ID/路径、绝对路径、反斜杠、路径穿越、符号链接、非普通文件、加密/未知压缩方法、zip bomb、超量文件和解压大小越界。文件不会解压到目录。`WriteDeterministicArchive` 可生成固定时间戳、固定权限、排序 entry 的可复现 artifact，并返回应写入数据库的规范 manifest JSON。
 
-缓存以 SHA-256 为键，下载时流式执行 size/SHA-256 校验并原子 rename；并发 miss 合并为一次下载，命中会重新校验，损坏后自动重拉。进程启动会删除本 cache 目录中的旧 ZIP、临时文件和同名 symlink，不跟随链接；因此该目录必须是 judging 专用 emptyDir。
+缓存以 SHA-256 为键，下载时流式执行 size/SHA-256 校验并原子 rename；并发 miss 合并为一次下载，命中会重新校验，损坏后自动重拉。同一 SHA-256 可跨不同 object key 复用完全相同的字节，但每一条数据库元数据的期望 size/SHA-256 都会独立复核；object key 仅是下载定位符。进程启动会删除本 cache 目录中的旧 ZIP、临时文件和同名 symlink，不跟随链接；因此该目录必须是 judging 专用 emptyDir。
 
 ## 技术基线
 

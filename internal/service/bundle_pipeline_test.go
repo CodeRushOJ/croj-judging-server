@@ -63,7 +63,7 @@ func TestBundlePipelineRunsCasesInOrderAndAggregatesMaximumMetrics(t *testing.T)
 		{Status: "Accepted", TimeUsed: 15, MemoryUsed: 700, Stdout: "two\n"},
 	}}
 	pipeline := NewBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a", "sandbox-b"}}, executor, 2)
-	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validBundleProblem(), artifact)
+	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validExecutionConfig(), artifact)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +80,7 @@ func TestBundlePipelineTokenCheckerComparesInJudging(t *testing.T) {
 	artifact.manifest.Checker = bundle.CheckerToken
 	executor := &sequenceExecutor{responses: []*sandboxpb.ExecuteResponse{{Status: "Accepted", Stdout: " one\t\n"}}}
 	pipeline := NewBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a"}}, executor, 2)
-	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validBundleProblem(), artifact)
+	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validExecutionConfig(), artifact)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +113,7 @@ func TestBundlePipelineDoesNotPublishHiddenContents(t *testing.T) {
 	artifact.contents[artifact.manifest.Cases[0].Output] = "hidden-output-secret"
 	executor := &sequenceExecutor{responses: []*sandboxpb.ExecuteResponse{{Status: "Accepted", Stdout: "contestant-output"}}}
 	pipeline := NewBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a"}}, executor, 1)
-	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validBundleProblem(), artifact)
+	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validExecutionConfig(), artifact)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +132,7 @@ func TestBundlePipelineStopsAtFirstContestantVerdict(t *testing.T) {
 		{Status: "Accepted"},
 	}}
 	pipeline := NewBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a"}}, executor, 2)
-	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validBundleProblem(), artifact)
+	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validExecutionConfig(), artifact)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +148,7 @@ func TestBundlePipelineMapsOutputLimitToRuntimeErrorWithoutRetry(t *testing.T) {
 		{Status: "Accepted"},
 	}}
 	pipeline := NewBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a", "sandbox-b"}}, executor, 2)
-	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validBundleProblem(), artifact)
+	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validExecutionConfig(), artifact)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +173,7 @@ func TestBundlePipelineFailsOverInfrastructureFailuresOnly(t *testing.T) {
 				errors:    []error{first.err, nil},
 			}
 			pipeline := NewBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a", "sandbox-b"}}, executor, 2)
-			result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validBundleProblem(), artifact)
+			result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validExecutionConfig(), artifact)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -188,7 +188,7 @@ func TestBundlePipelineReturnsSystemErrorAfterUnknownStatusLimit(t *testing.T) {
 	artifact := exactArtifact(1)
 	executor := &sequenceExecutor{responses: []*sandboxpb.ExecuteResponse{{Status: "Mystery"}, {Status: "Mystery"}}}
 	pipeline := NewBundlePipeline(&sequenceSelector{endpoints: []string{"a", "b"}}, executor, 2)
-	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validBundleProblem(), artifact)
+	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validExecutionConfig(), artifact)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,4 +213,6 @@ func exactArtifact(count int) *memoryArtifact {
 func validBundleSubmission() *model.Task {
 	return &model.Task{ID: 99, Language: "go", Code: "package main"}
 }
-func validBundleProblem() *model.Problem { return &model.Problem{TimeLimit: 1000, MemoryLimit: 64} }
+func validExecutionConfig() ExecutionConfig {
+	return ExecutionConfig{TimeLimitMillis: 1000, MemoryLimitMB: 64}
+}

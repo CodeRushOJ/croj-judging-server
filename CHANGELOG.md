@@ -14,6 +14,7 @@
 - 增加进程内有界任务注册表，合并并发重复事件，并在临时回调失败后复用稳定结果载荷。
 - 增加消息 ACK/重试分类、回调契约、并发幂等与连接淘汰测试。
 - 增加 `submission.problem_version_id` 到唯一 `t_test_bundle` 的只读不可变元数据链路。
+- 增加 `t_problem_version` 的发布态、题目归属和严格执行快照校验，时间/内存与 ACM/SPJ/OI 判定不再读取可变 `t_problem`。
 - 增加严格 manifest v1、确定性 ZIP builder、安全 central-directory 校验和 exact/token ACM checker。
 - 增加 S3/MinIO 有界流式下载、size/SHA-256 校验及原子发布。
 - 增加 checksum-keyed 磁盘缓存、并发下载合并、命中校验、损坏修复、TTL/LRU 和 restart orphan 清理。
@@ -22,7 +23,7 @@
 ### Changed
 
 - `JudgeService` 不再模拟 Accepted；它从 EndpointSlice 轮询调度器选择 Ready sandbox，使用题目限制执行真实源码，并通过后端内部 API 发布结果。
-- 移除判题服务的 MySQL 写路径；数据库仅作为源码和题目限制的只读兼容来源，结果事务、CAS 和计数由后端统一处理。
+- 移除判题服务的 MySQL 写路径；数据库仅用于只读提交、不可变题目版本与测试包元数据，结果事务、CAS 和计数由后端统一处理。
 - gRPC endpoint 连接缓存增加容量上限、空闲 TTL 和 LRU 空闲连接淘汰，避免 Pod churn 导致连接无界增长。
 - `400/403/404/409` 等契约型回调响应被永久 ACK；网络错误、`401/408/425/429`、`5xx` 以及沙箱资源不足/不可用错误进入有界 RocketMQ 重试，超限转入 DLQ。
 - HTTP callback 禁止自动跟随重定向，避免服务 token 被 3xx 转发至非预期地址。

@@ -25,7 +25,7 @@ func NewHiddenTestExecutor(provider ArtifactProvider, pipeline *BundlePipeline) 
 func (executor *HiddenTestExecutor) Execute(
 	ctx context.Context,
 	submission *model.Task,
-	problem *model.Problem,
+	executionConfig ExecutionConfig,
 	metadata *model.TestBundle,
 ) (result callback.Result, resultErr error) {
 	if executor == nil || executor.provider == nil || executor.pipeline == nil {
@@ -43,5 +43,5 @@ func (executor *HiddenTestExecutor) Execute(
 			result = systemErrorResult("immutable test bundle could not be closed")
 		}
 	}()
-	return executor.pipeline.ExecuteArtifact(ctx, submission, problem, artifact)
+	return executor.pipeline.ExecuteArtifact(ctx, submission, executionConfig, artifact)
 }
