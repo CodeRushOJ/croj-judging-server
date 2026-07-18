@@ -21,19 +21,20 @@ const (
 
 // Task 对应数据库中的 t_submission 表
 type Task struct {
-	ID           int64            `gorm:"column:id;primaryKey;autoIncrement" json:"id"`
-	ProblemID    int64            `gorm:"column:problem_id;not null" json:"problem_id"`
-	UserID       int64            `gorm:"column:user_id;not null" json:"user_id"`
-	Language     string           `gorm:"column:language;size:20;not null" json:"language"`
-	Code         string           `gorm:"column:code;type:text;not null" json:"code"`
-	Status       SubmissionStatus `gorm:"column:status;not null;default:0" json:"status"`
-	RunTime      *int             `gorm:"column:run_time" json:"run_time,omitempty"`                     // 使用指针以区分 0 和 NULL
-	Memory       *int             `gorm:"column:memory" json:"memory,omitempty"`                         // 使用指针以区分 0 和 NULL
-	JudgeInfo    *string          `gorm:"column:judge_info;type:text" json:"judge_info,omitempty"`       // 使用指针处理 NULL
-	Score        *int             `gorm:"column:score" json:"score,omitempty"`                           // 使用指针处理 NULL
-	ErrorMessage *string          `gorm:"column:error_message;type:text" json:"error_message,omitempty"` // 使用指针处理 NULL
-	CreateTime   time.Time        `gorm:"column:create_time;not null;default:CURRENT_TIMESTAMP" json:"create_time"`
-	UpdateTime   time.Time        `gorm:"column:update_time;not null;default:CURRENT_TIMESTAMP;onUpdate:CURRENT_TIMESTAMP" json:"update_time"`
+	ID               int64            `gorm:"column:id;primaryKey;autoIncrement" json:"id"`
+	ProblemID        int64            `gorm:"column:problem_id;not null" json:"problem_id"`
+	ProblemVersionID *int64           `gorm:"column:problem_version_id" json:"problem_version_id,omitempty"`
+	UserID           int64            `gorm:"column:user_id;not null" json:"user_id"`
+	Language         string           `gorm:"column:language;size:20;not null" json:"language"`
+	Code             string           `gorm:"column:code;type:text;not null" json:"code"`
+	Status           SubmissionStatus `gorm:"column:status;not null;default:0" json:"status"`
+	RunTime          *int             `gorm:"column:run_time" json:"run_time,omitempty"`                     // 使用指针以区分 0 和 NULL
+	Memory           *int             `gorm:"column:memory" json:"memory,omitempty"`                         // 使用指针以区分 0 和 NULL
+	JudgeInfo        *string          `gorm:"column:judge_info;type:text" json:"judge_info,omitempty"`       // 使用指针处理 NULL
+	Score            *int             `gorm:"column:score" json:"score,omitempty"`                           // 使用指针处理 NULL
+	ErrorMessage     *string          `gorm:"column:error_message;type:text" json:"error_message,omitempty"` // 使用指针处理 NULL
+	CreateTime       time.Time        `gorm:"column:create_time;not null;default:CURRENT_TIMESTAMP" json:"create_time"`
+	UpdateTime       time.Time        `gorm:"column:update_time;not null;default:CURRENT_TIMESTAMP;onUpdate:CURRENT_TIMESTAMP" json:"update_time"`
 	// IsDeleted field is omitted for simplicity, assuming soft deletes are handled elsewhere or not needed for this service
 }
 
