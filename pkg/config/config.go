@@ -14,6 +14,7 @@ type Config struct {
 	RocketMQ         RocketMQConfig         `yaml:"rocketmq"`
 	Database         DatabaseConfig         `yaml:"database"`
 	JudgeResult      JudgeResultConfig      `yaml:"judge-result"`
+	TestBundles      TestBundleConfig       `yaml:"test-bundles"`
 	SandboxDiscovery SandboxDiscoveryConfig `yaml:"sandbox-discovery"`
 	// 可以添加其他配置项，例如日志级别、沙盒路径等
 }
@@ -52,6 +53,25 @@ type JudgeResultConfig struct {
 	CallbackTimeout string `yaml:"callback-timeout"`
 	CacheCapacity   int    `yaml:"cache-capacity"`
 	CacheTTL        string `yaml:"cache-ttl"`
+}
+
+type TestBundleConfig struct {
+	Endpoint             string `yaml:"endpoint"`
+	Bucket               string `yaml:"bucket"`
+	Region               string `yaml:"region"`
+	UseTLS               bool   `yaml:"use-tls"`
+	AccessKey            string `yaml:"access-key"`
+	SecretKey            string `yaml:"secret-key"`
+	CacheDir             string `yaml:"cache-dir"`
+	CacheMaxBytes        int64  `yaml:"cache-max-bytes"`
+	MaxObjectBytes       int64  `yaml:"max-object-bytes"`
+	CacheTTL             string `yaml:"cache-ttl"`
+	MaxFiles             int    `yaml:"max-files"`
+	MaxManifestBytes     int64  `yaml:"max-manifest-bytes"`
+	MaxCaseBytes         int64  `yaml:"max-case-bytes"`
+	MaxUncompressedBytes int64  `yaml:"max-uncompressed-bytes"`
+	MaxCompressionRatio  uint64 `yaml:"max-compression-ratio"`
+	MaxInfraAttempts     int    `yaml:"max-infra-attempts"`
 }
 
 type SandboxDiscoveryConfig struct {
@@ -107,6 +127,31 @@ func (config *Config) applyEnvironment() error {
 	overrideString(&config.JudgeResult.ServiceToken, "JUDGE_RESULT_SERVICE_TOKEN")
 	overrideString(&config.JudgeResult.CallbackTimeout, "JUDGE_RESULT_CALLBACK_TIMEOUT")
 	overrideString(&config.JudgeResult.CacheTTL, "JUDGE_TASK_CACHE_TTL")
+	overrideString(&config.TestBundles.Endpoint, "TEST_BUNDLE_ENDPOINT")
+	overrideString(&config.TestBundles.Bucket, "TEST_BUNDLE_BUCKET")
+	overrideString(&config.TestBundles.Region, "TEST_BUNDLE_REGION")
+	overrideString(&config.TestBundles.AccessKey, "TEST_BUNDLE_ACCESS_KEY")
+	overrideString(&config.TestBundles.SecretKey, "TEST_BUNDLE_SECRET_KEY")
+	overrideString(&config.TestBundles.CacheDir, "TEST_BUNDLE_CACHE_DIR")
+	overrideString(&config.TestBundles.Endpoint, "OBJECT_STORAGE_ENDPOINT")
+	overrideString(&config.TestBundles.Bucket, "OBJECT_STORAGE_BUCKET")
+	overrideString(&config.TestBundles.Region, "OBJECT_STORAGE_REGION")
+	overrideString(&config.TestBundles.AccessKey, "OBJECT_STORAGE_ACCESS_KEY")
+	overrideString(&config.TestBundles.SecretKey, "OBJECT_STORAGE_SECRET_KEY")
+	overrideString(&config.TestBundles.CacheDir, "JUDGE_BUNDLE_CACHE_DIR")
+	overrideString(&config.TestBundles.CacheTTL, "TEST_BUNDLE_CACHE_TTL")
+	overrideString(&config.TestBundles.CacheTTL, "JUDGE_BUNDLE_CACHE_TTL")
+	tlsValue, tlsConfigured := os.LookupEnv("TEST_BUNDLE_USE_TLS")
+	if canonicalValue, ok := os.LookupEnv("OBJECT_STORAGE_USE_TLS"); ok {
+		tlsValue, tlsConfigured = canonicalValue, true
+	}
+	if tlsConfigured {
+		parsed, err := strconv.ParseBool(tlsValue)
+		if err != nil {
+			return fmt.Errorf("OBJECT_STORAGE_USE_TLS must be true or false")
+		}
+		config.TestBundles.UseTLS = parsed
+	}
 	overrideString(&config.SandboxDiscovery.Namespace, "SANDBOX_NAMESPACE")
 	overrideString(&config.SandboxDiscovery.Service, "SANDBOX_SERVICE")
 	overrideString(&config.SandboxDiscovery.PortName, "SANDBOX_PORT_NAME")
@@ -127,6 +172,67 @@ func (config *Config) applyEnvironment() error {
 	if err := overridePositiveInt(&config.SandboxDiscovery.MaxConnections, "SANDBOX_MAX_CONNECTIONS"); err != nil {
 		return err
 	}
+	for _, override := range []struct {
+		target *int
+		name   string
+	}{
+		{&config.TestBundles.MaxFiles, "TEST_BUNDLE_MAX_FILES"},
+		{&config.TestBundles.MaxInfraAttempts, "TEST_BUNDLE_MAX_INFRA_ATTEMPTS"},
+	} {
+		if err := overridePositiveInt(override.target, override.name); err != nil {
+			return err
+		}
+	}
+	for _, override := range []struct {
+		target *int
+		name   string
+	}{
+		{&config.TestBundles.MaxFiles, "JUDGE_BUNDLE_MAX_FILES"},
+		{&config.TestBundles.MaxInfraAttempts, "JUDGE_BUNDLE_MAX_INFRA_ATTEMPTS"},
+	} {
+		if err := overridePositiveInt(override.target, override.name); err != nil {
+			return err
+		}
+	}
+	for _, override := range []struct {
+		target *int64
+		name   string
+	}{
+		{&config.TestBundles.CacheMaxBytes, "TEST_BUNDLE_CACHE_MAX_BYTES"},
+		{&config.TestBundles.MaxObjectBytes, "TEST_BUNDLE_MAX_OBJECT_BYTES"},
+		{&config.TestBundles.MaxManifestBytes, "TEST_BUNDLE_MAX_MANIFEST_BYTES"},
+		{&config.TestBundles.MaxCaseBytes, "TEST_BUNDLE_MAX_CASE_BYTES"},
+		{&config.TestBundles.MaxUncompressedBytes, "TEST_BUNDLE_MAX_UNCOMPRESSED_BYTES"},
+	} {
+		if err := overridePositiveInt64(override.target, override.name); err != nil {
+			return err
+		}
+	}
+	for _, override := range []struct {
+		target *int64
+		name   string
+	}{
+		{&config.TestBundles.CacheMaxBytes, "JUDGE_BUNDLE_CACHE_MAX_BYTES"},
+		{&config.TestBundles.MaxObjectBytes, "JUDGE_BUNDLE_MAX_OBJECT_BYTES"},
+		{&config.TestBundles.MaxManifestBytes, "JUDGE_BUNDLE_MAX_MANIFEST_BYTES"},
+		{&config.TestBundles.MaxCaseBytes, "JUDGE_BUNDLE_MAX_CASE_BYTES"},
+		{&config.TestBundles.MaxUncompressedBytes, "JUDGE_BUNDLE_MAX_UNCOMPRESSED_BYTES"},
+	} {
+		if err := overridePositiveInt64(override.target, override.name); err != nil {
+			return err
+		}
+	}
+	compressionRatio, compressionRatioConfigured := os.LookupEnv("TEST_BUNDLE_MAX_COMPRESSION_RATIO")
+	if canonicalValue, ok := os.LookupEnv("JUDGE_BUNDLE_MAX_COMPRESSION_RATIO"); ok {
+		compressionRatio, compressionRatioConfigured = canonicalValue, true
+	}
+	if compressionRatioConfigured {
+		parsed, err := strconv.ParseUint(compressionRatio, 10, 64)
+		if err != nil || parsed == 0 {
+			return fmt.Errorf("JUDGE_BUNDLE_MAX_COMPRESSION_RATIO must be a positive integer")
+		}
+		config.TestBundles.MaxCompressionRatio = parsed
+	}
 	return nil
 }
 
@@ -142,6 +248,19 @@ func overridePositiveInt(target *int, environmentVariable string) error {
 		return nil
 	}
 	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		return fmt.Errorf("%s must be a positive integer", environmentVariable)
+	}
+	*target = parsed
+	return nil
+}
+
+func overridePositiveInt64(target *int64, environmentVariable string) error {
+	value, ok := os.LookupEnv(environmentVariable)
+	if !ok {
+		return nil
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
 	if err != nil || parsed <= 0 {
 		return fmt.Errorf("%s must be a positive integer", environmentVariable)
 	}

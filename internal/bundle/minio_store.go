@@ -52,6 +52,11 @@ func (store *MinIOStore) Open(ctx context.Context, key string) (Object, error) {
 	info, err := object.Stat()
 	if err != nil {
 		_ = object.Close()
+		response := minio.ToErrorResponse(err)
+		switch response.Code {
+		case "NoSuchKey", "NoSuchObject", "NoSuchBucket", "NotFound":
+			return Object{}, Invalid(fmt.Errorf("bundle object does not exist: %w", err))
+		}
 		return Object{}, fmt.Errorf("stat bundle object: %w", err)
 	}
 	return Object{Body: object, Size: info.Size}, nil

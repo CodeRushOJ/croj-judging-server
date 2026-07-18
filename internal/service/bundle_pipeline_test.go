@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/CodeRushOJ/croj-judging-server/internal/bundle"
@@ -91,6 +92,39 @@ func TestBundlePipelineTokenCheckerComparesInJudging(t *testing.T) {
 	}
 }
 
+func TestOutputCheckersMatchDocumentedNormalization(t *testing.T) {
+	if !outputsMatch(bundle.CheckerExact, "  one  \r\n two\t\n\n", "one\ntwo") {
+		t.Fatal("exact checker did not match sandbox normalization")
+	}
+	if outputsMatch(bundle.CheckerExact, "unexpected", "") {
+		t.Fatal("empty expected output bypassed exact comparison")
+	}
+	if !outputsMatch(bundle.CheckerToken, "one\t two\n", " one two ") {
+		t.Fatal("token checker rejected equivalent tokens")
+	}
+	if outputsMatch(bundle.CheckerToken, "one two", "one three") {
+		t.Fatal("token checker accepted different tokens")
+	}
+}
+
+func TestBundlePipelineDoesNotPublishHiddenContents(t *testing.T) {
+	artifact := exactArtifact(1)
+	artifact.contents[artifact.manifest.Cases[0].Input] = "hidden-input-secret"
+	artifact.contents[artifact.manifest.Cases[0].Output] = "hidden-output-secret"
+	executor := &sequenceExecutor{responses: []*sandboxpb.ExecuteResponse{{Status: "Accepted", Stdout: "contestant-output"}}}
+	pipeline := NewBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a"}}, executor, 1)
+	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validBundleProblem(), artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serialized := result.Stdout + result.Stderr + result.CompileError
+	for _, secret := range []string{"hidden-input-secret", "hidden-output-secret", "contestant-output"} {
+		if strings.Contains(serialized, secret) {
+			t.Fatalf("callback leaked %q: %+v", secret, result)
+		}
+	}
+}
+
 func TestBundlePipelineStopsAtFirstContestantVerdict(t *testing.T) {
 	artifact := exactArtifact(2)
 	executor := &sequenceExecutor{responses: []*sandboxpb.ExecuteResponse{
@@ -103,6 +137,22 @@ func TestBundlePipelineStopsAtFirstContestantVerdict(t *testing.T) {
 		t.Fatal(err)
 	}
 	if result.Status != callback.StatusWrongAnswer || len(executor.requests) != 1 {
+		t.Fatalf("result=%+v calls=%d", result, len(executor.requests))
+	}
+}
+
+func TestBundlePipelineMapsOutputLimitToRuntimeErrorWithoutRetry(t *testing.T) {
+	artifact := exactArtifact(1)
+	executor := &sequenceExecutor{responses: []*sandboxpb.ExecuteResponse{
+		{Status: "Output Limit Exceeded", TimeUsed: 8, MemoryUsed: 100},
+		{Status: "Accepted"},
+	}}
+	pipeline := NewBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a", "sandbox-b"}}, executor, 2)
+	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validBundleProblem(), artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != callback.StatusRuntimeError || len(executor.requests) != 1 || !strings.Contains(result.Stderr, "Output Limit Exceeded") {
 		t.Fatalf("result=%+v calls=%d", result, len(executor.requests))
 	}
 }

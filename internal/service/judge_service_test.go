@@ -13,6 +13,8 @@ import (
 type fakeSubmissionStore struct {
 	submission *model.Task
 	problem    *model.Problem
+	bundle     *model.TestBundle
+	bundleErr  error
 }
 
 func (store *fakeSubmissionStore) GetSubmissionByID(int64) (*model.Task, error) {
@@ -23,13 +25,17 @@ func (store *fakeSubmissionStore) GetProblemByID(int64) (*model.Problem, error) 
 	return store.problem, nil
 }
 
+func (store *fakeSubmissionStore) GetTestBundleByProblemVersionID(int64) (*model.TestBundle, error) {
+	return store.bundle, store.bundleErr
+}
+
 type fakeResultExecutor struct {
 	result callback.Result
 	err    error
 	calls  int
 }
 
-func (executor *fakeResultExecutor) Execute(context.Context, *model.Task, *model.Problem) (callback.Result, error) {
+func (executor *fakeResultExecutor) Execute(context.Context, *model.Task, *model.Problem, *model.TestBundle) (callback.Result, error) {
 	executor.calls++
 	return executor.result, executor.err
 }
@@ -48,8 +54,9 @@ func (publisher *fakeResultPublisher) Publish(_ context.Context, result callback
 
 func TestJudgeServicePublishesStableEventResultWithoutDatabaseWrite(t *testing.T) {
 	store := &fakeSubmissionStore{
-		submission: &model.Task{ID: 99, ProblemID: 42, UserID: 7, Language: "java17", Status: model.StatusPending},
+		submission: validBundleTask(),
 		problem:    &model.Problem{ID: 42},
+		bundle:     &model.TestBundle{ProblemVersionID: 7},
 	}
 	executor := &fakeResultExecutor{result: callback.Result{Status: callback.StatusAccepted}}
 	publisher := &fakeResultPublisher{}
@@ -63,6 +70,38 @@ func TestJudgeServicePublishesStableEventResultWithoutDatabaseWrite(t *testing.T
 	}
 	if executor.calls != 1 || publisher.calls != 1 {
 		t.Fatalf("executor calls=%d publisher calls=%d", executor.calls, publisher.calls)
+	}
+}
+
+func TestJudgeServicePublishesSystemErrorForMissingImmutableBundle(t *testing.T) {
+	for name, mutate := range map[string]func(*fakeSubmissionStore){
+		"null problem version": func(store *fakeSubmissionStore) { store.submission.ProblemVersionID = nil },
+		"missing bundle":       func(store *fakeSubmissionStore) { store.bundle = nil },
+	} {
+		t.Run(name, func(t *testing.T) {
+			store := validStore()
+			mutate(store)
+			executor := &fakeResultExecutor{result: callback.Result{Status: callback.StatusAccepted}}
+			publisher := &fakeResultPublisher{}
+			judgeService := NewJudgeService(store, executor, publisher, NewTaskRegistry(16, time.Hour))
+			if err := judgeService.ProcessEvent(context.Background(), validSubmissionEvent()); err != nil {
+				t.Fatal(err)
+			}
+			if publisher.result.Status != callback.StatusSystemError || executor.calls != 0 {
+				t.Fatalf("result=%+v executor calls=%d", publisher.result, executor.calls)
+			}
+		})
+	}
+}
+
+func TestJudgeServiceRetriesTransientBundleMetadataFailure(t *testing.T) {
+	store := validStore()
+	store.bundleErr = errors.New("database unavailable")
+	publisher := &fakeResultPublisher{}
+	judgeService := NewJudgeService(store, &fakeResultExecutor{}, publisher, NewTaskRegistry(16, time.Hour))
+	err := judgeService.ProcessEvent(context.Background(), validSubmissionEvent())
+	if err == nil || callback.IsPermanent(err) || publisher.calls != 0 {
+		t.Fatalf("error=%v permanent=%v publisher calls=%d", err, callback.IsPermanent(err), publisher.calls)
 	}
 }
 
@@ -100,9 +139,15 @@ func TestJudgeServiceDoesNotRepeatPermanentCallbackFailure(t *testing.T) {
 
 func validStore() *fakeSubmissionStore {
 	return &fakeSubmissionStore{
-		submission: &model.Task{ID: 99, ProblemID: 42, UserID: 7, Language: "java17", Status: model.StatusPending},
+		submission: validBundleTask(),
 		problem:    &model.Problem{ID: 42},
+		bundle:     &model.TestBundle{ProblemVersionID: 7},
 	}
+}
+
+func validBundleTask() *model.Task {
+	problemVersionID := int64(7)
+	return &model.Task{ID: 99, ProblemID: 42, ProblemVersionID: &problemVersionID, UserID: 7, Language: "java17", Status: model.StatusPending}
 }
 
 func validSubmissionEvent() model.SubmissionRequested {

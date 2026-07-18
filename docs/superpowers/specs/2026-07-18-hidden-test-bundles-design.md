@@ -10,7 +10,7 @@ The object stored in S3/MinIO is a deterministic ZIP whose SHA-256 covers every 
 
 Manifest v1 fields are `schemaVersion: 1`, `judgeMode: "ACM"`, `checker: "exact" | "token"`, and a non-empty ordered `cases` array. Each case has a unique safe `id`, safe relative `input` and `output` paths, and `weight: 1`. Unknown fields, duplicate IDs or paths, invalid UTF-8, absolute/backslash/traversal paths, zero or out-of-range weights, SPJ, and OI are rejected.
 
-Exact checker uses the sandbox compatibility rule documented by the sandbox: normalize CRLF/CR to LF and ignore trailing spaces on each line plus trailing blank lines. Token checker compares judging-side stdout and expected output as Unicode-whitespace-separated token sequences. Hidden content never appears in logs or callback summaries.
+Exact checker uses the current sandbox compatibility rule: normalize CRLF/CR to LF, apply Unicode `TrimSpace` to every line, then trim the joined value. Token checker compares judging-side stdout and expected output as Unicode-whitespace-separated token sequences. Hidden content never appears in judging logs or callback summaries. Rollout is blocked on `croj-sandbox#10`, which removes the legacy sandbox WA expected/actual log.
 
 ## Storage and cache
 
@@ -24,7 +24,7 @@ The loader first scans the central directory without extracting. It accepts only
 
 ## Execution and errors
 
-The runner executes cases in manifest order. Each request contains immutable source, case stdin, expected output for exact checking, version limits, and one selected Ready endpoint. `Accepted` continues; CE/WA/TLE/MLE/RE stop immediately. Exact uses the sandbox verdict. Token runs with empty expected output, then judging compares stdout tokens. Time and memory aggregate by maximum, and callback text contains only bounded case IDs/verdict summaries.
+The runner executes cases in manifest order. Each request contains immutable source, case stdin, expected output for exact checking, version limits, and one selected Ready endpoint. `Accepted` continues; CE/WA/TLE/MLE/RE/OLE stop immediately. Exact repeats the sandbox comparison in judging so an empty expected output cannot bypass comparison. Token runs with empty expected output, then judging compares stdout tokens. OLE temporarily maps to callback v1 `RUNTIME_ERROR` and retains only the OLE label in its summary. Time and memory aggregate by maximum, and callback text contains only bounded case IDs/verdict summaries.
 
 gRPC `Unavailable`/`ResourceExhausted`, `Sandbox Error`, and unknown sandbox statuses are infrastructure failures. The runner selects another Ready endpoint up to a configured attempt limit for the same case, then returns `SYSTEM_ERROR`. Contestant verdicts are never retried. Missing metadata, null problem version, invalid bundle, unsupported manifest, or corrupt storage return a publishable `SYSTEM_ERROR` result rather than a retry loop; transient database/object-store/network failures remain retryable errors.
 

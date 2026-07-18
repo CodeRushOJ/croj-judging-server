@@ -13,6 +13,11 @@
 - 增加带 `X-CROJ-Service-Token` 的后端判题结果回调，支持 `APPLIED`/`DUPLICATE` 幂等完成语义。
 - 增加进程内有界任务注册表，合并并发重复事件，并在临时回调失败后复用稳定结果载荷。
 - 增加消息 ACK/重试分类、回调契约、并发幂等与连接淘汰测试。
+- 增加 `submission.problem_version_id` 到唯一 `t_test_bundle` 的只读不可变元数据链路。
+- 增加严格 manifest v1、确定性 ZIP builder、安全 central-directory 校验和 exact/token ACM checker。
+- 增加 S3/MinIO 有界流式下载、size/SHA-256 校验及原子发布。
+- 增加 checksum-keyed 磁盘缓存、并发下载合并、命中校验、损坏修复、TTL/LRU 和 restart orphan 清理。
+- 增加 ACM 多 case 顺序执行、选手错误早停、最大资源聚合与基础设施故障有界换 endpoint。
 
 ### Changed
 
@@ -22,11 +27,14 @@
 - `400/403/404/409` 等契约型回调响应被永久 ACK；网络错误、`401/408/425/429`、`5xx` 以及沙箱资源不足/不可用错误进入有界 RocketMQ 重试，超限转入 DLQ。
 - HTTP callback 禁止自动跟随重定向，避免服务 token 被 3xx 转发至非预期地址。
 - callback 文本按后端 Java UTF-16 code unit 边界截断和校验，非 BMP 字符不会导致合法 Go 载荷被后端永久拒绝。
+- 判题从单次空 stdin 兼容请求切换为 problem-version 固定的隐藏测试包；缺失、损坏、SPJ/OI 均明确发布 `SYSTEM_ERROR`。
+- `Output Limit Exceeded` 在 callback v1 暂映射为 `RUNTIME_ERROR` 且不重试，等待 Issue #13 的正式枚举。
 
 ### Known limitations
 
-- 当前兼容请求尚未加载不可变隐藏测试包，stdin 与 expected output 为空；Accepted 只表示该次源码执行成功。
-- 当前仍从 MySQL 只读加载源码和题目限制；不可变隐藏测试包将替代该兼容依赖。
+- 当前每个 case 会重复编译；Issue #11 跟进 compile-once batch sandbox API。
+- SPJ/OI 尚未支持并返回 `SYSTEM_ERROR`；Issue #12 跟进版本化能力。
+- exact checker 上线依赖 `croj-sandbox#10` 先移除 WA expected/actual 日志，避免 hidden data 泄露。
 - 任务结果缓存是进程级优化，进程重启后的最终幂等由后端 result receipt 保证。
 
 ## [0.0.1] - 2025-04-26

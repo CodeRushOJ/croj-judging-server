@@ -21,6 +21,24 @@ judge-result:
   cache-capacity: 10000
   cache-ttl: "6h"
 
+test-bundles:
+  endpoint: "coderushoj-infra-minio.coderushoj.svc:9000"
+  bucket: "judge-bundles"
+  region: "us-east-1"
+  use-tls: false
+  access-key: ""
+  secret-key: ""
+  cache-dir: "/tmp/croj-bundles"
+  cache-max-bytes: 2147483648
+  max-object-bytes: 536870912
+  cache-ttl: "24h"
+  max-files: 20001
+  max-manifest-bytes: 1048576
+  max-case-bytes: 67108864
+  max-uncompressed-bytes: 536870912
+  max-compression-ratio: 200
+  max-infra-attempts: 3
+
 sandbox-discovery:
   namespace: "coderushoj"
   service: "croj-sandbox"
