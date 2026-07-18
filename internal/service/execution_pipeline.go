@@ -7,6 +7,7 @@ import (
 	"math"
 	"strings"
 
+	"github.com/CodeRushOJ/croj-judging-server/internal/callback"
 	"github.com/CodeRushOJ/croj-judging-server/pkg/model"
 	sandboxpb "github.com/CodeRushOJ/croj-judging-server/proto"
 )
@@ -29,12 +30,49 @@ func NewExecutionPipeline(selector SandboxSelector, executor SandboxExecutor) *E
 }
 
 func (p *ExecutionPipeline) Run(ctx context.Context, submission *model.Task, problem *model.Problem) error {
+	response, err := p.executeResponse(ctx, submission, problem)
+	if err != nil {
+		return err
+	}
+	applySandboxResult(submission, response)
+	return nil
+}
+
+func (p *ExecutionPipeline) Execute(ctx context.Context, submission *model.Task, problem *model.Problem) (callback.Result, error) {
+	response, err := p.executeResponse(ctx, submission, problem)
+	if err != nil {
+		return callback.Result{}, err
+	}
+	status := mapCallbackStatus(response.Status)
+	compileError := truncateRunes(strings.TrimSpace(response.CompileError), 32_768)
+	if status == callback.StatusCompileError && compileError == "" {
+		compileError = truncateRunes(firstDiagnostic(response.Error, response.Stderr), 32_768)
+		if compileError == "" {
+			compileError = "compiler failed without diagnostics"
+		}
+	}
+	exitCode := int(response.ExitCode)
+	if status == callback.StatusAccepted && exitCode != 0 {
+		status = callback.StatusSystemError
+	}
+	return callback.Result{
+		Status:         status,
+		ExitCode:       exitCode,
+		TimeUsedMillis: boundedMetric(response.TimeUsed, 86_400_000),
+		MemoryUsedKB:   boundedMetric(response.MemoryUsed, math.MaxInt32),
+		Stdout:         truncateRunes(response.Stdout, 65_536),
+		Stderr:         truncateRunes(response.Stderr, 65_536),
+		CompileError:   compileError,
+	}, nil
+}
+
+func (p *ExecutionPipeline) executeResponse(ctx context.Context, submission *model.Task, problem *model.Problem) (*sandboxpb.ExecuteResponse, error) {
 	if submission == nil || problem == nil {
-		return fmt.Errorf("submission and problem are required")
+		return nil, fmt.Errorf("submission and problem are required")
 	}
 	address, err := p.selector.SelectSandbox()
 	if err != nil {
-		return fmt.Errorf("select sandbox: %w", err)
+		return nil, fmt.Errorf("select sandbox: %w", err)
 	}
 	response, err := p.executor.Execute(ctx, address, &sandboxpb.ExecuteRequest{
 		Language:    submission.Language,
@@ -43,13 +81,31 @@ func (p *ExecutionPipeline) Run(ctx context.Context, submission *model.Task, pro
 		MemoryLimit: boundedInt32(problem.MemoryLimit),
 	})
 	if err != nil {
-		return fmt.Errorf("execute submission %d: %w", submission.ID, err)
+		return nil, fmt.Errorf("execute submission %d: %w", submission.ID, err)
 	}
 	if response == nil {
-		return fmt.Errorf("execute submission %d: sandbox returned no response", submission.ID)
+		return nil, fmt.Errorf("execute submission %d: sandbox returned no response", submission.ID)
 	}
-	applySandboxResult(submission, response)
-	return nil
+	return response, nil
+}
+
+func mapCallbackStatus(status string) callback.Status {
+	switch status {
+	case "Accepted":
+		return callback.StatusAccepted
+	case "Compile Error":
+		return callback.StatusCompileError
+	case "Wrong Answer":
+		return callback.StatusWrongAnswer
+	case "Time Limit Exceeded":
+		return callback.StatusTimeLimitExceeded
+	case "Memory Limit Exceeded":
+		return callback.StatusMemoryLimitExceeded
+	case "Runtime Error":
+		return callback.StatusRuntimeError
+	default:
+		return callback.StatusSystemError
+	}
 }
 
 func MapSandboxStatus(status string) model.SubmissionStatus {
@@ -129,6 +185,16 @@ func boundedInt(value int64) int {
 	return int(value)
 }
 
+func boundedMetric(value int64, maximum int) int {
+	if value <= 0 {
+		return 0
+	}
+	if value > int64(maximum) {
+		return maximum
+	}
+	return int(value)
+}
+
 func firstDiagnostic(values ...string) string {
 	for _, value := range values {
 		if value = strings.TrimSpace(value); value != "" {
@@ -143,4 +209,15 @@ func truncate(value string, limit int) string {
 		return value
 	}
 	return value[:limit]
+}
+
+func truncateRunes(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	return string(runes[:limit])
 }

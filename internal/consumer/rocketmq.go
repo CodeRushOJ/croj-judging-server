@@ -3,11 +3,11 @@ package consumer
 import (
 	"context"
 	"fmt"
+	"log"
 
-	// "github.com/CodeRushOJ/croj-judging-server/internal/service"
-	// "github.com/CodeRushOJ/croj-judging-server/pkg/config"
-	"github.com/CodeRushOJ/croj-judging-server/internal/service"
+	"github.com/CodeRushOJ/croj-judging-server/internal/callback"
 	"github.com/CodeRushOJ/croj-judging-server/pkg/config"
+	"github.com/CodeRushOJ/croj-judging-server/pkg/model"
 	"github.com/apache/rocketmq-client-go/v2"
 	"github.com/apache/rocketmq-client-go/v2/consumer"
 	"github.com/apache/rocketmq-client-go/v2/primitive"
@@ -15,13 +15,17 @@ import (
 
 // RocketMQConsumer 结构体，包含消费者实例和判题服务
 type RocketMQConsumer struct {
-	consumer     rocketmq.PushConsumer
-	judgeService *service.JudgeService
-	topic        string
+	consumer  rocketmq.PushConsumer
+	processor EventProcessor
+	topic     string
+}
+
+type EventProcessor interface {
+	ProcessEvent(context.Context, model.SubmissionRequested) error
 }
 
 // NewRocketMQConsumer 创建一个新的 RocketMQ 消费者
-func NewRocketMQConsumer(cfg config.RocketMQConfig, judgeService *service.JudgeService) (*RocketMQConsumer, error) {
+func NewRocketMQConsumer(cfg config.RocketMQConfig, processor EventProcessor) (*RocketMQConsumer, error) {
 	fmt.Println("Initializing RocketMQ Consumer...")
 
 	// 注意：NameServer 地址需要是 []string 类型
@@ -35,19 +39,26 @@ func NewRocketMQConsumer(cfg config.RocketMQConfig, judgeService *service.JudgeS
 	if cfg.Topic == "" {
 		return nil, fmt.Errorf("rocketmq topic is not configured")
 	}
+	if processor == nil {
+		return nil, fmt.Errorf("judge event processor is not configured")
+	}
+	if cfg.Consumer.MaxReconsumeTimes <= 0 {
+		return nil, fmt.Errorf("rocketmq max reconsume times must be positive")
+	}
 
 	c, err := rocketmq.NewPushConsumer(
 		consumer.WithNameServer(namesrvAddr),
 		consumer.WithGroupName(cfg.Consumer.Group), // 使用嵌套的 Group
+		consumer.WithMaxReconsumeTimes(cfg.Consumer.MaxReconsumeTimes),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create rocketmq consumer: %w", err)
 	}
 
 	rc := &RocketMQConsumer{
-		consumer:     c,
-		judgeService: judgeService,
-		topic:        cfg.Topic,
+		consumer:  c,
+		processor: processor,
+		topic:     cfg.Topic,
 	}
 
 	err = c.Subscribe(cfg.Topic, consumer.MessageSelector{}, rc.handleMessage)
@@ -61,16 +72,20 @@ func NewRocketMQConsumer(cfg config.RocketMQConfig, judgeService *service.JudgeS
 
 // handleMessage 处理接收到的消息
 func (rc *RocketMQConsumer) handleMessage(ctx context.Context, msgs ...*primitive.MessageExt) (consumer.ConsumeResult, error) {
-	fmt.Println("Handling RocketMQ messages...")
 	for _, msg := range msgs {
-		taskID := string(msg.Body)
-		fmt.Printf("Received task ID: %s\n", taskID)
-
-		// 调用 JudgeService 处理任务
-		err := rc.judgeService.ProcessTask(ctx, taskID)
+		event, err := DecodeSubmissionRequested(msg.Body)
 		if err != nil {
-			fmt.Printf("Error processing task %s: %v\n", taskID, err)
-			// 根据错误类型决定是否重试，例如返回 ConsumeRetryLater
+			log.Printf("discarding invalid SubmissionRequested message: %v", err)
+			continue
+		}
+		if err := rc.processor.ProcessEvent(ctx, event); err != nil {
+			if callback.IsPermanent(err) {
+				log.Printf("judge event %s submission=%d attempt=%d rejected permanently: %v",
+					event.EventID, event.SubmissionID, event.AttemptNo, err)
+				continue
+			}
+			log.Printf("judge event %s submission=%d attempt=%d will retry: %v",
+				event.EventID, event.SubmissionID, event.AttemptNo, err)
 			return consumer.ConsumeRetryLater, nil
 		}
 	}

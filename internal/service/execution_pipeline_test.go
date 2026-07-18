@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/CodeRushOJ/croj-judging-server/internal/callback"
 	"github.com/CodeRushOJ/croj-judging-server/pkg/model"
 	sandboxpb "github.com/CodeRushOJ/croj-judging-server/proto"
 )
@@ -120,5 +121,28 @@ func TestMapSandboxStatus(t *testing.T) {
 				t.Fatalf("MapSandboxStatus(%q) = %d, want %d", sandboxStatus, got, want)
 			}
 		})
+	}
+}
+
+func TestExecutionPipelineBuildsCallbackResult(t *testing.T) {
+	executor := &fakeExecutor{response: &sandboxpb.ExecuteResponse{
+		Status:       "Compile Error",
+		ExitCode:     2,
+		Stderr:       "compiler stderr",
+		CompileError: "syntax error",
+		TimeUsed:     -1,
+		MemoryUsed:   -1,
+	}}
+	pipeline := NewExecutionPipeline(fakeSelector{endpoint: "10.0.0.9:50051"}, executor)
+
+	result, err := pipeline.Execute(context.Background(), &model.Task{Language: "cpp", Code: "bad"}, &model.Problem{TimeLimit: 1000, MemoryLimit: 64})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if result.Status != callback.StatusCompileError || result.CompileError != "syntax error" {
+		t.Fatalf("result = %+v", result)
+	}
+	if result.TimeUsedMillis != 0 || result.MemoryUsedKB != 0 {
+		t.Fatalf("negative metrics were not normalized: %+v", result)
 	}
 }

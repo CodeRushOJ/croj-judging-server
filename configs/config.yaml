@@ -12,6 +12,14 @@ rocketmq:
   #  group: submission-producer-group # 如果需要生产者，则取消注释
   consumer:
     group: submission-consumer-group
+    max-reconsume-times: 16 # 超限后由 RocketMQ 投递到 %DLQ%<group>
+
+judge-result:
+  backend-url: "http://croj-backend:7999/api"
+  service-token: ""
+  callback-timeout: "10s"
+  cache-capacity: 10000
+  cache-ttl: "6h"
 
 sandbox-discovery:
   namespace: "coderushoj"
@@ -19,4 +27,6 @@ sandbox-discovery:
   port-name: "grpc"
   refresh-interval: "5s"
   execute-timeout: "60s"
+  max-connections: 128
+  connection-idle-ttl: "5m"
   kubeconfig: ""

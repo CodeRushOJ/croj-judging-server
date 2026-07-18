@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/CodeRushOJ/croj-judging-server/internal/callback"
 	"github.com/CodeRushOJ/croj-judging-server/internal/consumer"
 	"github.com/CodeRushOJ/croj-judging-server/internal/database"
 	"github.com/CodeRushOJ/croj-judging-server/internal/discovery"
@@ -56,14 +58,40 @@ func main() {
 	if err != nil || executeTimeout <= 0 {
 		log.Fatalf("Invalid sandbox execute timeout: %q", cfg.SandboxDiscovery.ExecuteTimeout)
 	}
-	sandboxClient := sandbox.NewClient(executeTimeout)
+	connectionIdleTTL, err := time.ParseDuration(cfg.SandboxDiscovery.ConnectionIdleTTL)
+	if err != nil || connectionIdleTTL <= 0 {
+		log.Fatalf("Invalid sandbox connection idle TTL: %q", cfg.SandboxDiscovery.ConnectionIdleTTL)
+	}
+	sandboxClient := sandbox.NewClientWithCache(
+		executeTimeout,
+		cfg.SandboxDiscovery.MaxConnections,
+		connectionIdleTTL,
+	)
 	defer func() {
 		if err := sandboxClient.Close(); err != nil {
 			log.Printf("Failed to close sandbox client: %v", err)
 		}
 	}()
 	executionPipeline := service.NewExecutionPipeline(sandboxScheduler, sandboxClient)
-	judgeService := service.NewJudgeService(db, executionPipeline)
+	callbackTimeout, err := time.ParseDuration(cfg.JudgeResult.CallbackTimeout)
+	if err != nil || callbackTimeout <= 0 {
+		log.Fatalf("Invalid judge result callback timeout: %q", cfg.JudgeResult.CallbackTimeout)
+	}
+	resultClient, err := callback.NewClient(
+		cfg.JudgeResult.BackendURL,
+		cfg.JudgeResult.ServiceToken,
+		callbackTimeout,
+		http.DefaultClient,
+	)
+	if err != nil {
+		log.Fatalf("Failed to initialize judge result callback: %v", err)
+	}
+	cacheTTL, err := time.ParseDuration(cfg.JudgeResult.CacheTTL)
+	if err != nil || cacheTTL <= 0 {
+		log.Fatalf("Invalid judge task cache TTL: %q", cfg.JudgeResult.CacheTTL)
+	}
+	registry := service.NewTaskRegistry(cfg.JudgeResult.CacheCapacity, cacheTTL)
+	judgeService := service.NewJudgeService(db, executionPipeline, resultClient, registry)
 	fmt.Println("Judge service initialized.")
 
 	// 启动 RocketMQ 消费者

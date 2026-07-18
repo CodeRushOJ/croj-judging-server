@@ -4,74 +4,115 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
+	"github.com/CodeRushOJ/croj-judging-server/internal/callback"
 	"github.com/CodeRushOJ/croj-judging-server/pkg/model"
 )
 
 type fakeSubmissionStore struct {
 	submission *model.Task
 	problem    *model.Problem
-	updated    *model.Task
 }
 
-func (s *fakeSubmissionStore) GetSubmissionByID(int64) (*model.Task, error) {
-	return s.submission, nil
+func (store *fakeSubmissionStore) GetSubmissionByID(int64) (*model.Task, error) {
+	return store.submission, nil
 }
 
-func (s *fakeSubmissionStore) GetProblemByID(int64) (*model.Problem, error) {
-	return s.problem, nil
+func (store *fakeSubmissionStore) GetProblemByID(int64) (*model.Problem, error) {
+	return store.problem, nil
 }
 
-func (s *fakeSubmissionStore) UpdateSubmissionResultInTx(submission *model.Task) error {
-	s.updated = submission
-	return nil
-}
-
-type fakePipeline struct {
+type fakeResultExecutor struct {
+	result callback.Result
 	err    error
-	called bool
+	calls  int
 }
 
-func (p *fakePipeline) Run(_ context.Context, submission *model.Task, _ *model.Problem) error {
-	p.called = true
-	if p.err == nil {
-		submission.Status = model.StatusAccepted
-	}
-	return p.err
+func (executor *fakeResultExecutor) Execute(context.Context, *model.Task, *model.Problem) (callback.Result, error) {
+	executor.calls++
+	return executor.result, executor.err
 }
 
-func TestJudgeServicePersistsRealPipelineResult(t *testing.T) {
+type fakeResultPublisher struct {
+	result callback.Result
+	err    error
+	calls  int
+}
+
+func (publisher *fakeResultPublisher) Publish(_ context.Context, result callback.Result) (callback.Disposition, error) {
+	publisher.calls++
+	publisher.result = result
+	return callback.DispositionApplied, publisher.err
+}
+
+func TestJudgeServicePublishesStableEventResultWithoutDatabaseWrite(t *testing.T) {
 	store := &fakeSubmissionStore{
-		submission: &model.Task{ID: 41, ProblemID: 7, Status: model.StatusPending},
-		problem:    &model.Problem{ID: 7, TimeLimit: 1000, MemoryLimit: 256},
+		submission: &model.Task{ID: 99, ProblemID: 42, UserID: 7, Language: "java17", Status: model.StatusPending},
+		problem:    &model.Problem{ID: 42},
 	}
-	pipeline := &fakePipeline{}
-	service := NewJudgeService(store, pipeline)
+	executor := &fakeResultExecutor{result: callback.Result{Status: callback.StatusAccepted}}
+	publisher := &fakeResultPublisher{}
+	service := NewJudgeService(store, executor, publisher, NewTaskRegistry(16, time.Hour))
 
-	if err := service.ProcessTask(context.Background(), "41"); err != nil {
-		t.Fatalf("ProcessTask: %v", err)
+	if err := service.ProcessEvent(context.Background(), validSubmissionEvent()); err != nil {
+		t.Fatalf("ProcessEvent: %v", err)
 	}
-	if !pipeline.called {
-		t.Fatal("execution pipeline was not called")
+	if publisher.result.ResultID != "50f75fdf-fdea-473f-a156-bf1ed60acf58" || publisher.result.SubmissionID != 99 || publisher.result.AttemptNo != 1 {
+		t.Fatalf("published result identity = %+v", publisher.result)
 	}
-	if store.updated == nil || store.updated.Status != model.StatusAccepted {
-		t.Fatalf("updated submission = %+v", store.updated)
+	if executor.calls != 1 || publisher.calls != 1 {
+		t.Fatalf("executor calls=%d publisher calls=%d", executor.calls, publisher.calls)
 	}
 }
 
-func TestJudgeServiceDoesNotPersistWhenSandboxFails(t *testing.T) {
-	store := &fakeSubmissionStore{
-		submission: &model.Task{ID: 42, ProblemID: 8, Status: model.StatusPending},
-		problem:    &model.Problem{ID: 8},
-	}
-	wantErr := errors.New("sandbox unavailable")
-	service := NewJudgeService(store, &fakePipeline{err: wantErr})
+func TestJudgeServiceKeepsGRPCFailureRetryable(t *testing.T) {
+	wantErr := errors.New("rpc error: code = ResourceExhausted")
+	executor := &fakeResultExecutor{err: wantErr}
+	publisher := &fakeResultPublisher{}
+	service := NewJudgeService(validStore(), executor, publisher, NewTaskRegistry(16, time.Hour))
 
-	err := service.ProcessTask(context.Background(), "42")
-	if !errors.Is(err, wantErr) {
-		t.Fatalf("ProcessTask error = %v, want %v", err, wantErr)
+	err := service.ProcessEvent(context.Background(), validSubmissionEvent())
+	if !errors.Is(err, wantErr) || callback.IsPermanent(err) {
+		t.Fatalf("ProcessEvent error = %v, permanent=%v", err, callback.IsPermanent(err))
 	}
-	if store.updated != nil {
-		t.Fatalf("unexpected persisted submission: %+v", store.updated)
+	if publisher.calls != 0 {
+		t.Fatal("result was published after failed execution")
+	}
+}
+
+func TestJudgeServiceDoesNotRepeatPermanentCallbackFailure(t *testing.T) {
+	executor := &fakeResultExecutor{result: callback.Result{Status: callback.StatusAccepted}}
+	publisher := &fakeResultPublisher{err: callback.Permanent(errors.New("HTTP 409"))}
+	service := NewJudgeService(validStore(), executor, publisher, NewTaskRegistry(16, time.Hour))
+	event := validSubmissionEvent()
+
+	if err := service.ProcessEvent(context.Background(), event); !callback.IsPermanent(err) {
+		t.Fatalf("first error = %v", err)
+	}
+	if err := service.ProcessEvent(context.Background(), event); err != nil {
+		t.Fatalf("completed duplicate: %v", err)
+	}
+	if executor.calls != 1 || publisher.calls != 1 {
+		t.Fatalf("executor calls=%d publisher calls=%d", executor.calls, publisher.calls)
+	}
+}
+
+func validStore() *fakeSubmissionStore {
+	return &fakeSubmissionStore{
+		submission: &model.Task{ID: 99, ProblemID: 42, UserID: 7, Language: "java17", Status: model.StatusPending},
+		problem:    &model.Problem{ID: 42},
+	}
+}
+
+func validSubmissionEvent() model.SubmissionRequested {
+	return model.SubmissionRequested{
+		SchemaVersion: 1,
+		EventID:       "50f75fdf-fdea-473f-a156-bf1ed60acf58",
+		SubmissionID:  99,
+		AttemptNo:     1,
+		ProblemID:     42,
+		UserID:        7,
+		Language:      "java17",
 	}
 }
