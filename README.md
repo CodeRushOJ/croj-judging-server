@@ -40,7 +40,7 @@ flowchart LR
 | `DATABASE_USERNAME` / `DATABASE_PASSWORD` / `DATABASE_NAME` | MySQL 凭据和库名 | YAML / Secret |
 | `ROCKETMQ_NAME_SERVER` | NameServer 地址 | YAML |
 | `SUBMISSION_TOPIC` / `ROCKETMQ_CONSUMER_GROUP` | 消费主题和消费组 | YAML |
-| `SANDBOX_NAMESPACE` / `SANDBOX_SERVICE` / `SANDBOX_PORT_NAME` | EndpointSlice 选择目标 | YAML |
+| `SANDBOX_NAMESPACE` / `SANDBOX_SERVICE` / `SANDBOX_PORT_NAME` | EndpointSlice 选择目标（默认 gRPC 端口名 `grpc`） | YAML |
 | `SANDBOX_REFRESH_INTERVAL` | 刷新周期，如 `5s` | YAML |
 | `KUBECONFIG` | 集群外开发时的 kubeconfig 路径 | client-go 默认规则 |
 
@@ -91,7 +91,7 @@ kubectl auth can-i list endpointslices.discovery.k8s.io \
 
 ## 故障排查
 
-- `no ready sandbox endpoints`：检查 Service selector、EndpointSlice 的 Ready/Terminating 条件和端口名 `http`。
+- `no ready sandbox endpoints`：检查 Service selector、EndpointSlice 的 Ready/Terminating 条件和端口名 `grpc`。
 - `forbidden: endpointslices is forbidden`：确认 Deployment 使用正确 ServiceAccount，并应用 RBAC。
 - 集群外无法读取 API：检查 `KUBECONFIG` 指向容器内可见路径，必要时以只读方式挂载 kubeconfig。
 - RocketMQ 消费失败：核对 NameServer、topic 和 consumer group；消息体应是十进制 submission ID。
