@@ -66,6 +66,18 @@ func (d *Database) GetProblemByID(problemID int64) (*model.Problem, error) {
 	return problem, nil
 }
 
+func (d *Database) GetTestBundleByProblemVersionID(problemVersionID int64) (*model.TestBundle, error) {
+	testBundle := &model.TestBundle{}
+	result := d.DB.Where("problem_version_id = ?", problemVersionID).First(testBundle)
+	if result.Error != nil {
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get test bundle for problem version %d: %w", problemVersionID, result.Error)
+	}
+	return testBundle, nil
+}
+
 // Close 关闭数据库连接
 func (d *Database) Close() error {
 	fmt.Println("Closing database connection...")
