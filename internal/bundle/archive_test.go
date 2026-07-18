@@ -68,6 +68,13 @@ func TestOpenArchiveRejectsZipBombAndSizeLimits(t *testing.T) {
 		{name: "cases/01.out", body: "x"},
 	}
 	limits := DefaultArchiveLimits()
+	limits.MaxManifestBytes = 16
+	if artifact, err := OpenArchive(writeZIP(t, entries), []byte(validManifest), limits); err == nil {
+		artifact.Close()
+		t.Fatal("expected database manifest size error")
+	}
+
+	limits = DefaultArchiveLimits()
 	limits.MaxCaseBytes = 10_000
 	if artifact, err := OpenArchive(writeZIP(t, entries), []byte(validManifest), limits); err == nil {
 		artifact.Close()

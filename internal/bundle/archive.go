@@ -37,6 +37,9 @@ func OpenArchive(filename string, databaseManifest []byte, limits ArchiveLimits)
 	if err := validateArchiveLimits(limits); err != nil {
 		return nil, err
 	}
+	if int64(len(databaseManifest)) > limits.MaxManifestBytes {
+		return nil, fmt.Errorf("database bundle manifest exceeds size limit")
+	}
 	expected, err := ParseManifest(databaseManifest)
 	if err != nil {
 		return nil, fmt.Errorf("database bundle manifest: %w", err)
@@ -90,7 +93,7 @@ func (artifact *Artifact) validate(expected Manifest) error {
 		if file.Name == "manifest.json" && file.UncompressedSize64 > uint64(artifact.limits.MaxManifestBytes) {
 			return fmt.Errorf("manifest.json exceeds size limit")
 		}
-		if file.UncompressedSize64 > 0 && (file.CompressedSize64 == 0 || file.UncompressedSize64 > file.CompressedSize64*artifact.limits.MaxCompressionRatio) {
+		if exceedsCompressionRatio(file.UncompressedSize64, file.CompressedSize64, artifact.limits.MaxCompressionRatio) {
 			return fmt.Errorf("ZIP entry %q exceeds compression ratio limit", file.Name)
 		}
 		total += file.UncompressedSize64
@@ -125,6 +128,17 @@ func (artifact *Artifact) validate(expected Manifest) error {
 	}
 	artifact.manifest = actual
 	return nil
+}
+
+func exceedsCompressionRatio(uncompressed, compressed, maximum uint64) bool {
+	if uncompressed == 0 {
+		return false
+	}
+	if compressed == 0 {
+		return true
+	}
+	quotient, remainder := uncompressed/compressed, uncompressed%compressed
+	return quotient > maximum || (quotient == maximum && remainder > 0)
 }
 
 func (artifact *Artifact) readText(name string, limit int64) (string, error) {
