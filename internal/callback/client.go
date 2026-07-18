@@ -53,9 +53,13 @@ type Client struct {
 }
 
 func NewClient(baseURL, serviceToken string, timeout time.Duration, httpClient *http.Client) (*Client, error) {
-	parsed, err := url.Parse(strings.TrimRight(baseURL, "/"))
+	normalizedBaseURL := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	parsed, err := url.Parse(normalizedBaseURL)
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
 		return nil, fmt.Errorf("BACKEND_INTERNAL_URL must be an absolute HTTP(S) URL")
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Opaque != "" {
+		return nil, fmt.Errorf("BACKEND_INTERNAL_URL must not contain userinfo, query, fragment, or opaque data")
 	}
 	if strings.TrimRight(parsed.Path, "/") != "/api" {
 		return nil, fmt.Errorf("BACKEND_INTERNAL_URL must include the /api context path")
@@ -74,7 +78,7 @@ func NewClient(baseURL, serviceToken string, timeout time.Duration, httpClient *
 		return http.ErrUseLastResponse
 	}
 	return &Client{
-		endpoint:     strings.TrimRight(baseURL, "/") + "/internal/v1/judge-results",
+		endpoint:     normalizedBaseURL + "/internal/v1/judge-results",
 		serviceToken: serviceToken,
 		timeout:      timeout,
 		httpClient:   &clientWithoutRedirects,
@@ -147,7 +151,7 @@ func validateResult(result Result) error {
 	if result.TimeUsedMillis < 0 || result.TimeUsedMillis > 86_400_000 || result.MemoryUsedKB < 0 || result.MemoryUsedKB > 2_147_483_647 {
 		return fmt.Errorf("judge result metrics are outside the callback contract")
 	}
-	if len([]rune(result.Stdout)) > 65_536 || len([]rune(result.Stderr)) > 65_536 || len([]rune(result.CompileError)) > 32_768 {
+	if UTF16Len(result.Stdout) > 65_536 || UTF16Len(result.Stderr) > 65_536 || UTF16Len(result.CompileError) > 32_768 {
 		return fmt.Errorf("judge result output exceeds the callback contract")
 	}
 	switch result.Status {

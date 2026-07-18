@@ -146,3 +146,19 @@ func TestExecutionPipelineBuildsCallbackResult(t *testing.T) {
 		t.Fatalf("negative metrics were not normalized: %+v", result)
 	}
 }
+
+func TestExecutionPipelineTruncatesCallbackTextByUTF16CodeUnits(t *testing.T) {
+	executor := &fakeExecutor{response: &sandboxpb.ExecuteResponse{
+		Status: "Accepted",
+		Stdout: strings.Repeat("😀", 40_000),
+	}}
+	pipeline := NewExecutionPipeline(fakeSelector{endpoint: "10.0.0.9:50051"}, executor)
+
+	result, err := pipeline.Execute(context.Background(), &model.Task{}, &model.Problem{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := callback.UTF16Len(result.Stdout); got != 65_536 {
+		t.Fatalf("stdout UTF-16 length = %d", got)
+	}
+}
