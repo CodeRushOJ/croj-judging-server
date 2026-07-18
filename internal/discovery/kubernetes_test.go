@@ -12,7 +12,7 @@ func TestEndpointAddressesIncludesOnlyReadyNonTerminatingBackends(t *testing.T) 
 	notReady := false
 	terminating := true
 	notTerminating := false
-	portName := "http"
+	portName := "grpc"
 	port := int32(8080)
 	slices := []discoveryv1.EndpointSlice{
 		{
@@ -31,7 +31,7 @@ func TestEndpointAddressesIncludesOnlyReadyNonTerminatingBackends(t *testing.T) 
 		},
 	}
 
-	got, err := EndpointAddresses(slices, "http")
+	got, err := EndpointAddresses(slices, "grpc")
 	if err != nil {
 		t.Fatalf("EndpointAddresses returned error: %v", err)
 	}
@@ -50,7 +50,7 @@ func TestEndpointAddressesSkipsSlicesWithoutConfiguredPort(t *testing.T) {
 		Endpoints: []discoveryv1.Endpoint{{Addresses: []string{"10.0.0.2"}, Conditions: discoveryv1.EndpointConditions{Ready: &ready}}},
 	}}
 
-	got, err := EndpointAddresses(slices, "http")
+	got, err := EndpointAddresses(slices, "grpc")
 	if err != nil {
 		t.Fatalf("EndpointAddresses returned error: %v", err)
 	}

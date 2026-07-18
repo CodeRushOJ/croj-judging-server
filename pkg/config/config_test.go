@@ -18,7 +18,7 @@ rocketmq:
 sandbox-discovery:
   namespace: coderushoj
   service: croj-sandbox
-  port-name: http
+  port-name: grpc
   refresh-interval: 5s
   kubeconfig: ""
 `)
