@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/CodeRushOJ/croj-judging-server/internal/consumer"
 	"github.com/CodeRushOJ/croj-judging-server/internal/database"
@@ -35,25 +36,23 @@ func main() {
 	defer db.Close()
 	fmt.Println("Database connected.")
 
-	// 初始化服务发现 (即使不直接调用沙盒，调度器可能仍需要它)
-	discoveryClient, err := discovery.NewZookeeperClient(cfg.Zookeeper.Servers)
+	refreshInterval, err := time.ParseDuration(cfg.SandboxDiscovery.RefreshInterval)
 	if err != nil {
-		log.Printf("Warning: Failed to connect to Zookeeper: %v. Scheduler might not work correctly.", err)
-		// 根据实际情况决定是否退出
+		log.Fatalf("Invalid sandbox discovery refresh interval: %v", err)
 	}
-	// ZK 连接可能在后台断开，需要更健壮的处理
-	// defer discoveryClient.Close() // Close 的实现在 ZK 库中有时会阻塞，视情况处理
-	if discoveryClient != nil {
-		fmt.Println("Zookeeper client initialized (connection attempt initiated).")
+	discoveryClient, err := discovery.NewKubernetesDiscovery(
+		cfg.SandboxDiscovery.Namespace,
+		cfg.SandboxDiscovery.Service,
+		cfg.SandboxDiscovery.PortName,
+		cfg.SandboxDiscovery.Kubeconfig,
+	)
+	if err != nil {
+		log.Fatalf("Failed to initialize Kubernetes sandbox discovery: %v", err)
 	}
-
-	// 初始化调度器 (如果 JudgeService 还需要它的话)
-	// 在当前简化流程下，JudgeService 不直接用调度器选择目的地，但保留框架
-	scheduler := scheduler.NewScheduler(discoveryClient)
+	sandboxScheduler := scheduler.New(discoveryClient)
 	fmt.Println("Scheduler initialized.")
 
-	// 初始化判题服务 (不需要 sandboxClient)
-	judgeService := service.NewJudgeService(db, scheduler, nil) // sandboxClient is nil
+	judgeService := service.NewJudgeService(db, sandboxScheduler, nil)
 	fmt.Println("Judge service initialized.")
 
 	// 启动 RocketMQ 消费者
@@ -65,6 +64,7 @@ func main() {
 	// 使用 context 来管理 consumer 的生命周期
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	go sandboxScheduler.Run(ctx, refreshInterval)
 
 	go func() {
 		fmt.Println("Starting RocketMQ consumer...")
@@ -95,12 +95,6 @@ func main() {
 		log.Printf("Failed to shutdown RocketMQ consumer: %v", err)
 	}
 	fmt.Println("RocketMQ consumer stopped.")
-
-	// 关闭 ZK 连接 (如果需要)
-	if discoveryClient != nil {
-		// discoveryClient.Close() // 视 ZK 库实现决定是否调用
-		fmt.Println("Zookeeper client shutdown.")
-	}
 
 	fmt.Println("Server gracefully stopped.")
 }

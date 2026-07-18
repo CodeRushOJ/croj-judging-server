@@ -1,19 +1,21 @@
 database:
-  host: localhost
+  host: coderushoj-infra-mysql.coderushoj.svc
   port: 3306
-  user: admin
-  password: admin123
+  user: coderushoj
+  password: ""
   name: code_rush_oj
 
 rocketmq:
-  name-server: "127.0.0.1:9876"
+  name-server: "coderushoj-infra-rocketmq-namesrv.coderushoj.svc:9876"
   topic: "submission-topic" # 需要明确指定 Topic
   # producer:
   #  group: submission-producer-group # 如果需要生产者，则取消注释
   consumer:
     group: submission-consumer-group
 
-zookeeper:
-  servers:
-    - "10.233.4.142:2181"
-  path: "/judges"        # 判题沙盒在 ZK 中的路径 
+sandbox-discovery:
+  namespace: "coderushoj"
+  service: "croj-sandbox"
+  port-name: "http"
+  refresh-interval: "5s"
+  kubeconfig: ""

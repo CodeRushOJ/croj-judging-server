@@ -3,15 +3,16 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
 
 	"gopkg.in/yaml.v3"
 )
 
 // Config 应用的总配置
 type Config struct {
-	RocketMQ  RocketMQConfig  `yaml:"rocketmq"`
-	Database  DatabaseConfig  `yaml:"database"`
-	Zookeeper ZookeeperConfig `yaml:"zookeeper"`
+	RocketMQ         RocketMQConfig         `yaml:"rocketmq"`
+	Database         DatabaseConfig         `yaml:"database"`
+	SandboxDiscovery SandboxDiscoveryConfig `yaml:"sandbox-discovery"`
 	// 可以添加其他配置项，例如日志级别、沙盒路径等
 }
 
@@ -42,10 +43,12 @@ type DatabaseConfig struct {
 	Name     string `yaml:"name"`
 }
 
-// ZookeeperConfig Zookeeper 相关配置
-type ZookeeperConfig struct {
-	Servers []string `yaml:"servers"`
-	Path    string   `yaml:"path"` // 沙盒节点在 ZK 中的基础路径
+type SandboxDiscoveryConfig struct {
+	Namespace       string `yaml:"namespace"`
+	Service         string `yaml:"service"`
+	PortName        string `yaml:"port-name"`
+	RefreshInterval string `yaml:"refresh-interval"`
+	Kubeconfig      string `yaml:"kubeconfig"`
 }
 
 // LoadConfig 从指定路径加载配置文件
@@ -64,7 +67,38 @@ func LoadConfig(configPath string) (*Config, error) {
 		return nil, fmt.Errorf("failed to decode config file %s: %w", configPath, err)
 	}
 
-	// 可以添加配置校验逻辑
+	if err := config.applyEnvironment(); err != nil {
+		return nil, err
+	}
 
 	return config, nil
+}
+
+func (config *Config) applyEnvironment() error {
+	overrideString(&config.Database.Host, "DATABASE_HOST")
+	overrideString(&config.Database.User, "DATABASE_USERNAME")
+	overrideString(&config.Database.Password, "DATABASE_PASSWORD")
+	overrideString(&config.Database.Name, "DATABASE_NAME")
+	overrideString(&config.RocketMQ.NameServer, "ROCKETMQ_NAME_SERVER")
+	overrideString(&config.RocketMQ.Topic, "SUBMISSION_TOPIC")
+	overrideString(&config.RocketMQ.Consumer.Group, "ROCKETMQ_CONSUMER_GROUP")
+	overrideString(&config.SandboxDiscovery.Namespace, "SANDBOX_NAMESPACE")
+	overrideString(&config.SandboxDiscovery.Service, "SANDBOX_SERVICE")
+	overrideString(&config.SandboxDiscovery.PortName, "SANDBOX_PORT_NAME")
+	overrideString(&config.SandboxDiscovery.RefreshInterval, "SANDBOX_REFRESH_INTERVAL")
+	overrideString(&config.SandboxDiscovery.Kubeconfig, "KUBECONFIG")
+	if value, ok := os.LookupEnv("DATABASE_PORT"); ok {
+		port, err := strconv.Atoi(value)
+		if err != nil || port < 1 || port > 65535 {
+			return fmt.Errorf("DATABASE_PORT must be an integer between 1 and 65535")
+		}
+		config.Database.Port = port
+	}
+	return nil
+}
+
+func overrideString(target *string, environmentVariable string) {
+	if value, ok := os.LookupEnv(environmentVariable); ok {
+		*target = value
+	}
 }
