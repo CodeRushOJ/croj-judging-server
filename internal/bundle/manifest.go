@@ -99,7 +99,7 @@ func (manifest Manifest) Validate() error {
 }
 
 func validateArtifactPath(name string) error {
-	if name == "" || len(name) > 512 || strings.ContainsRune(name, '\x00') || strings.Contains(name, `\`) || strings.HasPrefix(name, "/") {
+	if name == "" || len(name) > 512 || !utf8.ValidString(name) || strings.ContainsRune(name, '\x00') || strings.Contains(name, `\`) || strings.HasPrefix(name, "/") {
 		return fmt.Errorf("invalid artifact path")
 	}
 	cleaned := path.Clean(name)

@@ -40,6 +40,9 @@ func TestOpenArchiveRejectsUnsafeZIPs(t *testing.T) {
 		"traversal": {
 			{name: "manifest.json", body: validManifest}, {name: "../01.in", body: "x"}, {name: "cases/01.in", body: "x"}, {name: "cases/01.out", body: "x"},
 		},
+		"invalid UTF-8 name": {
+			{name: "manifest.json", body: validManifest}, {name: string([]byte{0xff}), body: "x"}, {name: "cases/01.in", body: "x"}, {name: "cases/01.out", body: "x"},
+		},
 		"duplicate": {
 			{name: "manifest.json", body: validManifest}, {name: "cases/01.in", body: "x"}, {name: "cases/01.in", body: "x"}, {name: "cases/01.out", body: "x"},
 		},
