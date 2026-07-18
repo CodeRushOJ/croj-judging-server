@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -112,6 +113,54 @@ func TestCacheRejectsSizeAndChecksumMismatchWithoutFinalFile(t *testing.T) {
 			}
 			if len(entries) != 0 {
 				t.Fatalf("partial files remain: %v", entries)
+			}
+		})
+	}
+}
+
+func TestNewCacheRemovesRestartOrphansWithoutFollowingSymlinks(t *testing.T) {
+	directory := t.TempDir()
+	external := t.TempDir() + "/external"
+	if err := os.WriteFile(external, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	knownBundle := strings64("a") + ".zip"
+	for name, body := range map[string]string{knownBundle: "old", ".bundle-download-old": "partial", "unrelated": "keep"} {
+		if err := os.WriteFile(directory+"/"+name, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	linkName := directory + "/" + strings64("b") + ".zip"
+	if err := os.Symlink(external, linkName); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewCache(directory, 1<<20, 1<<20, time.Hour, &fakeObjectStore{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{knownBundle, ".bundle-download-old", strings64("b") + ".zip"} {
+		if _, err := os.Lstat(directory + "/" + name); !os.IsNotExist(err) {
+			t.Fatalf("orphan %q remains: %v", name, err)
+		}
+	}
+	if data, err := os.ReadFile(external); err != nil || string(data) != "keep" {
+		t.Fatalf("symlink target changed: %q %v", data, err)
+	}
+	if _, err := os.Stat(directory + "/unrelated"); err != nil {
+		t.Fatal("unrelated file was removed")
+	}
+}
+
+func TestCacheRejectsUnsafeObjectKeyMetadata(t *testing.T) {
+	cache, err := NewCache(t.TempDir(), 1<<20, 1<<20, time.Hour, &fakeObjectStore{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := []byte("bundle")
+	for name, key := range map[string]string{"empty": "", "NUL": "bad\x00key", "long": strings.Repeat("a", 513)} {
+		t.Run(name, func(t *testing.T) {
+			metadata := cacheMetadata(key, data)
+			if _, err := cache.Resolve(context.Background(), metadata); err == nil {
+				t.Fatal("expected unsafe object key error")
 			}
 		})
 	}
