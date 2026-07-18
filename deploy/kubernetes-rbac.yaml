@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: coderushoj-judging-server
+  namespace: coderushoj
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: coderushoj-judging-server-endpoint-reader
+  namespace: coderushoj
+rules:
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: coderushoj-judging-server-endpoint-reader
+  namespace: coderushoj
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: coderushoj-judging-server-endpoint-reader
+subjects:
+  - kind: ServiceAccount
+    name: coderushoj-judging-server
+    namespace: coderushoj

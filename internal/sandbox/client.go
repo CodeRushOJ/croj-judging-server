@@ -26,7 +26,7 @@ func NewClient() *Client {
 
 // Judge 向指定的沙盒发送判题请求
 func (c *Client) Judge(sandboxAddr string, task *model.Task) (*model.JudgeResult, error) {
-	fmt.Printf("Sending judge request for task %s to sandbox %s...\n", task.ID, sandboxAddr)
+	fmt.Printf("Sending judge request for task %d to sandbox %s...\n", task.ID, sandboxAddr)
 
 	// 准备请求体
 	requestBody, err := json.Marshal(task) // 假设沙盒接收 Task 对象
@@ -60,6 +60,6 @@ func (c *Client) Judge(sandboxAddr string, task *model.Task) (*model.JudgeResult
 		return nil, fmt.Errorf("failed to decode judge response from %s: %w", sandboxAddr, err)
 	}
 
-	fmt.Printf("Received judge result for task %s from sandbox %s.\n", task.ID, sandboxAddr)
+	fmt.Printf("Received judge result for task %d from sandbox %s.\n", task.ID, sandboxAddr)
 	return &result, nil
 }
