@@ -115,6 +115,7 @@ func (repository *MySQLJobRepository) ClaimNext(
 		return WorkerJobClaim{}, ErrInvalidJobState
 	}
 	const maximumClaimRetries = 32
+	productiveRecovery := false
 	for attempt := 0; attempt < maximumClaimRetries; attempt++ {
 		claim, retry, err := repository.claimOne(ctx, workerID, leaseDuration)
 		if err != nil {
@@ -129,9 +130,13 @@ func (repository *MySQLJobRepository) ClaimNext(
 		if !retry {
 			return claim, nil
 		}
+		productiveRecovery = true
 		if err := waitForClaimRetry(ctx); err != nil {
 			return WorkerJobClaim{}, repositoryUnavailable("wait for worker claim recovery", err)
 		}
+	}
+	if productiveRecovery {
+		return WorkerJobClaim{}, ErrJobNotClaimable
 	}
 	return WorkerJobClaim{}, repositoryUnavailable("worker claim contention budget exhausted", ErrJobNotClaimable)
 }

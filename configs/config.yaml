@@ -54,7 +54,7 @@ sandbox-discovery:
   kubeconfig: ""
 
 # Disabled by default. Enabling this listener also enables durable REST workers
-# and requires MySQL schema v3, Redis, MinIO, source encryption keys, and DNS.
+# and requires MySQL schema v4, Redis, MinIO, source encryption keys, and DNS.
 external-api:
   enabled: false
   listen-address: "127.0.0.1:8081"
