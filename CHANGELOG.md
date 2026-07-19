@@ -6,6 +6,9 @@
 
 ### Added
 
+- 增加面向外部 OJ 的异步 REST v1 基础：RFC 9457 错误、request ID、scope 鉴权和 capabilities 端点。
+- 增加 Judge 自有 MySQL schema 的嵌入式迁移、advisory lock、checksum drift 拒绝及租户隔离数据结构。
+- 增加不透明 256-bit API Key 生成、peppered HMAC 存储、严格 scope 加载与 `judge-admin` 租户/密钥预置命令。
 - 增加与 `croj-sandbox` 一致的 `SandboxService.Execute` protobuf/gRPC 客户端。
 - 为 Pod endpoint 建立可复用连接、显式 RPC deadline 与确定性关闭流程。
 - 增加 bufconn、fake scheduler、失败传播和 verdict 映射测试。
