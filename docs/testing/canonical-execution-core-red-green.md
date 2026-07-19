@@ -164,3 +164,40 @@ ok github.com/CodeRushOJ/croj-judging-server/internal/worker 1.123s
 ok github.com/CodeRushOJ/croj-judging-server/internal/app 1.076s
 ok github.com/CodeRushOJ/croj-judging-server/cmd 1.282s
 ```
+
+## Final delivery gates
+
+```text
+$ go test -race ./...
+ok github.com/CodeRushOJ/croj-judging-server/cmd
+ok github.com/CodeRushOJ/croj-judging-server/internal/app
+ok github.com/CodeRushOJ/croj-judging-server/internal/external
+ok github.com/CodeRushOJ/croj-judging-server/internal/httpapi
+ok github.com/CodeRushOJ/croj-judging-server/internal/integration
+ok github.com/CodeRushOJ/croj-judging-server/internal/sandbox
+ok github.com/CodeRushOJ/croj-judging-server/internal/scheduler
+ok github.com/CodeRushOJ/croj-judging-server/internal/service
+ok github.com/CodeRushOJ/croj-judging-server/internal/worker
+ok github.com/CodeRushOJ/croj-judging-server/pkg/config
+
+$ go vet ./...
+(no output; exit 0)
+
+$ CGO_ENABLED=0 go build -trimpath ./cmd ./cmd/judge-admin
+(no output; exit 0)
+
+$ go test -race ./internal/worker ./cmd -run 'TestRunnerHeartbeatsWhileBundleProviderIsBlocked|TestStartExternalRuntimeDoneJoinsRuntimeShutdown' -count=20
+ok github.com/CodeRushOJ/croj-judging-server/internal/worker 1.362s
+ok github.com/CodeRushOJ/croj-judging-server/cmd 1.279s
+```
+
+The exact Dockerfile build was attempted twice. Both attempts stopped before reading project source because Docker Hub returned EOF while BuildKit resolved `docker/dockerfile:1.7`:
+
+```text
+ERROR: failed to resolve source metadata for docker.io/docker/dockerfile:1.7:
+Head "https://registry-1.docker.io/v2/docker/dockerfile/manifests/1.7": EOF
+```
+
+No gate image or service container was left behind. The native static builds above validate both Go entrypoints; CI retains the exact Dockerfile build gate for a runner with registry access.
+
+Independent spec review of `970a080..7ac2829` concluded `Critical 0 / Important 0 / Minor 0` after the lifecycle fixes.
