@@ -11,17 +11,19 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/CodeRushOJ/croj-judging-server/internal/external"
 )
 
-type Scope string
+type Scope = external.Scope
 
 const (
-	ScopeCapabilitiesRead Scope = "capabilities:read"
-	ScopeBundleWrite      Scope = "bundle:write"
-	ScopeBundleRead       Scope = "bundle:read"
-	ScopeJobSubmit        Scope = "job:submit"
-	ScopeJobRead          Scope = "job:read"
-	ScopeJobCancel        Scope = "job:cancel"
+	ScopeCapabilitiesRead = external.ScopeCapabilitiesRead
+	ScopeBundleWrite      = external.ScopeBundleWrite
+	ScopeBundleRead       = external.ScopeBundleRead
+	ScopeJobSubmit        = external.ScopeJobSubmit
+	ScopeJobRead          = external.ScopeJobRead
+	ScopeJobCancel        = external.ScopeJobCancel
 )
 
 var (
@@ -29,17 +31,8 @@ var (
 	keyPrefixPattern   = regexp.MustCompile(`^[A-Za-z0-9]{8,24}$`)
 )
 
-type Credential struct {
-	TenantID  string
-	Digest    []byte
-	Scopes    []Scope
-	ExpiresAt *time.Time
-	RevokedAt *time.Time
-}
-
-type CredentialStore interface {
-	FindCredentialByPrefix(context.Context, string) (*Credential, error)
-}
+type Credential = external.Credential
+type CredentialStore = external.CredentialStore
 
 type Principal struct {
 	TenantID string
