@@ -6,7 +6,12 @@ import (
 	"regexp"
 )
 
-const maximumV1CaseCount = 256
+const (
+	maximumV1CaseCount                 = 256
+	maximumJobRequestEncodingExpansion = int64(6)
+	maximumJobRequestEnvelopeBytes     = int64(64 << 10)
+	maximumV1SourceBytes               = (math.MaxInt64 - maximumJobRequestEnvelopeBytes) / maximumJobRequestEncodingExpansion
+)
 
 var capabilityLanguageIDPattern = regexp.MustCompile(`^[a-z][a-z0-9._-]{1,31}$`)
 
@@ -33,7 +38,7 @@ type Capabilities struct {
 
 func normalizeCapabilities(value Capabilities) (Capabilities, error) {
 	if value.APIVersion != "v1" || len(value.Languages) == 0 ||
-		value.Limits.MaxSourceBytes <= 0 || value.Limits.MaxSourceBytes > (math.MaxInt64-(64<<10))/6 ||
+		value.Limits.MaxSourceBytes <= 0 || value.Limits.MaxSourceBytes > maximumV1SourceBytes ||
 		value.Limits.MaxBundleBytes <= 0 || value.Limits.MaxCaseBytes <= 0 ||
 		value.Limits.MaxCaseCount <= 0 || value.Limits.MaxCaseCount > maximumV1CaseCount {
 		return Capabilities{}, fmt.Errorf("complete v1 capabilities and at least one language are required")

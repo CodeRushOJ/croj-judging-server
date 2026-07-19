@@ -54,6 +54,8 @@ paths:
           headers:
             X-Request-Id:
               $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
           content:
             application/json:
               schema:
@@ -115,6 +117,8 @@ paths:
           headers:
             X-Request-Id:
               $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
             Location:
               $ref: '#/components/headers/BundleLocation'
           content:
@@ -133,6 +137,8 @@ paths:
           headers:
             X-Request-Id:
               $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
             Location:
               $ref: '#/components/headers/BundleLocation'
           content:
@@ -177,6 +183,8 @@ paths:
           headers:
             X-Request-Id:
               $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
           content:
             application/json:
               schema:
@@ -239,6 +247,8 @@ paths:
           headers:
             X-Request-Id:
               $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
             Location:
               $ref: '#/components/headers/JobLocation'
             Idempotent-Replay:
@@ -286,6 +296,8 @@ paths:
           headers:
             X-Request-Id:
               $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
           content:
             application/json:
               schema:
@@ -332,6 +344,8 @@ paths:
           headers:
             X-Request-Id:
               $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
           content:
             application/json:
               schema:
@@ -388,6 +402,8 @@ paths:
           headers:
             X-Request-Id:
               $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
           content:
             application/json:
               schema:
@@ -471,6 +487,12 @@ components:
         type: string
         pattern: '^([0-9a-f]{32}|unavailable)$'
       example: unavailable
+    CacheControl:
+      description: Prevents authenticated API responses from being cached.
+      schema:
+        type: string
+        const: no-store
+      example: no-store
     BundleLocation:
       description: Relative metadata URL for the returned bundle.
       schema:
@@ -505,6 +527,8 @@ components:
       headers:
         X-Request-Id:
           $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
       content:
         application/problem+json:
           schema:
@@ -536,6 +560,8 @@ components:
       headers:
         X-Request-Id:
           $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
       content:
         application/problem+json:
           schema:
@@ -551,6 +577,8 @@ components:
       headers:
         X-Request-Id:
           $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
       content:
         application/problem+json:
           schema:
@@ -566,6 +594,8 @@ components:
       headers:
         X-Request-Id:
           $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
         WWW-Authenticate:
           $ref: '#/components/headers/WWWAuthenticate'
       content:
@@ -583,6 +613,8 @@ components:
       headers:
         X-Request-Id:
           $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
       content:
         application/problem+json:
           schema:
@@ -598,6 +630,8 @@ components:
       headers:
         X-Request-Id:
           $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
       content:
         application/problem+json:
           schema:
@@ -613,6 +647,8 @@ components:
       headers:
         X-Request-Id:
           $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
       content:
         application/problem+json:
           schema:
@@ -628,6 +664,8 @@ components:
       headers:
         X-Request-Id:
           $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
       content:
         application/problem+json:
           schema:
@@ -643,6 +681,8 @@ components:
       headers:
         X-Request-Id:
           $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
       content:
         application/problem+json:
           schema:
@@ -658,6 +698,8 @@ components:
       headers:
         X-Request-Id:
           $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
       content:
         application/problem+json:
           schema:
@@ -673,6 +715,8 @@ components:
       headers:
         X-Request-Id:
           $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
       content:
         application/problem+json:
           schema:
@@ -688,6 +732,8 @@ components:
       headers:
         X-Request-Id:
           $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
         Retry-After:
           $ref: '#/components/headers/RetryAfter'
       content:
@@ -705,6 +751,8 @@ components:
       headers:
         X-Request-Id:
           $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
       content:
         application/problem+json:
           schema:
@@ -720,6 +768,8 @@ components:
       headers:
         X-Request-Id:
           $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
         Retry-After:
           $ref: '#/components/headers/RetryAfter'
       content:
@@ -737,6 +787,8 @@ components:
       headers:
         X-Request-Id:
           $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
         Retry-After:
           $ref: '#/components/headers/RetryAfter'
       content:
@@ -777,6 +829,8 @@ components:
       headers:
         X-Request-Id:
           $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
         Retry-After:
           $ref: '#/components/headers/RetryAfter'
       content:
@@ -803,6 +857,8 @@ components:
       headers:
         X-Request-Id:
           $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
         Retry-After:
           $ref: '#/components/headers/RetryAfter'
       content:
@@ -836,6 +892,8 @@ components:
       headers:
         X-Request-Id:
           $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
         Retry-After:
           $ref: '#/components/headers/RetryAfter'
       content:
