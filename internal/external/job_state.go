@@ -118,7 +118,7 @@ func (job *DurableJob) Complete(claim JobClaim, result DurableJobResult, now tim
 		job.Status = JobStatusCancelled
 		job.Result = nil
 	} else {
-		if strings.TrimSpace(result.Verdict) == "" || strings.TrimSpace(result.CompileStatus) == "" {
+		if err := validateDurableJobResult(result); err != nil {
 			return fmt.Errorf("%w: terminal result is incomplete", ErrInvalidJobState)
 		}
 		copied := result
@@ -129,6 +129,27 @@ func (job *DurableJob) Complete(claim JobClaim, result DurableJobResult, now tim
 	job.FailureCode = ""
 	job.CompletedAt = copyTime(now)
 	job.clearLease()
+	return nil
+}
+
+func validateDurableJobResult(result DurableJobResult) error {
+	if strings.TrimSpace(result.Verdict) == "" || len(result.Verdict) > 64 ||
+		strings.TrimSpace(result.CompileStatus) == "" || len(result.CompileStatus) > 64 ||
+		result.TimeMillis < 0 || result.MemoryBytes < 0 || len(result.Cases) > 256 {
+		return ErrInvalidJobState
+	}
+	caseIDs := make(map[string]struct{}, len(result.Cases))
+	for _, item := range result.Cases {
+		if strings.TrimSpace(item.CaseID) == "" || len(item.CaseID) > 128 ||
+			strings.TrimSpace(item.Verdict) == "" || len(item.Verdict) > 64 ||
+			item.TimeMillis < 0 || item.MemoryBytes < 0 {
+			return ErrInvalidJobState
+		}
+		if _, exists := caseIDs[item.CaseID]; exists {
+			return ErrInvalidJobState
+		}
+		caseIDs[item.CaseID] = struct{}{}
+	}
 	return nil
 }
 

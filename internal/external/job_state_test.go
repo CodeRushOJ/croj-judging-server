@@ -98,6 +98,24 @@ func TestCompletionRejectsStaleWorkersAndHonorsCancellation(t *testing.T) {
 	}
 }
 
+func TestCompletionRejectsMalformedRedactedResults(t *testing.T) {
+	now := time.Date(2026, 7, 19, 10, 0, 0, 0, time.UTC)
+	for name, result := range map[string]DurableJobResult{
+		"negative aggregate": {Verdict: "ACCEPTED", CompileStatus: "SUCCEEDED", TimeMillis: -1},
+		"negative case":      {Verdict: "ACCEPTED", CompileStatus: "SUCCEEDED", Cases: []DurableCaseResult{{CaseID: "1", Verdict: "ACCEPTED", MemoryBytes: -1}}},
+		"empty case id":      {Verdict: "ACCEPTED", CompileStatus: "SUCCEEDED", Cases: []DurableCaseResult{{Verdict: "ACCEPTED"}}},
+		"duplicate case":     {Verdict: "ACCEPTED", CompileStatus: "SUCCEEDED", Cases: []DurableCaseResult{{CaseID: "1", Verdict: "ACCEPTED"}, {CaseID: "1", Verdict: "WRONG_ANSWER"}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			job := DurableJob{Status: JobStatusRunning, AttemptNo: 1, WorkerID: "worker-a", LeaseUntil: now.Add(time.Minute)}
+			err := job.Complete(JobClaim{WorkerID: "worker-a", AttemptNo: 1}, result, now)
+			if !errors.Is(err, ErrInvalidJobState) || job.Status != JobStatusRunning || job.Result != nil {
+				t.Fatalf("err=%v job=%+v", err, job)
+			}
+		})
+	}
+}
+
 func TestInfrastructureFailureRetriesThenTerminates(t *testing.T) {
 	now := time.Date(2026, 7, 19, 10, 0, 0, 0, time.UTC)
 	job := DurableJob{Status: JobStatusRunning, AttemptNo: 1, WorkerID: "worker-a", LeaseUntil: now.Add(time.Minute)}

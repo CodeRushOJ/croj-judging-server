@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strings"
 )
@@ -37,7 +38,8 @@ func NewServer(authenticator RequestAuthenticator, capabilities Capabilities, op
 	if authenticator == nil {
 		return nil, fmt.Errorf("request authenticator is required")
 	}
-	if capabilities.APIVersion != "v1" || len(capabilities.Languages) == 0 {
+	if capabilities.APIVersion != "v1" || len(capabilities.Languages) == 0 ||
+		capabilities.Limits.MaxSourceBytes <= 0 || capabilities.Limits.MaxSourceBytes > (math.MaxInt64-(64<<10))/6 {
 		return nil, fmt.Errorf("v1 capabilities and at least one language are required")
 	}
 	server := &Server{authenticator: authenticator, capabilities: capabilities}

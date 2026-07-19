@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -89,6 +90,38 @@ func TestSubmitJudgeJobUsesStrictJSONAndRequiresIdempotencyKey(t *testing.T) {
 	}
 }
 
+func TestSubmitJudgeJobRejectsMultipleIdempotencyHeaders(t *testing.T) {
+	service := &jobServiceStub{}
+	server := newJobTestServer(t, service, ScopeJobSubmit)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs", strings.NewReader(`{"bundleId":"ceirceirceirceirceirceircf","language":"cpp20","sourceCode":"x"}`))
+	request.Header.Set("Authorization", "Bearer valid")
+	request.Header.Add("Idempotency-Key", "submission-00000042")
+	request.Header.Add("Idempotency-Key", "submission-00000043")
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || service.submittedTenant != "" {
+		t.Fatalf("status=%d submitTenant=%q body=%s", response.Code, service.submittedTenant, response.Body.String())
+	}
+}
+
+func TestSubmitJudgeJobWireLimitAllowsWorstCaseEscapedSource(t *testing.T) {
+	service := &jobServiceStub{view: JobView{JobID: "ceirceirceirceirceirceirce", Status: JobQueued}}
+	server := newJobTestServer(t, service, ScopeJobSubmit)
+	source := strings.Repeat("\x01", 1<<20)
+	body, err := json.Marshal(SubmitJobCommand{BundleID: "ceirceirceirceirceirceircf", Language: "cpp20", SourceCode: source})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs", strings.NewReader(string(body)))
+	request.Header.Set("Authorization", "Bearer valid")
+	request.Header.Set("Idempotency-Key", "submission-00000042")
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusAccepted || len(service.command.SourceCode) != len(source) {
+		t.Fatalf("wireBytes=%d status=%d sourceBytes=%d body=%s", len(body), response.Code, len(service.command.SourceCode), response.Body.String())
+	}
+}
+
 func TestListJudgeJobsUsesStableCursorQuery(t *testing.T) {
 	service := &jobServiceStub{listPage: JobListPage{
 		Items:      []JobView{{JobID: "ceirceirceirceirceirceirce", Status: JobQueued}},
@@ -114,7 +147,7 @@ func TestListJudgeJobsUsesStableCursorQuery(t *testing.T) {
 func TestListJudgeJobsRejectsInvalidFilters(t *testing.T) {
 	service := &jobServiceStub{}
 	server := newJobTestServer(t, service, ScopeJobRead)
-	for _, query := range []string{"limit=0", "limit=101", "limit=nope", "status=UNKNOWN", "extra=x"} {
+	for _, query := range []string{"limit=0", "limit=101", "limit=nope", "status=UNKNOWN", "extra=x", "limit=%ZZ"} {
 		request := httptest.NewRequest(http.MethodGet, "/api/v1/judge-jobs?"+query, nil)
 		request.Header.Set("Authorization", "Bearer valid")
 		response := httptest.NewRecorder()
