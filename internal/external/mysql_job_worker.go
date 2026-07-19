@@ -16,25 +16,47 @@ import (
 var infrastructureCodePattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
 
 func (repository *MySQLJobRepository) LoadClaimSource(ctx context.Context, claim WorkerJobClaim) ([]byte, error) {
-	if repository == nil || !validWorkerClaim(claim) ||
-		!externalIDPattern.MatchString(claim.Job.TenantExternalID) ||
-		!externalIDPattern.MatchString(claim.Job.Source.ExternalID) {
+	if repository == nil || !validWorkerClaim(claim) {
 		return nil, ErrInvalidJobState
 	}
-	ciphertext, err := repository.sourceObjects.Get(ctx, claim.Job.Source.ObjectKey)
+	var tenantExternalID string
+	var source SourceObjectMetadata
+	var keyVersion uint64
+	err := repository.database.QueryRowContext(ctx, `
+SELECT tenant.external_id, source.external_id, source.object_key, source.source_sha256,
+       source.source_size_bytes, source.encryption_key_version, source.encryption_nonce
+FROM t_external_job AS job
+JOIN t_external_tenant AS tenant ON tenant.id = job.tenant_id
+JOIN t_external_source_object AS source
+  ON source.id = job.source_object_id AND source.tenant_id = job.tenant_id
+WHERE job.id = ? AND job.status = 'RUNNING' AND job.attempt_no = ? AND job.worker_id = ?
+  AND job.lease_token = ? AND job.lease_until > ?`,
+		claim.Job.InternalID, claim.AttemptNo, claim.WorkerID, claim.LeaseToken, repository.now().UTC()).
+		Scan(
+			&tenantExternalID, &source.ExternalID, &source.ObjectKey, &source.SHA256,
+			&source.SizeBytes, &keyVersion, &source.Nonce,
+		)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrStaleJobClaim
+	}
+	if err != nil || keyVersion == 0 || keyVersion > 65535 {
+		return nil, repositoryUnavailable("load authoritative source metadata", err)
+	}
+	source.KeyVersion = uint16(keyVersion)
+	ciphertext, err := repository.sourceObjects.Get(ctx, source.ObjectKey)
 	if err != nil {
 		return nil, fmt.Errorf("%w: encrypted source object is unavailable", ErrSourceEncryption)
 	}
 	encrypted := EncryptedSource{
 		Ciphertext: ciphertext,
-		Nonce:      append([]byte(nil), claim.Job.Source.Nonce...),
-		KeyVersion: claim.Job.Source.KeyVersion,
-		SHA256:     append([]byte(nil), claim.Job.Source.SHA256...),
-		SizeBytes:  claim.Job.Source.SizeBytes,
+		Nonce:      append([]byte(nil), source.Nonce...),
+		KeyVersion: source.KeyVersion,
+		SHA256:     append([]byte(nil), source.SHA256...),
+		SizeBytes:  source.SizeBytes,
 	}
 	plaintext, err := repository.sourceCipher.Decrypt(
-		claim.Job.TenantExternalID,
-		claim.Job.Source.ExternalID,
+		tenantExternalID,
+		source.ExternalID,
 		encrypted,
 	)
 	clear(ciphertext)
