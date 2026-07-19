@@ -30,6 +30,20 @@ type externalRuntime struct {
 	redis   *redis.Client
 }
 
+type runnableRuntime interface {
+	Run(context.Context) error
+}
+
+func startExternalRuntime(ctx context.Context, runtime runnableRuntime, cancel context.CancelFunc) <-chan error {
+	done := make(chan error, 1)
+	go func() {
+		err := runtime.Run(ctx)
+		cancel()
+		done <- err
+	}()
+	return done
+}
+
 func newExternalRuntime(
 	cfg *config.Config,
 	database *sql.DB,

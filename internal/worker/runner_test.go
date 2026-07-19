@@ -46,7 +46,7 @@ func TestRunnerPropagatesCancellationToCanonicalCoreAndFencedCompletion(t *testi
 	runner, err := NewRunner(repository, staticProvider{artifact: &runnerArtifact{manifest: bundle.Manifest{
 		SchemaVersion: 1, JudgeMode: bundle.JudgeModeACM, Checker: bundle.CheckerExact,
 		Limits: bundle.Limits{TimeLimitMillis: 1000, MemoryLimitMiB: 64},
-		Cases: []bundle.Case{{ID: "case-1", Input: "1.in", Output: "1.out", Weight: 1}},
+		Cases:  []bundle.Case{{ID: "case-1", Input: "1.in", Output: "1.out", Weight: 1}},
 	}}}, core, Config{LeaseDuration: time.Second, HeartbeatInterval: 20 * time.Millisecond, ControlPollInterval: 5 * time.Millisecond, RetryDelay: time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
@@ -69,7 +69,7 @@ func TestRunnerClaimsQueuedWorkAndStopsWithParentContext(t *testing.T) {
 	artifact := &runnerArtifact{manifest: bundle.Manifest{
 		SchemaVersion: 1, JudgeMode: bundle.JudgeModeACM, Checker: bundle.CheckerExact,
 		Limits: bundle.Limits{TimeLimitMillis: 1000, MemoryLimitMiB: 64},
-		Cases: []bundle.Case{{ID: "case-1", Input: "1.in", Output: "1.out", Weight: 1}},
+		Cases:  []bundle.Case{{ID: "case-1", Input: "1.in", Output: "1.out", Weight: 1}},
 	}}
 	runner, err := NewRunner(repository, staticProvider{artifact: artifact}, acceptedCore{}, Config{
 		LeaseDuration: time.Second, HeartbeatInterval: 20 * time.Millisecond,
@@ -92,6 +92,44 @@ func TestRunnerClaimsQueuedWorkAndStopsWithParentContext(t *testing.T) {
 	}
 }
 
+func TestRunnerHeartbeatsWhileBundleProviderIsBlocked(t *testing.T) {
+	claim := external.WorkerJobClaim{Job: external.ExternalJobRecord{InternalID: 11}, WorkerID: "slow-bundle-worker", AttemptNo: 1, LeaseToken: make([]byte, 32), LeaseUntil: time.Now().Add(time.Second)}
+	heartbeat := make(chan struct{}, 1)
+	repository := &runnerRepository{heartbeatSignal: heartbeat, input: external.WorkerExecutionInput{
+		Language: "go126", SourceCode: []byte("package main"), StopOnFailure: true,
+		Bundle: external.WorkerBundleInput{ObjectKey: "bundle.zip", SHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", SizeBytes: 1, ManifestJSON: []byte("manifest")},
+	}}
+	provider := &blockingProvider{
+		started: make(chan struct{}), release: make(chan struct{}),
+		artifact: &runnerArtifact{manifest: bundle.Manifest{
+			SchemaVersion: 1, JudgeMode: bundle.JudgeModeACM, Checker: bundle.CheckerExact,
+			Limits: bundle.Limits{TimeLimitMillis: 1000, MemoryLimitMiB: 64},
+			Cases:  []bundle.Case{{ID: "case-1", Input: "1.in", Output: "1.out", Weight: 1}},
+		}},
+	}
+	runner, err := NewRunner(repository, provider, acceptedCore{}, Config{
+		LeaseDuration: 100 * time.Millisecond, HeartbeatInterval: 10 * time.Millisecond,
+		ControlPollInterval: 20 * time.Millisecond, RetryDelay: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- runner.ExecuteClaim(context.Background(), claim) }()
+	<-provider.started
+	select {
+	case <-heartbeat:
+	case <-time.After(80 * time.Millisecond):
+		close(provider.release)
+		<-done
+		t.Fatal("claim was not heartbeated while bundle I/O was blocked")
+	}
+	close(provider.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 type runnerRepository struct {
 	input                  external.WorkerExecutionInput
 	cancelled              bool
@@ -99,6 +137,7 @@ type runnerRepository struct {
 	infrastructureFailures int
 	claim                  *external.WorkerJobClaim
 	completionSignal       chan struct{}
+	heartbeatSignal        chan struct{}
 }
 
 func (repository *runnerRepository) ClaimNext(context.Context, string, time.Duration) (external.WorkerJobClaim, error) {
@@ -113,8 +152,18 @@ func (repository *runnerRepository) ClaimNext(context.Context, string, time.Dura
 func (repository *runnerRepository) LoadClaimInput(context.Context, external.WorkerJobClaim) (external.WorkerExecutionInput, error) {
 	return repository.input, nil
 }
-func (repository *runnerRepository) Heartbeat(context.Context, external.WorkerJobClaim, time.Duration) error { return nil }
-func (repository *runnerRepository) ClaimCancelled(context.Context, external.WorkerJobClaim) (bool, error) { return repository.cancelled, nil }
+func (repository *runnerRepository) Heartbeat(context.Context, external.WorkerJobClaim, time.Duration) error {
+	if repository.heartbeatSignal != nil {
+		select {
+		case repository.heartbeatSignal <- struct{}{}:
+		default:
+		}
+	}
+	return nil
+}
+func (repository *runnerRepository) ClaimCancelled(context.Context, external.WorkerJobClaim) (bool, error) {
+	return repository.cancelled, nil
+}
 func (repository *runnerRepository) Complete(_ context.Context, _ external.WorkerJobClaim, _ external.DurableJobResult) error {
 	repository.completions++
 	if repository.completionSignal != nil {
@@ -128,12 +177,32 @@ func (repository *runnerRepository) FailInfrastructure(context.Context, external
 }
 
 type staticProvider struct{ artifact bundle.ArtifactReader }
-func (provider staticProvider) OpenMetadata(context.Context, bundle.Metadata, []byte) (bundle.ArtifactReader, error) { return provider.artifact, nil }
+
+func (provider staticProvider) OpenMetadata(context.Context, bundle.Metadata, []byte) (bundle.ArtifactReader, error) {
+	return provider.artifact, nil
+}
+
+type blockingProvider struct {
+	started  chan struct{}
+	release  chan struct{}
+	artifact bundle.ArtifactReader
+}
+
+func (provider *blockingProvider) OpenMetadata(ctx context.Context, _ bundle.Metadata, _ []byte) (bundle.ArtifactReader, error) {
+	close(provider.started)
+	select {
+	case <-provider.release:
+		return provider.artifact, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
 
 type cancellationCore struct {
 	started   chan struct{}
 	cancelled bool
 }
+
 func (core *cancellationCore) ExecuteCanonical(ctx context.Context, _ service.CanonicalExecutionRequest, _ service.CaseArtifact) (service.CanonicalResult, error) {
 	close(core.started)
 	<-ctx.Done()
@@ -142,9 +211,10 @@ func (core *cancellationCore) ExecuteCanonical(ctx context.Context, _ service.Ca
 }
 
 type runnerArtifact struct{ manifest bundle.Manifest }
-func (artifact *runnerArtifact) Manifest() bundle.Manifest { return artifact.manifest }
+
+func (artifact *runnerArtifact) Manifest() bundle.Manifest                    { return artifact.manifest }
 func (artifact *runnerArtifact) ReadCase(bundle.Case) (string, string, error) { return "", "", nil }
-func (artifact *runnerArtifact) Close() error { return nil }
+func (artifact *runnerArtifact) Close() error                                 { return nil }
 
 type acceptedCore struct{}
 

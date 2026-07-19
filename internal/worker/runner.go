@@ -61,32 +61,11 @@ func NewRunner(repository Repository, provider ArtifactProvider, core CanonicalC
 }
 
 func (runner *Runner) ExecuteClaim(ctx context.Context, claim external.WorkerJobClaim) error {
-	input, err := runner.repository.LoadClaimInput(ctx, claim)
-	if err != nil {
-		if errors.Is(err, external.ErrStaleJobClaim) {
-			return nil
-		}
-		return runner.failInfrastructure(ctx, claim, "LOAD_EXECUTION_INPUT_FAILED")
-	}
-	defer clear(input.SourceCode)
-	artifact, err := runner.provider.OpenMetadata(ctx, bundle.Metadata{
-		ObjectKey: input.Bundle.ObjectKey, SHA256: input.Bundle.SHA256, SizeBytes: input.Bundle.SizeBytes,
-	}, input.Bundle.ManifestJSON)
-	if err != nil {
-		if bundle.IsInvalid(err) {
-			return runner.complete(ctx, claim, service.CanonicalResult{Status: callback.StatusSystemError})
-		}
-		return runner.failInfrastructure(ctx, claim, "LOAD_BUNDLE_FAILED")
-	}
-	defer artifact.Close()
-
 	executionContext, cancel := context.WithCancel(ctx)
 	controlDone := make(chan struct{})
 	controlResult := make(chan error, 1)
 	go runner.monitorClaim(executionContext, cancel, claim, controlDone, controlResult)
-	result, executionErr := runner.core.ExecuteCanonical(executionContext, service.CanonicalExecutionRequest{
-		Language: input.Language, SourceCode: string(input.SourceCode), StopOnFailure: input.StopOnFailure,
-	}, artifact)
+	result, failureCode, executionErr := runner.executeControlled(executionContext, claim)
 	close(controlDone)
 	controlErr := <-controlResult
 	cancel()
@@ -95,18 +74,46 @@ func (runner *Runner) ExecuteClaim(ctx context.Context, claim external.WorkerJob
 		return runner.complete(ctx, claim, service.CanonicalResult{Status: callback.StatusSystemError})
 	}
 	if controlErr != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if errors.Is(controlErr, external.ErrStaleJobClaim) {
 			return nil
 		}
 		return runner.failInfrastructure(ctx, claim, "LEASE_CONTROL_FAILED")
 	}
 	if executionErr != nil {
+		if errors.Is(executionErr, external.ErrStaleJobClaim) {
+			return nil
+		}
 		if errors.Is(executionErr, context.Canceled) && ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return runner.failInfrastructure(ctx, claim, "SANDBOX_EXECUTION_FAILED")
+		return runner.failInfrastructure(ctx, claim, failureCode)
 	}
 	return runner.complete(ctx, claim, result)
+}
+
+func (runner *Runner) executeControlled(ctx context.Context, claim external.WorkerJobClaim) (service.CanonicalResult, string, error) {
+	input, err := runner.repository.LoadClaimInput(ctx, claim)
+	if err != nil {
+		return service.CanonicalResult{}, "LOAD_EXECUTION_INPUT_FAILED", err
+	}
+	defer clear(input.SourceCode)
+	artifact, err := runner.provider.OpenMetadata(ctx, bundle.Metadata{
+		ObjectKey: input.Bundle.ObjectKey, SHA256: input.Bundle.SHA256, SizeBytes: input.Bundle.SizeBytes,
+	}, input.Bundle.ManifestJSON)
+	if err != nil {
+		if bundle.IsInvalid(err) {
+			return service.CanonicalResult{Status: callback.StatusSystemError}, "", nil
+		}
+		return service.CanonicalResult{}, "LOAD_BUNDLE_FAILED", err
+	}
+	defer artifact.Close()
+	result, err := runner.core.ExecuteCanonical(ctx, service.CanonicalExecutionRequest{
+		Language: input.Language, SourceCode: string(input.SourceCode), StopOnFailure: input.StopOnFailure,
+	}, artifact)
+	return result, "SANDBOX_EXECUTION_FAILED", err
 }
 
 func (runner *Runner) Run(ctx context.Context, workerID string, idleBackoff time.Duration) error {
