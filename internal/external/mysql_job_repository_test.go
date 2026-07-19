@@ -335,8 +335,51 @@ func TestMySQLJobRepositoryListUsesStableTenantBoundCursor(t *testing.T) {
 	if len(seen) != len(jobIDs) {
 		t.Fatalf("seen=%d want=%d", len(seen), len(jobIDs))
 	}
-	if _, err := repository.List(context.Background(), tenantB, JobListOptions{Limit: 2, Status: JobStatusQueued, Cursor: first.NextCursor}); !errors.Is(err, ErrExternalJobInvalid) {
+	if _, err := repository.List(context.Background(), tenantB, JobListOptions{Limit: 2, Status: JobStatusQueued, Cursor: first.NextCursor}); !errors.Is(err, ErrInvalidJobCursor) {
 		t.Fatalf("cross-tenant cursor error = %v", err)
+	}
+}
+
+func TestMySQLJobRepositorySweepsOnlyUnreferencedSourceReservations(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	tenantID := strings.Repeat("3", 26)
+	bundleID := strings.Repeat("4", 26)
+	insertTenantBundleAndCallback(t, database, tenantID, bundleID, "", 2)
+	store := newMemorySourceStore()
+	repository := newTestMySQLJobRepository(t, database, store)
+	accepted, err := repository.Submit(context.Background(), tenantID, "reservation-linked-key", JudgeJobRequest{
+		BundleID: bundleID, Language: "cpp20", SourceCode: []byte("int main(){}"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	linkedKey := accepted.Job.Source.ObjectKey
+	orphanID := strings.Repeat("5", 26)
+	orphanKey, err := SourceObjectKey(tenantID, orphanID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Create(context.Background(), orphanKey, []byte("opaque ciphertext")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT INTO t_external_source_reservation(object_key, created_at)
+VALUES (?, CURRENT_TIMESTAMP(3) - INTERVAL 1 HOUR), (?, CURRENT_TIMESTAMP(3) - INTERVAL 1 HOUR)`, orphanKey, linkedKey); err != nil {
+		t.Fatal(err)
+	}
+	reaped, err := repository.SweepSourceReservations(context.Background(), time.Minute, 10)
+	if err != nil || reaped != 2 {
+		t.Fatalf("sweep reaped=%d error=%v", reaped, err)
+	}
+	objects, _, _ := store.snapshot()
+	if _, exists := objects[orphanKey]; exists {
+		t.Fatal("orphaned source object survived reservation sweep")
+	}
+	if _, exists := objects[linkedKey]; !exists {
+		t.Fatal("referenced source object was deleted by reservation sweep")
+	}
+	if count := mustCount(t, database, "SELECT COUNT(*) FROM t_external_source_reservation"); count != 0 {
+		t.Fatalf("source reservations after sweep=%d", count)
 	}
 }
 
@@ -428,7 +471,7 @@ func prepareExternalJobDatabase(t *testing.T, database *sql.DB) {
 	}
 	for _, table := range []string{
 		"t_external_webhook_outbox", "t_external_job_attempt", "t_external_idempotency",
-		"t_external_job", "t_external_source_object", "t_external_callback", "t_external_bundle",
+		"t_external_job", "t_external_source_reservation", "t_external_source_object", "t_external_callback", "t_external_bundle",
 		"t_external_api_key", "t_external_tenant",
 	} {
 		if _, err := database.ExecContext(ctx, "DELETE FROM "+table); err != nil {

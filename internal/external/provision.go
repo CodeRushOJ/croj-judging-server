@@ -29,8 +29,8 @@ func (policy TenantPolicy) validate() error {
 	if policy.MaxQueuedJobs <= 0 || policy.MaxRunningJobs <= 0 || policy.MaxRunningJobs > policy.MaxQueuedJobs {
 		return fmt.Errorf("queued/running job limits are invalid")
 	}
-	if policy.MaxSourceBytes <= 0 || policy.MaxRetainedBundles <= 0 || policy.DailyExecutionMillis <= 0 {
-		return fmt.Errorf("source, bundle, and daily execution limits must be positive")
+	if policy.MaxSourceBytes <= 0 || policy.MaxSourceBytes > MaximumSourceBytes || policy.MaxRetainedBundles <= 0 || policy.DailyExecutionMillis <= 0 {
+		return fmt.Errorf("source limit must be between 1 and %d bytes; bundle and daily execution limits must be positive", MaximumSourceBytes)
 	}
 	if policy.MaxInfrastructureTries <= 0 || policy.MaxInfrastructureTries > 10 {
 		return fmt.Errorf("infrastructure attempt limit must be between 1 and 10")

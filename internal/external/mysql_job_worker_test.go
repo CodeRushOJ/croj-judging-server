@@ -125,6 +125,102 @@ func TestMySQLWorkerSkipsQuotaFullTenantWithoutStarvingOthers(t *testing.T) {
 	}
 }
 
+func TestMySQLWorkerRetriesTenantSelectionAfterConcurrentContention(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	tenantA := strings.Repeat("a", 26)
+	tenantB := strings.Repeat("b", 26)
+	bundleA := strings.Repeat("c", 26)
+	bundleB := strings.Repeat("d", 26)
+	insertTenantBundleAndCallback(t, database, tenantA, bundleA, "", 2)
+	insertTenantBundleAndCallback(t, database, tenantB, bundleB, "", 2)
+	repository := newTestMySQLJobRepository(t, database, newMemorySourceStore())
+	for _, job := range []struct{ tenant, key, bundle string }{
+		{tenantA, "contention-tenant-a", bundleA},
+		{tenantB, "contention-tenant-b", bundleB},
+	} {
+		if _, err := repository.Submit(context.Background(), job.tenant, job.key, JudgeJobRequest{
+			BundleID: job.bundle, Language: "cpp20", SourceCode: []byte("int main(){}"),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	blocker, err := database.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Rollback()
+	if _, err := blocker.Exec("SELECT id FROM t_external_tenant WHERE external_id = ? FOR UPDATE", tenantA); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	claimContext, cancelClaims := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelClaims()
+	claims := make(chan WorkerJobClaim, 2)
+	errorsChannel := make(chan error, 2)
+	var wait sync.WaitGroup
+	for _, workerID := range []string{"contention-worker-a", "contention-worker-b"} {
+		workerID := workerID
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			claim, err := repository.ClaimNext(claimContext, workerID, time.Minute)
+			claims <- claim
+			errorsChannel <- err
+		}()
+	}
+	close(start)
+	// Both calls can perform the unlocked candidate read, then wait on tenant A.
+	time.Sleep(250 * time.Millisecond)
+	if err := blocker.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	wait.Wait()
+	close(claims)
+	close(errorsChannel)
+	for err := range errorsChannel {
+		if err != nil {
+			t.Fatalf("claim after tenant contention: %v", err)
+		}
+	}
+	seen := map[string]bool{}
+	for claim := range claims {
+		seen[claim.Job.TenantExternalID] = true
+	}
+	if !seen[tenantA] || !seen[tenantB] {
+		t.Fatalf("contention starved runnable tenant: %#v", seen)
+	}
+}
+
+func TestMySQLWorkerLeaseExpiryUsesDatabaseClock(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	tenantID := strings.Repeat("k", 26)
+	bundleID := strings.Repeat("m", 26)
+	insertTenantBundleAndCallback(t, database, tenantID, bundleID, "", 2)
+	store := newMemorySourceStore()
+	repository := newTestMySQLJobRepository(t, database, store)
+	if _, err := repository.Submit(context.Background(), tenantID, "database-clock-lease", JudgeJobRequest{
+		BundleID: bundleID, Language: "cpp20", SourceCode: []byte("int main(){}"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := repository.ClaimNext(context.Background(), "correct-clock-worker", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	skewed := newTestMySQLJobRepositoryWithClock(t, database, store, func() time.Time {
+		return time.Now().Add(24 * time.Hour)
+	})
+	if _, err := skewed.ClaimNext(context.Background(), "future-clock-worker", time.Minute); !errors.Is(err, ErrJobNotClaimable) {
+		t.Fatalf("future application clock reclaimed active lease: %v", err)
+	}
+	if err := skewed.Heartbeat(context.Background(), first, time.Minute); err != nil {
+		t.Fatalf("future application clock rejected active lease heartbeat: %v", err)
+	}
+}
+
 func TestMySQLWorkerSkipsDisabledTenantWithoutStarvingOthers(t *testing.T) {
 	database := openMySQLIntegration(t)
 	prepareExternalJobDatabase(t, database)
@@ -184,6 +280,7 @@ func TestMySQLWorkerHeartbeatCompletionAndRestartReclaimAreFenced(t *testing.T) 
 		t.Fatal(err)
 	}
 	clock.Advance(31 * time.Second)
+	expireClaimLease(t, database, first)
 	restarted := newTestMySQLJobRepositoryWithClock(t, database, store, clock.Now)
 	second, err := restarted.ClaimNext(context.Background(), "recovery-worker", time.Minute)
 	if err != nil {
@@ -308,6 +405,7 @@ func TestMySQLWorkerInfrastructureRetryAndCancellationRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	clock.Advance(11 * time.Second)
+	expireClaimLease(t, database, cancelClaim)
 	restarted := newTestMySQLJobRepositoryWithClock(t, database, store, clock.Now)
 	if _, err := restarted.ClaimNext(context.Background(), "recovery-worker", time.Minute); !errors.Is(err, ErrJobNotClaimable) {
 		t.Fatalf("cancel recovery returned executable claim: %v", err)
@@ -368,4 +466,18 @@ func newTestMySQLJobRepositoryWithClock(
 		t.Fatal(err)
 	}
 	return repository
+}
+
+func expireClaimLease(t *testing.T, database *sql.DB, claim WorkerJobClaim) {
+	t.Helper()
+	if _, err := database.Exec(`UPDATE t_external_job
+SET lease_until = CURRENT_TIMESTAMP(3) - INTERVAL 1 SECOND
+WHERE id = ? AND attempt_no = ?`, claim.Job.InternalID, claim.AttemptNo); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`UPDATE t_external_job_attempt
+SET lease_until = CURRENT_TIMESTAMP(3) - INTERVAL 1 SECOND
+WHERE job_id = ? AND attempt_no = ?`, claim.Job.InternalID, claim.AttemptNo); err != nil {
+		t.Fatal(err)
+	}
 }

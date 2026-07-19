@@ -30,8 +30,8 @@ JOIN t_external_tenant AS tenant ON tenant.id = job.tenant_id
 JOIN t_external_source_object AS source
   ON source.id = job.source_object_id AND source.tenant_id = job.tenant_id
 WHERE job.id = ? AND job.status = 'RUNNING' AND job.attempt_no = ? AND job.worker_id = ?
-  AND job.lease_token = ? AND job.lease_until > ?`,
-		claim.Job.InternalID, claim.AttemptNo, claim.WorkerID, claim.LeaseToken, repository.now().UTC()).
+  AND job.lease_token = ? AND job.lease_until > CURRENT_TIMESTAMP(3)`,
+		claim.Job.InternalID, claim.AttemptNo, claim.WorkerID, claim.LeaseToken).
 		Scan(
 			&tenantExternalID, &source.ExternalID, &source.ObjectKey, &source.SHA256,
 			&source.SizeBytes, &keyVersion, &source.Nonce,
@@ -74,16 +74,18 @@ func (repository *MySQLJobRepository) ClaimNext(
 	if repository == nil || !validWorkerID(workerID) || leaseDuration <= 0 || leaseDuration > 15*time.Minute {
 		return WorkerJobClaim{}, ErrInvalidJobState
 	}
-	for recovered := 0; recovered < 16; recovered++ {
-		claim, recoveryOnly, err := repository.claimOne(ctx, workerID, leaseDuration)
+	for {
+		claim, retry, err := repository.claimOne(ctx, workerID, leaseDuration)
 		if err != nil {
+			if retry && errors.Is(err, ErrJobNotClaimable) {
+				continue
+			}
 			return WorkerJobClaim{}, err
 		}
-		if !recoveryOnly {
+		if !retry {
 			return claim, nil
 		}
 	}
-	return WorkerJobClaim{}, ErrJobNotClaimable
 }
 
 func (repository *MySQLJobRepository) claimOne(
@@ -91,12 +93,16 @@ func (repository *MySQLJobRepository) claimOne(
 	workerID string,
 	leaseDuration time.Duration,
 ) (WorkerJobClaim, bool, error) {
-	now := repository.now().UTC()
+	scheduleNow := repository.now().UTC()
 	tx, err := repository.database.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return WorkerJobClaim{}, false, repositoryUnavailable("begin worker claim", err)
 	}
 	defer tx.Rollback()
+	leaseNow, err := mysqlCurrentTime(ctx, tx)
+	if err != nil {
+		return WorkerJobClaim{}, false, err
+	}
 
 	var candidateTenantID uint64
 	err = tx.QueryRowContext(ctx, `
@@ -118,7 +124,7 @@ WHERE tenant.status = 'ACTIVE'
       )
   )
 ORDER BY (job.status = 'RUNNING') DESC, job.next_attempt_at, job.created_at, job.id
-LIMIT 1`, now, now).Scan(&candidateTenantID)
+LIMIT 1`, leaseNow, scheduleNow).Scan(&candidateTenantID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return WorkerJobClaim{}, false, ErrJobNotClaimable
 	}
@@ -134,7 +140,10 @@ LIMIT 1`, now, now).Scan(&candidateTenantID)
 		return WorkerJobClaim{}, false, repositoryUnavailable("lock claim tenant", err)
 	}
 	policy, err := decodeTenantPolicy(encodedPolicy)
-	if err != nil || tenantStatus != "ACTIVE" {
+	if tenantStatus != "ACTIVE" {
+		return WorkerJobClaim{}, true, ErrJobNotClaimable
+	}
+	if err != nil {
 		return WorkerJobClaim{}, false, ErrExternalJobUnavailable
 	}
 
@@ -151,24 +160,24 @@ WHERE tenant_id = ? AND (
     (status = 'RUNNING' AND lease_until <= ?)
 )
 ORDER BY (status = 'RUNNING') DESC, next_attempt_at, created_at, id
-LIMIT 1 FOR UPDATE SKIP LOCKED`, candidateTenantID, now, now).
+LIMIT 1 FOR UPDATE SKIP LOCKED`, candidateTenantID, scheduleNow, leaseNow).
 		Scan(&jobInternalID, &jobExternalID, &status, &attemptNo, &cancelRequested)
 	if errors.Is(err, sql.ErrNoRows) {
-		return WorkerJobClaim{}, false, ErrJobNotClaimable
+		return WorkerJobClaim{}, true, ErrJobNotClaimable
 	}
 	if err != nil {
 		return WorkerJobClaim{}, false, repositoryUnavailable("lock claimable job", err)
 	}
 
 	if status == JobStatusRunning {
-		if err := expireAttempt(ctx, tx, candidateTenantID, jobInternalID, attemptNo, now); err != nil {
+		if err := expireAttempt(ctx, tx, candidateTenantID, jobInternalID, attemptNo, leaseNow); err != nil {
 			return WorkerJobClaim{}, false, err
 		}
 		if cancelRequested.Valid {
 			if _, err := tx.ExecContext(ctx, `
 UPDATE t_external_job
 SET status = 'CANCELLED', completed_at = ?, worker_id = NULL, lease_token = NULL, lease_until = NULL
-WHERE id = ? AND status = 'RUNNING' AND attempt_no = ?`, now, jobInternalID, attemptNo); err != nil {
+WHERE id = ? AND status = 'RUNNING' AND attempt_no = ?`, leaseNow, jobInternalID, attemptNo); err != nil {
 				return WorkerJobClaim{}, false, repositoryUnavailable("recover expired cancellation", err)
 			}
 			if err := tx.Commit(); err != nil {
@@ -181,7 +190,7 @@ WHERE id = ? AND status = 'RUNNING' AND attempt_no = ?`, now, jobInternalID, att
 UPDATE t_external_job
 SET status = 'FAILED', failure_code = 'LEASE_EXPIRED', completed_at = ?,
     worker_id = NULL, lease_token = NULL, lease_until = NULL
-WHERE id = ? AND status = 'RUNNING' AND attempt_no = ?`, now, jobInternalID, attemptNo); err != nil {
+WHERE id = ? AND status = 'RUNNING' AND attempt_no = ?`, leaseNow, jobInternalID, attemptNo); err != nil {
 				return WorkerJobClaim{}, false, repositoryUnavailable("finish exhausted expired job", err)
 			}
 			if err := tx.Commit(); err != nil {
@@ -197,7 +206,7 @@ WHERE id = ? AND status = 'RUNNING' AND attempt_no = ?`, now, jobInternalID, att
 			return WorkerJobClaim{}, false, repositoryUnavailable("establish running quota", err)
 		}
 		if running >= policy.MaxRunningJobs {
-			return WorkerJobClaim{}, false, ErrJobNotClaimable
+			return WorkerJobClaim{}, true, ErrJobNotClaimable
 		}
 	} else {
 		return WorkerJobClaim{}, false, ErrJobNotClaimable
@@ -211,13 +220,13 @@ WHERE id = ? AND status = 'RUNNING' AND attempt_no = ?`, now, jobInternalID, att
 	if _, err := io.ReadFull(repository.random, leaseToken); err != nil {
 		return WorkerJobClaim{}, false, repositoryUnavailable("generate lease token", err)
 	}
-	leaseUntil := now.Add(leaseDuration)
+	leaseUntil := leaseNow.Add(leaseDuration)
 	result, err := tx.ExecContext(ctx, `
 UPDATE t_external_job
 SET status = 'RUNNING', attempt_no = ?, worker_id = ?, lease_token = ?, lease_until = ?,
     started_at = COALESCE(started_at, ?), failure_code = NULL
 WHERE id = ? AND status = ? AND attempt_no = ?`,
-		newAttemptNo, workerID, leaseToken, leaseUntil, now,
+		newAttemptNo, workerID, leaseToken, leaseUntil, leaseNow,
 		jobInternalID, status, attemptNo)
 	if err != nil {
 		return WorkerJobClaim{}, false, repositoryUnavailable("persist worker claim", err)
@@ -229,7 +238,7 @@ WHERE id = ? AND status = ? AND attempt_no = ?`,
 INSERT INTO t_external_job_attempt(
     tenant_id, job_id, attempt_no, worker_id, lease_token, status, lease_until, started_at
 ) VALUES (?, ?, ?, ?, ?, 'RUNNING', ?, ?)`,
-		candidateTenantID, jobInternalID, newAttemptNo, workerID, leaseToken, leaseUntil, now); err != nil {
+		candidateTenantID, jobInternalID, newAttemptNo, workerID, leaseToken, leaseUntil, leaseNow); err != nil {
 		return WorkerJobClaim{}, false, repositoryUnavailable("persist worker attempt", err)
 	}
 	job, err := getExternalJobByInternalID(ctx, tx, jobInternalID)
@@ -268,13 +277,16 @@ func (repository *MySQLJobRepository) Heartbeat(
 	if repository == nil || !validWorkerClaim(claim) || leaseDuration <= 0 || leaseDuration > 15*time.Minute {
 		return ErrStaleJobClaim
 	}
-	now := repository.now().UTC()
-	leaseUntil := now.Add(leaseDuration)
 	tx, err := repository.database.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return repositoryUnavailable("begin heartbeat", err)
 	}
 	defer tx.Rollback()
+	now, err := mysqlCurrentTime(ctx, tx)
+	if err != nil {
+		return err
+	}
+	leaseUntil := now.Add(leaseDuration)
 	result, err := tx.ExecContext(ctx, `
 UPDATE t_external_job
 SET lease_until = ?
@@ -316,13 +328,16 @@ func (repository *MySQLJobRepository) Complete(
 	if err != nil {
 		return ErrInvalidJobState
 	}
-	now := repository.now().UTC()
 	tx, err := repository.database.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return repositoryUnavailable("begin completion", err)
 	}
 	defer tx.Rollback()
-	cancelled, err := lockActiveClaim(ctx, tx, claim, now)
+	now, err := mysqlCurrentTime(ctx, tx)
+	if err != nil {
+		return err
+	}
+	cancelled, err := lockActiveClaim(ctx, tx, claim)
 	if err != nil {
 		return err
 	}
@@ -363,13 +378,16 @@ func (repository *MySQLJobRepository) FailInfrastructure(
 	if repository == nil || !validWorkerClaim(claim) || !infrastructureCodePattern.MatchString(failure.Code) || failure.RetryDelay < 0 || failure.RetryDelay > time.Hour {
 		return "", ErrInvalidJobState
 	}
-	now := repository.now().UTC()
 	tx, err := repository.database.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return "", repositoryUnavailable("begin infrastructure failure", err)
 	}
 	defer tx.Rollback()
-	cancelled, encodedPolicy, err := lockActiveClaimAndPolicy(ctx, tx, claim, now)
+	now, err := mysqlCurrentTime(ctx, tx)
+	if err != nil {
+		return "", err
+	}
+	cancelled, encodedPolicy, err := lockActiveClaimAndPolicy(ctx, tx, claim)
 	if err != nil {
 		return "", err
 	}
@@ -380,7 +398,7 @@ func (repository *MySQLJobRepository) FailInfrastructure(
 	disposition := FailureTerminal
 	jobStatus := JobStatusFailed
 	completedAt := any(now)
-	nextAttemptAt := any(now)
+	nextAttemptAt := any(repository.now().UTC())
 	if cancelled {
 		disposition = FailureCancelled
 		jobStatus = JobStatusCancelled
@@ -388,7 +406,7 @@ func (repository *MySQLJobRepository) FailInfrastructure(
 		disposition = FailureRequeued
 		jobStatus = JobStatusQueued
 		completedAt = nil
-		nextAttemptAt = now.Add(failure.RetryDelay)
+		nextAttemptAt = repository.now().UTC().Add(failure.RetryDelay)
 	}
 	jobResult, err := tx.ExecContext(ctx, `
 UPDATE t_external_job
@@ -416,13 +434,13 @@ WHERE id = ? AND status = 'RUNNING' AND attempt_no = ? AND worker_id = ? AND lea
 	return disposition, nil
 }
 
-func lockActiveClaim(ctx context.Context, tx *sql.Tx, claim WorkerJobClaim, now time.Time) (bool, error) {
+func lockActiveClaim(ctx context.Context, tx *sql.Tx, claim WorkerJobClaim) (bool, error) {
 	var cancelRequested sql.NullTime
 	err := tx.QueryRowContext(ctx, `
 SELECT cancel_requested_at FROM t_external_job
 WHERE id = ? AND status = 'RUNNING' AND attempt_no = ? AND worker_id = ?
-  AND lease_token = ? AND lease_until > ? FOR UPDATE`,
-		claim.Job.InternalID, claim.AttemptNo, claim.WorkerID, claim.LeaseToken, now).Scan(&cancelRequested)
+  AND lease_token = ? AND lease_until > CURRENT_TIMESTAMP(3) FOR UPDATE`,
+		claim.Job.InternalID, claim.AttemptNo, claim.WorkerID, claim.LeaseToken).Scan(&cancelRequested)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, ErrStaleJobClaim
 	}
@@ -432,7 +450,7 @@ WHERE id = ? AND status = 'RUNNING' AND attempt_no = ? AND worker_id = ?
 	return cancelRequested.Valid, nil
 }
 
-func lockActiveClaimAndPolicy(ctx context.Context, tx *sql.Tx, claim WorkerJobClaim, now time.Time) (bool, []byte, error) {
+func lockActiveClaimAndPolicy(ctx context.Context, tx *sql.Tx, claim WorkerJobClaim) (bool, []byte, error) {
 	var cancelRequested sql.NullTime
 	var encodedPolicy []byte
 	err := tx.QueryRowContext(ctx, `
@@ -440,8 +458,8 @@ SELECT job.cancel_requested_at, tenant.policy_json
 FROM t_external_job AS job
 JOIN t_external_tenant AS tenant ON tenant.id = job.tenant_id
 WHERE job.id = ? AND job.status = 'RUNNING' AND job.attempt_no = ? AND job.worker_id = ?
-  AND job.lease_token = ? AND job.lease_until > ? FOR UPDATE`,
-		claim.Job.InternalID, claim.AttemptNo, claim.WorkerID, claim.LeaseToken, now).
+  AND job.lease_token = ? AND job.lease_until > CURRENT_TIMESTAMP(3) FOR UPDATE`,
+		claim.Job.InternalID, claim.AttemptNo, claim.WorkerID, claim.LeaseToken).
 		Scan(&cancelRequested, &encodedPolicy)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil, ErrStaleJobClaim
@@ -498,4 +516,12 @@ func validWorkerID(workerID string) bool {
 
 func validWorkerClaim(claim WorkerJobClaim) bool {
 	return claim.Job.InternalID > 0 && claim.AttemptNo > 0 && validWorkerID(claim.WorkerID) && len(claim.LeaseToken) == 32
+}
+
+func mysqlCurrentTime(ctx context.Context, tx *sql.Tx) (time.Time, error) {
+	var now time.Time
+	if err := tx.QueryRowContext(ctx, "SELECT CURRENT_TIMESTAMP(3)").Scan(&now); err != nil {
+		return time.Time{}, repositoryUnavailable("read database lease clock", err)
+	}
+	return now.UTC(), nil
 }

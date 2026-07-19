@@ -14,6 +14,10 @@ import (
 
 const maximumEncryptedSourceObjectBytes = 64 << 20
 
+// MaximumSourceBytes is the largest plaintext that can be encrypted with the
+// v1 AES-GCM envelope and still satisfy the source object transport bound.
+const MaximumSourceBytes = maximumEncryptedSourceObjectBytes - sourceCiphertextOverheadBytes
+
 type MinIOSourceObjectStore struct {
 	client *minio.Client
 	bucket string

@@ -186,6 +186,18 @@ func TestListJudgeJobsRejectsInvalidFilters(t *testing.T) {
 	}
 }
 
+func TestListJudgeJobsMapsInvalidRepositoryCursorToBadRequest(t *testing.T) {
+	service := &jobServiceStub{err: ErrJobInvalid}
+	server := newJobTestServer(t, service, ScopeJobRead)
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/judge-jobs?cursor=tampered", nil)
+	request.Header.Set("Authorization", "Bearer valid")
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "invalid-list-query") {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
 func TestGetAndCancelJudgeJobAreTenantScopedAndStatusAware(t *testing.T) {
 	service := &jobServiceStub{view: JobView{JobID: "ceirceirceirceirceirceirce", Status: JobCancelled}}
 	server := newJobTestServer(t, service, ScopeJobRead, ScopeJobCancel)

@@ -89,6 +89,9 @@ func TestDurableJobFencingMigrationAddsTenantBoundLeaseTokens(t *testing.T) {
 		"foreign key (job_id, tenant_id) references t_external_job(id, tenant_id)",
 		"constraint chk_external_job_active_lease",
 		"constraint chk_external_attempt_active_lease",
+		"create table if not exists t_external_source_reservation",
+		"object_key varchar(1024) character set ascii collate ascii_bin",
+		"key idx_external_source_reservation_created (created_at)",
 	} {
 		if !strings.Contains(sql, contract) {
 			t.Errorf("migration is missing contract %q", contract)
@@ -141,8 +144,16 @@ func TestApplyMigrationsUsesAnAdvisoryLockAndRecordsChecksums(t *testing.T) {
 	if !connection.locked || !connection.released {
 		t.Fatalf("migration lock lifecycle: locked=%v released=%v", connection.locked, connection.released)
 	}
-	if len(connection.executions) < 19 {
-		t.Fatalf("executions = %d, want all three migrations", len(connection.executions))
+	expectedExecutions := 1 + len(migrations)
+	for _, migration := range migrations {
+		statements, splitErr := splitMigrationStatements(migration.SQL)
+		if splitErr != nil {
+			t.Fatal(splitErr)
+		}
+		expectedExecutions += len(statements)
+	}
+	if len(connection.executions) != expectedExecutions {
+		t.Fatalf("executions = %d, want history DDL + schema DDL/DML + history inserts = %d", len(connection.executions), expectedExecutions)
 	}
 	if !strings.Contains(strings.ToLower(connection.executions[0].query), "create table if not exists t_judge_schema_history") {
 		t.Fatalf("first execution = %s", connection.executions[0].query)
@@ -190,6 +201,9 @@ func (connection *migrationConnectionStub) QueryRowContext(_ context.Context, qu
 	}
 	if strings.Contains(query, "RELEASE_LOCK") {
 		connection.released = true
+		return integerRow(1)
+	}
+	if strings.Contains(query, "information_schema") {
 		return integerRow(1)
 	}
 	return errorRow{err: fmt.Errorf("unexpected row query %q", query)}

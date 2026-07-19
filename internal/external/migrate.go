@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"embed"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io/fs"
 	"path/filepath"
@@ -14,12 +15,15 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	mysqlDriver "github.com/go-sql-driver/mysql"
 )
 
 //go:embed migrations/*.sql
 var migrationFiles embed.FS
 
 var migrationNamePattern = regexp.MustCompile(`^([0-9]{3})_([a-z0-9_]+)\.sql$`)
+var migrationReplayErrorsPattern = regexp.MustCompile(`(?m)^-- migrate:replay-errors ([0-9]+(?:,[0-9]+)*)[ \t]*$`)
 
 type Migration struct {
 	Version  int
@@ -148,8 +152,13 @@ func applyMigrations(ctx context.Context, connection migrationConnection, migrat
 		}
 		for statementIndex, statement := range statements {
 			if _, err := connection.ExecContext(ctx, statement); err != nil {
-				return fmt.Errorf("apply migration %d statement %d: %w", migration.Version, statementIndex+1, err)
+				if !isExplicitlyReplayableMigrationError(statement, err) {
+					return fmt.Errorf("apply migration %d statement %d: %w", migration.Version, statementIndex+1, err)
+				}
 			}
+		}
+		if err := validateMigrationPostconditions(ctx, connection, migration); err != nil {
+			return fmt.Errorf("validate migration %d: %w", migration.Version, err)
 		}
 		if _, err := connection.ExecContext(ctx,
 			"INSERT INTO t_judge_schema_history(version, name, checksum) VALUES (?, ?, ?)",
@@ -159,6 +168,130 @@ func applyMigrations(ctx context.Context, connection migrationConnection, migrat
 	}
 	return nil
 }
+
+func isExplicitlyReplayableMigrationError(statement string, executionErr error) bool {
+	match := migrationReplayErrorsPattern.FindStringSubmatch(statement)
+	if match == nil {
+		return false
+	}
+	var mysqlErr *mysqlDriver.MySQLError
+	if !errors.As(executionErr, &mysqlErr) {
+		return false
+	}
+	for _, rawNumber := range strings.Split(match[1], ",") {
+		number, err := strconv.ParseUint(rawNumber, 10, 16)
+		if err == nil && uint16(number) == mysqlErr.Number {
+			return true
+		}
+	}
+	return false
+}
+
+func validateMigrationPostconditions(ctx context.Context, connection migrationConnection, migration Migration) error {
+	if migration.Version != 3 || migration.Name != "durable_job_fencing" {
+		return nil
+	}
+	var valid int
+	if err := connection.QueryRowContext(ctx, durableFencingSchemaValidationSQL).Scan(&valid); err != nil {
+		return fmt.Errorf("inspect durable fencing schema: %w", err)
+	}
+	if valid != 1 {
+		return fmt.Errorf("durable fencing schema does not match the required columns, indexes, constraints, and reservation table")
+	}
+	return nil
+}
+
+const durableFencingSchemaValidationSQL = `SELECT
+    EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = DATABASE() AND table_name = 't_external_job'
+          AND column_name = 'lease_token' AND column_type = 'binary(32)' AND is_nullable = 'YES'
+    )
+    AND EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = DATABASE() AND table_name = 't_external_job_attempt'
+          AND column_name = 'tenant_id' AND column_type = 'bigint unsigned' AND is_nullable = 'NO'
+    )
+    AND EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = DATABASE() AND table_name = 't_external_job_attempt'
+          AND column_name = 'lease_token' AND column_type = 'binary(32)' AND is_nullable = 'YES'
+    )
+    AND COALESCE((
+        SELECT GROUP_CONCAT(column_name ORDER BY seq_in_index SEPARATOR ',')
+        FROM information_schema.statistics
+        WHERE table_schema = DATABASE() AND table_name = 't_external_job_attempt'
+          AND index_name = 'uk_external_attempt_id_tenant' AND non_unique = 0
+    ), '') = 'id,tenant_id'
+    AND COALESCE((
+        SELECT GROUP_CONCAT(column_name ORDER BY seq_in_index SEPARATOR ',')
+        FROM information_schema.statistics
+        WHERE table_schema = DATABASE() AND table_name = 't_external_job_attempt'
+          AND index_name = 'idx_external_attempt_tenant'
+    ), '') = 'tenant_id,started_at,id'
+    AND NOT EXISTS (
+        SELECT 1 FROM information_schema.table_constraints
+        WHERE constraint_schema = DATABASE() AND table_name = 't_external_job_attempt'
+          AND constraint_name = 'fk_external_attempt_job'
+    )
+    AND COALESCE((
+        SELECT GROUP_CONCAT(CONCAT(column_name, ':', referenced_column_name)
+                            ORDER BY ordinal_position SEPARATOR ',')
+        FROM information_schema.key_column_usage
+        WHERE constraint_schema = DATABASE() AND table_name = 't_external_job_attempt'
+          AND constraint_name = 'fk_external_attempt_job_tenant'
+          AND referenced_table_name = 't_external_job'
+    ), '') = 'job_id:id,tenant_id:tenant_id'
+    AND (
+        SELECT COUNT(*) FROM information_schema.table_constraints
+        WHERE constraint_schema = DATABASE() AND constraint_type = 'CHECK'
+          AND constraint_name IN ('chk_external_job_active_lease', 'chk_external_attempt_active_lease')
+    ) = 2
+    AND EXISTS (
+        SELECT 1 FROM information_schema.check_constraints
+        WHERE constraint_schema = DATABASE()
+          AND constraint_name = 'chk_external_attempt_active_lease'
+          AND LOCATE('status', LOWER(check_clause)) > 0
+          AND LOCATE('lease_token', LOWER(check_clause)) > 0
+    )
+    AND EXISTS (
+        SELECT 1 FROM information_schema.check_constraints
+        WHERE constraint_schema = DATABASE()
+          AND constraint_name = 'chk_external_job_active_lease'
+          AND LOCATE('status', LOWER(check_clause)) > 0
+          AND LOCATE('worker_id', LOWER(check_clause)) > 0
+          AND LOCATE('lease_token', LOWER(check_clause)) > 0
+          AND LOCATE('lease_until', LOWER(check_clause)) > 0
+    )
+    AND EXISTS (
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = DATABASE() AND table_name = 't_external_source_reservation'
+          AND engine = 'InnoDB'
+    )
+    AND EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = DATABASE() AND table_name = 't_external_source_reservation'
+          AND column_name = 'object_key' AND column_type = 'varchar(1024)'
+          AND character_set_name = 'ascii' AND collation_name = 'ascii_bin' AND is_nullable = 'NO'
+    )
+    AND EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = DATABASE() AND table_name = 't_external_source_reservation'
+          AND column_name = 'created_at' AND column_type = 'datetime(3)' AND is_nullable = 'NO'
+          AND UPPER(column_default) = 'CURRENT_TIMESTAMP(3)'
+    )
+    AND COALESCE((
+        SELECT GROUP_CONCAT(column_name ORDER BY seq_in_index SEPARATOR ',')
+        FROM information_schema.statistics
+        WHERE table_schema = DATABASE() AND table_name = 't_external_source_reservation'
+          AND index_name = 'PRIMARY' AND non_unique = 0
+    ), '') = 'object_key'
+    AND COALESCE((
+        SELECT GROUP_CONCAT(column_name ORDER BY seq_in_index SEPARATOR ',')
+        FROM information_schema.statistics
+        WHERE table_schema = DATABASE() AND table_name = 't_external_source_reservation'
+          AND index_name = 'idx_external_source_reservation_created'
+    ), '') = 'created_at'`
 
 func Migrations() ([]Migration, error) {
 	entries, err := fs.ReadDir(migrationFiles, "migrations")

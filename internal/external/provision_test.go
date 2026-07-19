@@ -84,6 +84,14 @@ func TestProvisionerRejectsUnsafePolicyScopesAndUnknownTenant(t *testing.T) {
 			}
 		})
 	}
+	validPolicy.MaxSourceBytes = MaximumSourceBytes + 1
+	if err := validPolicy.validate(); err == nil {
+		t.Fatal("policy accepted a source larger than the encrypted object contract")
+	}
+	validPolicy.MaxSourceBytes = MaximumSourceBytes
+	if err := validPolicy.validate(); err != nil {
+		t.Fatalf("maximum supported source size was rejected: %v", err)
+	}
 	unknownTenant := &Provisioner{executor: &provisionExecutorStub{affected: 0}, random: bytes.NewReader(make([]byte, apiKeyRandomBytes))}
 	if _, err := unknownTenant.CreateAPIKey(context.Background(), "ceirceirceirceirceirceirce", []Scope{ScopeJobRead}, nil, make([]byte, sha256.Size)); err == nil {
 		t.Fatal("expected unknown/disabled tenant rejection")
