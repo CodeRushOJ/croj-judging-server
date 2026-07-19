@@ -27,6 +27,7 @@ type memoryBundleRepository struct {
 	mu             sync.Mutex
 	idempotency    map[string]bundleUploadRecord
 	bundles        map[string]BundleMetadata
+	ready          map[string]bool
 	logicalCreates int
 	commitErr      error
 }
@@ -37,14 +38,15 @@ type bundleUploadRecord struct {
 }
 
 func newMemoryBundleRepository() *memoryBundleRepository {
-	return &memoryBundleRepository{idempotency: map[string]bundleUploadRecord{}, bundles: map[string]BundleMetadata{}}
+	return &memoryBundleRepository{idempotency: map[string]bundleUploadRecord{}, bundles: map[string]BundleMetadata{}, ready: map[string]bool{}}
 }
 
 func (repository *memoryBundleRepository) FindBundleUpload(_ context.Context, tenantID string, keyDigest [sha256.Size]byte) (BundleUploadLookup, error) {
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
 	record, found := repository.idempotency[tenantID+":"+hex.EncodeToString(keyDigest[:])]
-	return BundleUploadLookup{Found: found, RequestHash: record.requestHash, Metadata: record.metadata}, nil
+	bundleKey := tenantID + ":" + record.metadata.SHA256
+	return BundleUploadLookup{Found: found, Ready: found && repository.ready[bundleKey], RequestHash: record.requestHash, Metadata: record.metadata}, nil
 }
 
 func (repository *memoryBundleRepository) CommitBundleUpload(_ context.Context, input BundleCommitInput) (BundleCommitResult, error) {
@@ -58,7 +60,7 @@ func (repository *memoryBundleRepository) CommitBundleUpload(_ context.Context, 
 		if record.requestHash != input.RequestHash {
 			return BundleCommitResult{}, ErrIdempotencyConflict
 		}
-		return BundleCommitResult{Metadata: record.metadata, Replay: true}, nil
+		return BundleCommitResult{Metadata: record.metadata, Replay: true, Ready: repository.ready[input.TenantID+":"+record.metadata.SHA256]}, nil
 	}
 	bundleKey := input.TenantID + ":" + hex.EncodeToString(input.RequestHash[:])
 	metadata, found := repository.bundles[bundleKey]
@@ -68,14 +70,26 @@ func (repository *memoryBundleRepository) CommitBundleUpload(_ context.Context, 
 		repository.logicalCreates++
 	}
 	repository.idempotency[idempotencyKey] = bundleUploadRecord{requestHash: input.RequestHash, metadata: metadata}
-	return BundleCommitResult{Metadata: metadata, Replay: found}, nil
+	return BundleCommitResult{Metadata: metadata, Replay: found, Ready: repository.ready[bundleKey]}, nil
+}
+
+func (repository *memoryBundleRepository) MarkBundleReady(_ context.Context, tenantID, bundleID string, digest [sha256.Size]byte) error {
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	bundleKey := tenantID + ":" + hex.EncodeToString(digest[:])
+	metadata, found := repository.bundles[bundleKey]
+	if !found || metadata.BundleID != bundleID {
+		return ErrBundleNotFound
+	}
+	repository.ready[bundleKey] = true
+	return nil
 }
 
 func (repository *memoryBundleRepository) FindBundle(_ context.Context, tenantID, bundleID string) (BundleMetadata, error) {
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
 	for key, metadata := range repository.bundles {
-		if strings.HasPrefix(key, tenantID+":") && metadata.BundleID == bundleID {
+		if strings.HasPrefix(key, tenantID+":") && metadata.BundleID == bundleID && repository.ready[key] {
 			return metadata, nil
 		}
 	}
@@ -87,6 +101,23 @@ type atomicMemoryObjectStore struct {
 	objects   map[string][]byte
 	publishes int
 	failNext  int
+}
+
+type blockingMemoryObjectStore struct {
+	inner   *atomicMemoryObjectStore
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (store *blockingMemoryObjectStore) Publish(ctx context.Context, key, filename string, size int64, digest [sha256.Size]byte) error {
+	store.once.Do(func() { close(store.started) })
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-store.release:
+		return store.inner.Publish(ctx, key, filename, size, digest)
+	}
 }
 
 func (store *atomicMemoryObjectStore) Publish(_ context.Context, key, filename string, size int64, digest [sha256.Size]byte) error {
@@ -141,6 +172,51 @@ func TestBundleServiceReconcilesOwnedObjectAfterPublishFailure(t *testing.T) {
 	metadata, replay, err := service.Upload(context.Background(), testTenantID, "upload-key-00001", bytes.NewReader(body))
 	if err != nil || !replay || metadata.BundleID == "" || len(store.objects) != 1 {
 		t.Fatalf("metadata=%+v replay=%v error=%v objects=%d", metadata, replay, err, len(store.objects))
+	}
+}
+
+func TestBundleServiceDoesNotExposeMetadataBeforeObjectIsPublished(t *testing.T) {
+	repository := newMemoryBundleRepository()
+	store := &blockingMemoryObjectStore{inner: &atomicMemoryObjectStore{}, started: make(chan struct{}), release: make(chan struct{})}
+	service := newTestBundleService(t, repository, store, t.TempDir(), 1<<20, bundle.DefaultArchiveLimits())
+	result := make(chan BundleMetadata, 1)
+	errorsChannel := make(chan error, 1)
+	body := validExternalBundle(t, "input")
+	go func() {
+		metadata, _, err := service.Upload(context.Background(), testTenantID, "upload-key-00001", bytes.NewReader(body))
+		if err != nil {
+			errorsChannel <- err
+			return
+		}
+		result <- metadata
+	}()
+	<-store.started
+
+	repository.mu.Lock()
+	var pendingID string
+	for _, metadata := range repository.bundles {
+		pendingID = metadata.BundleID
+	}
+	repository.mu.Unlock()
+	if pendingID == "" {
+		t.Fatal("ownership record was not committed before object publication")
+	}
+	if _, err := service.Get(context.Background(), testTenantID, pendingID); !errors.Is(err, ErrBundleNotFound) {
+		t.Fatalf("pending metadata became visible: %v", err)
+	}
+	close(store.release)
+	select {
+	case err := <-errorsChannel:
+		t.Fatal(err)
+	case metadata := <-result:
+		if metadata.BundleID != pendingID {
+			t.Fatalf("metadata=%+v pendingID=%s", metadata, pendingID)
+		}
+		if _, err := service.Get(context.Background(), testTenantID, pendingID); err != nil {
+			t.Fatalf("ready metadata is not visible: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("upload did not complete after publication was released")
 	}
 }
 

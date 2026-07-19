@@ -30,14 +30,19 @@ func (repository *SQLBundleRepository) FindBundleUpload(ctx context.Context, ten
 	}
 	var requestHash []byte
 	var responseJSON []byte
+	var ready bool
 	err := repository.database.QueryRowContext(ctx, `
-SELECT idempotency.request_hash, idempotency.response_json
+SELECT idempotency.request_hash, idempotency.response_json, bundle.ready_at IS NOT NULL
 FROM t_external_idempotency AS idempotency
 JOIN t_external_tenant AS tenant ON tenant.id = idempotency.tenant_id
+JOIN t_external_bundle AS bundle
+  ON bundle.tenant_id = idempotency.tenant_id
+ AND bundle.external_id = idempotency.resource_external_id
 WHERE tenant.external_id = ? AND tenant.status = 'ACTIVE'
   AND idempotency.operation_scope = ? AND idempotency.key_digest = ?
   AND idempotency.expires_at > UTC_TIMESTAMP(3)
-LIMIT 1`, tenantID, bundleUploadOperationScope, keyDigest[:]).Scan(&requestHash, &responseJSON)
+  AND bundle.deleted_at IS NULL
+LIMIT 1`, tenantID, bundleUploadOperationScope, keyDigest[:]).Scan(&requestHash, &responseJSON, &ready)
 	if errors.Is(err, sql.ErrNoRows) {
 		return BundleUploadLookup{}, nil
 	}
@@ -53,7 +58,7 @@ LIMIT 1`, tenantID, bundleUploadOperationScope, keyDigest[:]).Scan(&requestHash,
 	}
 	var digest [sha256.Size]byte
 	copy(digest[:], requestHash)
-	return BundleUploadLookup{Found: true, RequestHash: digest, Metadata: metadata}, nil
+	return BundleUploadLookup{Found: true, Ready: ready, RequestHash: digest, Metadata: metadata}, nil
 }
 
 func (repository *SQLBundleRepository) CommitBundleUpload(ctx context.Context, input BundleCommitInput) (result BundleCommitResult, resultErr error) {
@@ -89,11 +94,16 @@ WHERE tenant_id = ? AND operation_scope = ? AND key_digest = ? AND expires_at <=
 
 	var storedRequestHash []byte
 	var storedResponse []byte
+	var storedReady bool
 	err = transaction.QueryRowContext(ctx, `
-SELECT request_hash, response_json
-FROM t_external_idempotency
-WHERE tenant_id = ? AND operation_scope = ? AND key_digest = ?
-FOR UPDATE`, tenantInternalID, bundleUploadOperationScope, input.IdempotencyDigest[:]).Scan(&storedRequestHash, &storedResponse)
+SELECT idempotency.request_hash, idempotency.response_json, bundle.ready_at IS NOT NULL
+FROM t_external_idempotency AS idempotency
+JOIN t_external_bundle AS bundle
+  ON bundle.tenant_id = idempotency.tenant_id
+ AND bundle.external_id = idempotency.resource_external_id
+WHERE idempotency.tenant_id = ? AND idempotency.operation_scope = ? AND idempotency.key_digest = ?
+  AND bundle.deleted_at IS NULL
+FOR UPDATE`, tenantInternalID, bundleUploadOperationScope, input.IdempotencyDigest[:]).Scan(&storedRequestHash, &storedResponse, &storedReady)
 	if err == nil {
 		if len(storedRequestHash) != sha256.Size {
 			return BundleCommitResult{}, fmt.Errorf("stored bundle idempotency hash is invalid")
@@ -110,13 +120,13 @@ FOR UPDATE`, tenantInternalID, bundleUploadOperationScope, input.IdempotencyDige
 		if err := transaction.Commit(); err != nil {
 			return BundleCommitResult{}, fmt.Errorf("commit bundle replay: %w", err)
 		}
-		return BundleCommitResult{Metadata: metadata, Replay: true}, nil
+		return BundleCommitResult{Metadata: metadata, Replay: true, Ready: storedReady}, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return BundleCommitResult{}, fmt.Errorf("read bundle idempotency under lock: %w", err)
 	}
 
-	metadata, found, err := findBundleByDigest(ctx, transaction, tenantInternalID, input.RequestHash)
+	metadata, ready, found, err := findBundleByDigest(ctx, transaction, tenantInternalID, input.RequestHash)
 	if err != nil {
 		return BundleCommitResult{}, err
 	}
@@ -152,7 +162,62 @@ INSERT INTO t_external_idempotency(
 	if err := transaction.Commit(); err != nil {
 		return BundleCommitResult{}, fmt.Errorf("commit immutable bundle: %w", err)
 	}
-	return BundleCommitResult{Metadata: metadata, Replay: found}, nil
+	return BundleCommitResult{Metadata: metadata, Replay: found, Ready: ready}, nil
+}
+
+func (repository *SQLBundleRepository) MarkBundleReady(ctx context.Context, tenantID, bundleID string, digest [sha256.Size]byte) (resultErr error) {
+	if repository == nil || repository.database == nil || !externalIDPattern.MatchString(tenantID) || !externalIDPattern.MatchString(bundleID) {
+		return ErrBundleNotFound
+	}
+	transaction, err := repository.database.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return fmt.Errorf("begin immutable bundle readiness: %w", err)
+	}
+	defer func() {
+		if resultErr != nil {
+			_ = transaction.Rollback()
+		}
+	}()
+	var tenantInternalID uint64
+	if err := transaction.QueryRowContext(ctx, `
+SELECT id FROM t_external_tenant
+WHERE external_id = ? AND status = 'ACTIVE'
+FOR UPDATE`, tenantID).Scan(&tenantInternalID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrBundleNotFound
+		}
+		return fmt.Errorf("lock bundle tenant for readiness: %w", err)
+	}
+	result, err := transaction.ExecContext(ctx, `
+UPDATE t_external_bundle
+SET ready_at = COALESCE(ready_at, UTC_TIMESTAMP(3))
+WHERE tenant_id = ? AND external_id = ? AND sha256 = ? AND deleted_at IS NULL`, tenantInternalID, bundleID, digest[:])
+	if err != nil {
+		return fmt.Errorf("mark immutable bundle ready: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read immutable bundle readiness result: %w", err)
+	}
+	if affected == 0 {
+		var exists int
+		err := transaction.QueryRowContext(ctx, `
+SELECT 1
+FROM t_external_bundle
+WHERE tenant_id = ? AND external_id = ? AND sha256 = ?
+  AND ready_at IS NOT NULL AND deleted_at IS NULL
+LIMIT 1`, tenantInternalID, bundleID, digest[:]).Scan(&exists)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrBundleNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("verify immutable bundle readiness: %w", err)
+		}
+	}
+	if err := transaction.Commit(); err != nil {
+		return fmt.Errorf("commit immutable bundle readiness: %w", err)
+	}
+	return nil
 }
 
 func (repository *SQLBundleRepository) FindBundle(ctx context.Context, tenantID, bundleID string) (BundleMetadata, error) {
@@ -165,7 +230,7 @@ SELECT bundle.external_id, bundle.sha256, bundle.size_bytes, bundle.case_count,
 FROM t_external_bundle AS bundle
 JOIN t_external_tenant AS tenant ON tenant.id = bundle.tenant_id
 WHERE tenant.external_id = ? AND tenant.status = 'ACTIVE'
-  AND bundle.external_id = ? AND bundle.deleted_at IS NULL
+  AND bundle.external_id = ? AND bundle.ready_at IS NOT NULL AND bundle.deleted_at IS NULL
 LIMIT 1`, tenantID, bundleID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return BundleMetadata{}, ErrBundleNotFound
@@ -176,19 +241,37 @@ LIMIT 1`, tenantID, bundleID))
 	return metadata, nil
 }
 
-func findBundleByDigest(ctx context.Context, transaction *sql.Tx, tenantInternalID uint64, digest [sha256.Size]byte) (BundleMetadata, bool, error) {
-	metadata, err := scanBundleMetadata(transaction.QueryRowContext(ctx, `
-SELECT external_id, sha256, size_bytes, case_count, manifest_version, created_at
+func findBundleByDigest(ctx context.Context, transaction *sql.Tx, tenantInternalID uint64, digest [sha256.Size]byte) (BundleMetadata, bool, bool, error) {
+	metadata, ready, err := scanBundleMetadataWithReady(transaction.QueryRowContext(ctx, `
+SELECT external_id, sha256, size_bytes, case_count, manifest_version, created_at, ready_at IS NOT NULL
 FROM t_external_bundle
 WHERE tenant_id = ? AND sha256 = ? AND deleted_at IS NULL
 LIMIT 1 FOR UPDATE`, tenantInternalID, digest[:]))
 	if errors.Is(err, sql.ErrNoRows) {
-		return BundleMetadata{}, false, nil
+		return BundleMetadata{}, false, false, nil
 	}
 	if err != nil {
-		return BundleMetadata{}, false, fmt.Errorf("find immutable bundle by digest: %w", err)
+		return BundleMetadata{}, false, false, fmt.Errorf("find immutable bundle by digest: %w", err)
 	}
-	return metadata, true, nil
+	return metadata, ready, true, nil
+}
+
+func scanBundleMetadataWithReady(row rowScanner) (BundleMetadata, bool, error) {
+	var metadata BundleMetadata
+	var digest []byte
+	var ready bool
+	if err := row.Scan(&metadata.BundleID, &digest, &metadata.SizeBytes, &metadata.CaseCount, &metadata.ManifestVersion, &metadata.CreatedAt, &ready); err != nil {
+		return BundleMetadata{}, false, err
+	}
+	if len(digest) != sha256.Size {
+		return BundleMetadata{}, false, fmt.Errorf("stored bundle digest is invalid")
+	}
+	metadata.SHA256 = hex.EncodeToString(digest)
+	metadata.CreatedAt = metadata.CreatedAt.UTC()
+	if !validBundleMetadata(metadata) {
+		return BundleMetadata{}, false, fmt.Errorf("stored bundle metadata is invalid")
+	}
+	return metadata, ready, nil
 }
 
 func scanBundleMetadata(row rowScanner) (BundleMetadata, error) {

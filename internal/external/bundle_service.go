@@ -36,6 +36,7 @@ type BundleMetadata struct {
 
 type BundleUploadLookup struct {
 	Found       bool
+	Ready       bool
 	RequestHash [sha256.Size]byte
 	Metadata    BundleMetadata
 }
@@ -53,11 +54,13 @@ type BundleCommitInput struct {
 type BundleCommitResult struct {
 	Metadata BundleMetadata
 	Replay   bool
+	Ready    bool
 }
 
 type BundleRepository interface {
 	FindBundleUpload(context.Context, string, [sha256.Size]byte) (BundleUploadLookup, error)
 	CommitBundleUpload(context.Context, BundleCommitInput) (BundleCommitResult, error)
+	MarkBundleReady(context.Context, string, string, [sha256.Size]byte) error
 	FindBundle(context.Context, string, string) (BundleMetadata, error)
 }
 
@@ -156,9 +159,14 @@ func (service *BundleService) Upload(ctx context.Context, tenantID, idempotencyK
 		if lookup.RequestHash != requestHash {
 			return BundleMetadata{}, false, ErrIdempotencyConflict
 		}
-		objectKey := bundleObjectKey(tenantID, requestHash)
-		if err := service.store.Publish(ctx, objectKey, filename, written, requestHash); err != nil {
-			return BundleMetadata{}, false, fmt.Errorf("reconcile immutable bundle object: %w", err)
+		if !lookup.Ready {
+			objectKey := bundleObjectKey(tenantID, requestHash)
+			if err := service.store.Publish(ctx, objectKey, filename, written, requestHash); err != nil {
+				return BundleMetadata{}, false, fmt.Errorf("reconcile immutable bundle object: %w", err)
+			}
+			if err := service.repository.MarkBundleReady(ctx, tenantID, lookup.Metadata.BundleID, requestHash); err != nil {
+				return BundleMetadata{}, false, fmt.Errorf("mark reconciled immutable bundle ready: %w", err)
+			}
 		}
 		return lookup.Metadata, true, nil
 	}
@@ -179,11 +187,16 @@ func (service *BundleService) Upload(ctx context.Context, tenantID, idempotencyK
 	if err != nil {
 		return BundleMetadata{}, false, err
 	}
-	// The database record owns the deterministic final object key before it can
-	// become visible. A failed publish is safely repaired by retrying the same
-	// idempotent upload; no unowned final-prefix object can be created.
-	if err := service.store.Publish(ctx, objectKey, filename, written, requestHash); err != nil {
-		return BundleMetadata{}, false, fmt.Errorf("publish owned immutable bundle object: %w", err)
+	if !result.Ready {
+		// Ownership remains hidden until the complete object is atomically
+		// published. A failed publish is safely repaired by the same idempotent
+		// upload without ever exposing pending metadata or an unowned object.
+		if err := service.store.Publish(ctx, objectKey, filename, written, requestHash); err != nil {
+			return BundleMetadata{}, false, fmt.Errorf("publish owned immutable bundle object: %w", err)
+		}
+		if err := service.repository.MarkBundleReady(ctx, tenantID, result.Metadata.BundleID, requestHash); err != nil {
+			return BundleMetadata{}, false, fmt.Errorf("mark immutable bundle ready: %w", err)
+		}
 	}
 	return result.Metadata, result.Replay, nil
 }
