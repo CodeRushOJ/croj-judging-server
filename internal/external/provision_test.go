@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -34,6 +35,64 @@ func TestProvisionerCreatesTenantWithValidatedPolicy(t *testing.T) {
 	}
 	if executor.arguments[0] != tenantID || executor.arguments[1] != "Acme OJ" || !json.Valid(executor.arguments[2].([]byte)) {
 		t.Fatalf("arguments = %#v", executor.arguments)
+	}
+}
+
+func TestProvisionerCreatesEncryptedCallbackForPublicDestination(t *testing.T) {
+	executor := &provisionExecutorStub{affected: 1}
+	callbackCipher, err := NewCallbackCipher(7, map[uint16][]byte{7: bytes.Repeat([]byte{0x71}, 32)}, bytes.NewReader(bytes.Repeat([]byte{0x72}, 12)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	provisioner := &Provisioner{
+		executor:         executor,
+		random:           bytes.NewReader(bytes.Repeat([]byte{0x22}, externalIDRandomBytes+32)),
+		callbackCipher:   callbackCipher,
+		callbackResolver: callbackResolverStub{addresses: []netip.Addr{netip.MustParseAddr("8.8.8.8")}},
+	}
+	material, err := provisioner.CreateCallback(context.Background(), "ceirceirceirceirceirceirce", "HTTPS://OJ.Example.com/hooks?b=2&a=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !externalIDPattern.MatchString(material.CallbackID) || !strings.HasPrefix(material.Secret, "croj_whsec_") {
+		t.Fatalf("material = %s", material)
+	}
+	if !strings.Contains(strings.ToLower(executor.query), "insert into t_external_callback") || !strings.Contains(strings.ToLower(executor.query), "tenant.status = 'active'") {
+		t.Fatalf("query = %s", executor.query)
+	}
+	if len(executor.arguments) != 8 || executor.arguments[0] != material.CallbackID || executor.arguments[1] != "https://oj.example.com:443/hooks?a=1&b=2" || executor.arguments[2] != "oj.example.com" || executor.arguments[3] != uint16(443) || executor.arguments[6] != uint16(7) || executor.arguments[7] != "ceirceirceirceirceirceirce" {
+		t.Fatalf("arguments = %#v", executor.arguments)
+	}
+	ciphertext, ok := executor.arguments[4].([]byte)
+	if !ok || bytes.Contains(ciphertext, []byte(material.Secret)) {
+		t.Fatal("callback secret was not encrypted")
+	}
+	nonce, ok := executor.arguments[5].([]byte)
+	if !ok || len(nonce) != 12 {
+		t.Fatalf("nonce = %#v", executor.arguments[5])
+	}
+}
+
+func TestProvisionerRejectsUnsafeCallbackBeforePersistence(t *testing.T) {
+	callbackCipher, err := NewCallbackCipher(1, map[uint16][]byte{1: bytes.Repeat([]byte{1}, 32)}, bytes.NewReader(bytes.Repeat([]byte{2}, 12)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, resolver := range map[string]callbackResolverStub{
+		"private": {addresses: []netip.Addr{netip.MustParseAddr("10.0.0.1")}},
+		"mixed":   {addresses: []netip.Addr{netip.MustParseAddr("8.8.8.8"), netip.MustParseAddr("127.0.0.1")}},
+		"empty":   {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			executor := &provisionExecutorStub{affected: 1}
+			provisioner := &Provisioner{
+				executor: executor, random: bytes.NewReader(bytes.Repeat([]byte{3}, externalIDRandomBytes+32)),
+				callbackCipher: callbackCipher, callbackResolver: resolver,
+			}
+			if _, err := provisioner.CreateCallback(context.Background(), "ceirceirceirceirceirceirce", "https://oj.example.com/hook"); err == nil || executor.query != "" {
+				t.Fatalf("error=%v query=%q", err, executor.query)
+			}
+		})
 	}
 }
 
@@ -110,6 +169,15 @@ type provisionExecutorStub struct {
 	arguments []any
 	affected  int64
 	err       error
+}
+
+type callbackResolverStub struct {
+	addresses []netip.Addr
+	err       error
+}
+
+func (resolver callbackResolverStub) LookupNetIP(context.Context, string, string) ([]netip.Addr, error) {
+	return append([]netip.Addr(nil), resolver.addresses...), resolver.err
 }
 
 func (executor *provisionExecutorStub) ExecContext(_ context.Context, query string, arguments ...any) (sql.Result, error) {

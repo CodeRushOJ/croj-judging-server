@@ -4,9 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"encoding/base32"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"regexp"
 	"strings"
 	"time"
@@ -43,16 +45,49 @@ type provisionExecutor interface {
 }
 
 type Provisioner struct {
-	executor provisionExecutor
-	random   io.Reader
-	now      func() time.Time
+	executor         provisionExecutor
+	random           io.Reader
+	now              func() time.Time
+	callbackCipher   *CallbackCipher
+	callbackResolver callbackResolver
 }
 
-func NewProvisioner(database *sql.DB, random io.Reader) (*Provisioner, error) {
+type ProvisionerOption func(*Provisioner) error
+
+func WithCallbackCipher(callbackCipher *CallbackCipher) ProvisionerOption {
+	return func(provisioner *Provisioner) error {
+		if callbackCipher == nil {
+			return fmt.Errorf("callback cipher is required")
+		}
+		provisioner.callbackCipher = callbackCipher
+		return nil
+	}
+}
+
+func WithCallbackResolver(resolver callbackResolver) ProvisionerOption {
+	return func(provisioner *Provisioner) error {
+		if resolver == nil {
+			return fmt.Errorf("callback resolver is required")
+		}
+		provisioner.callbackResolver = resolver
+		return nil
+	}
+}
+
+func NewProvisioner(database *sql.DB, random io.Reader, options ...ProvisionerOption) (*Provisioner, error) {
 	if database == nil || random == nil {
 		return nil, fmt.Errorf("provisioning database and cryptographic random source are required")
 	}
-	return &Provisioner{executor: database, random: random, now: time.Now}, nil
+	provisioner := &Provisioner{executor: database, random: random, now: time.Now, callbackResolver: net.DefaultResolver}
+	for _, option := range options {
+		if option == nil {
+			return nil, fmt.Errorf("provisioner option is required")
+		}
+		if err := option(provisioner); err != nil {
+			return nil, err
+		}
+	}
+	return provisioner, nil
 }
 
 func (provisioner *Provisioner) CreateTenant(ctx context.Context, name string, policy TenantPolicy) (string, error) {
@@ -130,6 +165,61 @@ WHERE tenant.external_id = ? AND tenant.status = 'ACTIVE'`,
 		return APIKeyMaterial{}, fmt.Errorf("tenant does not exist or is disabled")
 	}
 	return material, nil
+}
+
+func (provisioner *Provisioner) CreateCallback(ctx context.Context, tenantID, rawDestination string) (CallbackMaterial, error) {
+	if provisioner == nil || provisioner.executor == nil || provisioner.random == nil || provisioner.callbackCipher == nil || provisioner.callbackResolver == nil {
+		return CallbackMaterial{}, fmt.Errorf("callback provisioner is not configured")
+	}
+	if !externalIDPattern.MatchString(tenantID) {
+		return CallbackMaterial{}, fmt.Errorf("tenant ID is invalid")
+	}
+	destination, err := CanonicalCallbackDestination(rawDestination)
+	if err != nil {
+		return CallbackMaterial{}, err
+	}
+	if _, err := resolvePublicCallback(ctx, provisioner.callbackResolver, destination.Host); err != nil {
+		return CallbackMaterial{}, fmt.Errorf("validate callback public destination: %w", err)
+	}
+	callbackID, err := generateExternalID(provisioner.random)
+	if err != nil {
+		return CallbackMaterial{}, err
+	}
+	secretEntropy := make([]byte, 32)
+	if _, err := io.ReadFull(provisioner.random, secretEntropy); err != nil {
+		return CallbackMaterial{}, fmt.Errorf("generate callback secret: %w", err)
+	}
+	secret := "croj_whsec_" + base64.RawURLEncoding.EncodeToString(secretEntropy)
+	clear(secretEntropy)
+	secretBytes := []byte(secret)
+	encrypted, err := provisioner.callbackCipher.Encrypt(tenantID, callbackID, destination.URL, secretBytes)
+	clear(secretBytes)
+	if err != nil {
+		return CallbackMaterial{}, err
+	}
+	defer clear(encrypted.Ciphertext)
+	defer clear(encrypted.Nonce)
+	result, err := provisioner.executor.ExecContext(ctx, `
+INSERT INTO t_external_callback(
+    external_id, tenant_id, destination_url, allowed_host, allowed_port,
+    secret_ciphertext, secret_nonce, secret_key_version
+)
+SELECT ?, tenant.id, ?, ?, ?, ?, ?, ?
+FROM t_external_tenant AS tenant
+WHERE tenant.external_id = ? AND tenant.status = 'ACTIVE'`,
+		callbackID, destination.URL, destination.Host, destination.Port,
+		encrypted.Ciphertext, encrypted.Nonce, encrypted.KeyVersion, tenantID)
+	if err != nil {
+		return CallbackMaterial{}, fmt.Errorf("create callback: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return CallbackMaterial{}, fmt.Errorf("confirm callback creation: %w", err)
+	}
+	if affected != 1 {
+		return CallbackMaterial{}, fmt.Errorf("tenant does not exist or is disabled")
+	}
+	return CallbackMaterial{CallbackID: callbackID, Secret: secret}, nil
 }
 
 func generateExternalID(random io.Reader) (string, error) {

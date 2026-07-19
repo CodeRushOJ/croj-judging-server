@@ -11,14 +11,23 @@ import (
 )
 
 type provisionerStub struct {
-	tenantName   string
-	tenantPolicy external.TenantPolicy
-	tenantID     string
-	scopes       []external.Scope
-	expiresAt    *time.Time
-	pepper       []byte
-	material     external.APIKeyMaterial
-	keyCalls     int
+	tenantName    string
+	tenantPolicy  external.TenantPolicy
+	tenantID      string
+	scopes        []external.Scope
+	expiresAt     *time.Time
+	pepper        []byte
+	material      external.APIKeyMaterial
+	keyCalls      int
+	callbackURL   string
+	callback      external.CallbackMaterial
+	callbackCalls int
+}
+
+func (stub *provisionerStub) CreateCallback(_ context.Context, tenantID, destinationURL string) (external.CallbackMaterial, error) {
+	stub.tenantID, stub.callbackURL = tenantID, destinationURL
+	stub.callbackCalls++
+	return stub.callback, nil
 }
 
 func (stub *provisionerStub) CreateTenant(_ context.Context, name string, policy external.TenantPolicy) (string, error) {
@@ -70,6 +79,39 @@ func TestRunCreatesAKeyAndPrintsTheSecretExactlyOnce(t *testing.T) {
 	}
 	if strings.Count(output.String(), plaintext) != 1 || !strings.Contains(output.String(), "shown once") {
 		t.Fatalf("secret output = %q", output.String())
+	}
+}
+
+func TestRunCreatesACallbackAndPrintsTheSecretExactlyOnce(t *testing.T) {
+	secret := "croj_whsec_0123456789012345678901234567890123456789012"
+	stub := &provisionerStub{callback: external.CallbackMaterial{CallbackID: "deirceirceirceirceirceirce", Secret: secret}}
+	var output bytes.Buffer
+	err := Run(context.Background(), []string{
+		"callback", "create", "--tenant", "ceirceirceirceirceirceirce", "--url", "https://oj.example.com/hook",
+	}, stub, nil, &output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stub.callbackCalls != 1 || stub.tenantID != "ceirceirceirceirceirceirce" || stub.callbackURL != "https://oj.example.com/hook" {
+		t.Fatalf("callback request tenant=%q url=%q calls=%d", stub.tenantID, stub.callbackURL, stub.callbackCalls)
+	}
+	if strings.Count(output.String(), secret) != 1 || strings.Count(output.String(), "deirceirceirceirceirceirce") != 1 || !strings.Contains(output.String(), "shown once") {
+		t.Fatalf("callback output = %q", output.String())
+	}
+}
+
+func TestRunRejectsInvalidCallbackFlagsBeforeProvisioning(t *testing.T) {
+	for name, arguments := range map[string][]string{
+		"missing tenant": {"callback", "create", "--url", "https://oj.example.com/hook"},
+		"missing URL":    {"callback", "create", "--tenant", "ceirceirceirceirceirceirce"},
+		"positional":     {"callback", "create", "extra", "--tenant", "ceirceirceirceirceirceirce", "--url", "https://oj.example.com/hook"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			stub := &provisionerStub{}
+			if err := Run(context.Background(), arguments, stub, nil, &bytes.Buffer{}); err == nil || stub.callbackCalls != 0 {
+				t.Fatalf("error=%v calls=%d", err, stub.callbackCalls)
+			}
+		})
 	}
 }
 
