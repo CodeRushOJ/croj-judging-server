@@ -19,7 +19,7 @@
 - 外部题包幂等键统一采用独立 pepper 的 HMAC-SHA256；对象发布改为 durable staging→PENDING→CAS-leased PUBLISHING→远端 size/SHA 校验→READY 状态机，增加持久 reconciler、退避/attempt/lease、ABANDONED 审计、单 promoter 和客户端不重放恢复测试。
 - CI 增加 digest 固定 MySQL 8.4.10 的 bundle integration job，真实运行迁移、并发、不可见窗口、reconciliation，以及 legacy pending 放弃与重新上传恢复，不允许通过 skip 绕过。
 - 增加真实 MySQL 8.4 `MySQLJobRepository`：peppered-HMAC 提交幂等、canonical hash 冲突检测、租户自有 bundle/callback、queued/running quota、稳定签名游标、tenant-safe GET/取消。
-- 增加 AES-256-GCM 源码对象生命周期接口及事务失败补偿；worker 通过权威数据库元数据加载密文，源码、对象引用和 lease token 不进入 REST view。
+- 增加 AES-256-GCM 源码对象生命周期接口、MinIO/S3 conditional-create/bounded-read 实现及事务失败补偿；worker 通过权威数据库元数据加载密文，源码、对象引用和 lease token 不进入 REST view。
 - 增加 `FOR UPDATE SKIP LOCKED` worker 领取、256-bit lease token、tenant-bound attempt、heartbeat/完成 CAS、进程重启过期回收、取消恢复和有界基础设施重试。
 - 增加持久仓储到异步 REST `JobService` 的脱敏适配，并区分配额已耗尽 `429` 与配额状态未知 `503`。
 - 增加与 `croj-sandbox` 一致的 `SandboxService.Execute` protobuf/gRPC 客户端。
