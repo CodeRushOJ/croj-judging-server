@@ -31,10 +31,11 @@ const maxSandboxBatchCasesV1 = 256
 const maxSandboxBatchRequestBytesV1 = 64 << 20
 
 type BatchBundlePipeline struct {
-	selector         SandboxSelector
-	executor         SandboxBatchExecutor
-	maxInfraAttempts int
-	maxRequestBytes  int
+	selector              SandboxSelector
+	executor              SandboxBatchExecutor
+	maxInfraAttempts      int
+	maxRequestBytes       int
+	maxExpectedCheckBytes int
 }
 
 func NewBatchBundlePipeline(selector SandboxSelector, executor SandboxBatchExecutor, maxInfraAttempts int) *BatchBundlePipeline {
@@ -42,10 +43,11 @@ func NewBatchBundlePipeline(selector SandboxSelector, executor SandboxBatchExecu
 		maxInfraAttempts = 3
 	}
 	return &BatchBundlePipeline{
-		selector:         selector,
-		executor:         executor,
-		maxInfraAttempts: maxInfraAttempts,
-		maxRequestBytes:  maxSandboxBatchRequestBytesV1,
+		selector:              selector,
+		executor:              executor,
+		maxInfraAttempts:      maxInfraAttempts,
+		maxRequestBytes:       maxSandboxBatchRequestBytesV1,
+		maxExpectedCheckBytes: maxSandboxBatchRequestBytesV1,
 	}
 }
 
@@ -80,19 +82,30 @@ func (pipeline *BatchBundlePipeline) ExecuteArtifact(
 	if proto.Size(request) > maxRequestBytes {
 		return systemErrorResult("submission exceeds sandbox batch byte limit"), nil
 	}
-	expectedOutputs := make([]string, 0, len(manifest.Cases))
+	expectedChecks := make([]string, 0, len(manifest.Cases))
+	maxExpectedCheckBytes := pipeline.maxExpectedCheckBytes
+	if maxExpectedCheckBytes <= 0 {
+		maxExpectedCheckBytes = maxSandboxBatchRequestBytesV1
+	}
+	retainedExpectedCheckBytes := 0
 	for _, testCase := range manifest.Cases {
 		input, expected, err := artifact.ReadCase(testCase)
 		if err != nil {
 			return systemErrorResult("bundle case could not be read"), nil
 		}
-		expectedOutputs = append(expectedOutputs, expected)
 		expectedForSandbox := ""
 		expectedTokenSHA256 := ""
+		expectedCheck := expected
 		if manifest.Checker == bundle.CheckerExact {
 			expectedForSandbox = expected
 		} else {
 			expectedTokenSHA256 = tokenOutputSHA256(expected)
+			expectedCheck = expectedTokenSHA256
+		}
+		expectedChecks = append(expectedChecks, expectedCheck)
+		retainedExpectedCheckBytes += len(expectedCheck)
+		if retainedExpectedCheckBytes > maxExpectedCheckBytes {
+			return systemErrorResult("bundle exceeds local expected-check retention limit"), nil
 		}
 		request.Cases = append(request.Cases, &sandboxpb.ExecuteBatchV1Case{
 			CaseId:              testCase.ID,
@@ -112,7 +125,7 @@ func (pipeline *BatchBundlePipeline) ExecuteArtifact(
 	if invalidResponse {
 		return systemErrorResult("sandbox batch response was invalid"), nil
 	}
-	return aggregateBatchResult(manifest, expectedOutputs, events), nil
+	return aggregateBatchResult(manifest, expectedChecks, events), nil
 }
 
 func (pipeline *BatchBundlePipeline) executeBatch(
@@ -220,7 +233,7 @@ func validateBatchEvents(request *sandboxpb.ExecuteBatchV1Request, events []*san
 
 func aggregateBatchResult(
 	manifest bundle.Manifest,
-	expectedOutputs []string,
+	expectedChecks []string,
 	events []*sandboxpb.ExecuteBatchV1Event,
 ) callback.Result {
 	if events[0].Kind == sandboxpb.ExecuteBatchV1Event_COMPILE_ERROR {
@@ -234,7 +247,7 @@ func aggregateBatchResult(
 	summaries := make([]string, 0, len(events)-1)
 	for index, event := range events[:len(events)-1] {
 		caseStatus := mapBundleStatus(event.Result.Status)
-		if event.Result.Status == "Accepted" && !outputsMatch(manifest.Checker, event.Result.Stdout, expectedOutputs[index]) {
+		if event.Result.Status == "Accepted" && !outputMatchesExpectedCheck(manifest.Checker, event.Result.Stdout, expectedChecks[index]) {
 			caseStatus = callback.StatusWrongAnswer
 		}
 		result.TimeUsedMillis = max(result.TimeUsedMillis, boundedMetric(event.Result.TimeUsed, 86_400_000))
@@ -252,4 +265,11 @@ func aggregateBatchResult(
 	}
 	result.ExitCode = 0
 	return result
+}
+
+func outputMatchesExpectedCheck(checker bundle.Checker, actual, expectedCheck string) bool {
+	if checker == bundle.CheckerToken {
+		return tokenOutputSHA256(actual) == expectedCheck
+	}
+	return outputsMatch(checker, actual, expectedCheck)
 }
