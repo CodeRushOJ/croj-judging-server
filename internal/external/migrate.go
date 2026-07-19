@@ -242,26 +242,33 @@ const durableFencingSchemaValidationSQL = `SELECT
           AND constraint_name = 'fk_external_attempt_job_tenant'
           AND referenced_table_name = 't_external_job'
     ), '') = 'job_id:id,tenant_id:tenant_id'
-    AND (
-        SELECT COUNT(*) FROM information_schema.table_constraints
-        WHERE constraint_schema = DATABASE() AND constraint_type = 'CHECK'
-          AND constraint_name IN ('chk_external_job_active_lease', 'chk_external_attempt_active_lease')
-    ) = 2
     AND EXISTS (
-        SELECT 1 FROM information_schema.check_constraints
-        WHERE constraint_schema = DATABASE()
-          AND constraint_name = 'chk_external_attempt_active_lease'
-          AND LOCATE('status', LOWER(check_clause)) > 0
-          AND LOCATE('lease_token', LOWER(check_clause)) > 0
+        SELECT 1
+        FROM information_schema.table_constraints AS table_constraint
+        JOIN information_schema.check_constraints AS check_constraint
+          ON check_constraint.constraint_schema = table_constraint.constraint_schema
+         AND check_constraint.constraint_name = table_constraint.constraint_name
+        WHERE table_constraint.constraint_schema = DATABASE()
+          AND table_constraint.table_name = 't_external_job_attempt'
+          AND table_constraint.constraint_type = 'CHECK'
+          AND table_constraint.constraint_name = 'chk_external_attempt_active_lease'
+          AND table_constraint.enforced = 'YES'
+          AND REPLACE(REPLACE(LOWER(check_constraint.check_clause), CHAR(96), ''), CHAR(92), '') =
+              '((status <> _utf8mb4''running'') or (lease_token is not null))'
     )
     AND EXISTS (
-        SELECT 1 FROM information_schema.check_constraints
-        WHERE constraint_schema = DATABASE()
-          AND constraint_name = 'chk_external_job_active_lease'
-          AND LOCATE('status', LOWER(check_clause)) > 0
-          AND LOCATE('worker_id', LOWER(check_clause)) > 0
-          AND LOCATE('lease_token', LOWER(check_clause)) > 0
-          AND LOCATE('lease_until', LOWER(check_clause)) > 0
+        SELECT 1
+        FROM information_schema.table_constraints AS table_constraint
+        JOIN information_schema.check_constraints AS check_constraint
+          ON check_constraint.constraint_schema = table_constraint.constraint_schema
+         AND check_constraint.constraint_name = table_constraint.constraint_name
+        WHERE table_constraint.constraint_schema = DATABASE()
+          AND table_constraint.table_name = 't_external_job'
+          AND table_constraint.constraint_type = 'CHECK'
+          AND table_constraint.constraint_name = 'chk_external_job_active_lease'
+          AND table_constraint.enforced = 'YES'
+          AND REPLACE(REPLACE(LOWER(check_constraint.check_clause), CHAR(96), ''), CHAR(92), '') =
+              '((status <> _utf8mb4''running'') or ((worker_id is not null) and (lease_token is not null) and (lease_until is not null)))'
     )
     AND EXISTS (
         SELECT 1 FROM information_schema.tables
@@ -279,6 +286,16 @@ const durableFencingSchemaValidationSQL = `SELECT
         WHERE table_schema = DATABASE() AND table_name = 't_external_source_reservation'
           AND column_name = 'created_at' AND column_type = 'datetime(3)' AND is_nullable = 'NO'
           AND UPPER(column_default) = 'CURRENT_TIMESTAMP(3)'
+    )
+    AND EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = DATABASE() AND table_name = 't_external_source_reservation'
+          AND column_name = 'owner_token' AND column_type = 'binary(32)' AND is_nullable = 'NO'
+    )
+    AND EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = DATABASE() AND table_name = 't_external_source_reservation'
+          AND column_name = 'lease_until' AND column_type = 'datetime(3)' AND is_nullable = 'NO'
     )
     AND COALESCE((
         SELECT GROUP_CONCAT(column_name ORDER BY seq_in_index SEPARATOR ',')

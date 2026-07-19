@@ -91,6 +91,8 @@ func TestDurableJobFencingMigrationAddsTenantBoundLeaseTokens(t *testing.T) {
 		"constraint chk_external_attempt_active_lease",
 		"create table if not exists t_external_source_reservation",
 		"object_key varchar(1024) character set ascii collate ascii_bin",
+		"owner_token binary(32) not null",
+		"lease_until datetime(3) not null",
 		"key idx_external_source_reservation_created (created_at)",
 	} {
 		if !strings.Contains(sql, contract) {

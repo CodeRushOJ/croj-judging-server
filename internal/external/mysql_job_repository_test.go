@@ -222,6 +222,25 @@ func TestMySQLJobRepositoryConcurrentReplayCreatesOneJobAndOneObject(t *testing.
 	}
 }
 
+func TestMySQLJobRepositoryAdmissionWorksWithSingleDatabaseConnection(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	database.SetMaxOpenConns(1)
+	database.SetMaxIdleConns(1)
+	tenantID := strings.Repeat("6", 26)
+	bundleID := strings.Repeat("7", 26)
+	insertTenantBundleAndCallback(t, database, tenantID, bundleID, "", 2)
+	repository := newTestMySQLJobRepository(t, database, newMemorySourceStore())
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	result, err := repository.Submit(ctx, tenantID, "single-connection-admission", JudgeJobRequest{
+		BundleID: bundleID, Language: "cpp20", SourceCode: []byte("int main(){}"),
+	})
+	if err != nil || result.Job.Status != JobStatusQueued {
+		t.Fatalf("single-connection admission result=%+v error=%v", result, err)
+	}
+}
+
 func TestMySQLJobRepositoryQueuedQuotaFailsClosed(t *testing.T) {
 	database := openMySQLIntegration(t)
 	prepareExternalJobDatabase(t, database)
@@ -363,8 +382,9 @@ func TestMySQLJobRepositorySweepsOnlyUnreferencedSourceReservations(t *testing.T
 	if err := store.Create(context.Background(), orphanKey, []byte("opaque ciphertext")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := database.Exec(`INSERT INTO t_external_source_reservation(object_key, created_at)
-VALUES (?, CURRENT_TIMESTAMP(3) - INTERVAL 1 HOUR), (?, CURRENT_TIMESTAMP(3) - INTERVAL 1 HOUR)`, orphanKey, linkedKey); err != nil {
+	if _, err := database.Exec(`INSERT INTO t_external_source_reservation(object_key, owner_token, lease_until, created_at)
+VALUES (?, RANDOM_BYTES(32), CURRENT_TIMESTAMP(3) - INTERVAL 1 HOUR, CURRENT_TIMESTAMP(3) - INTERVAL 1 HOUR),
+       (?, RANDOM_BYTES(32), CURRENT_TIMESTAMP(3) - INTERVAL 1 HOUR, CURRENT_TIMESTAMP(3) - INTERVAL 1 HOUR)`, orphanKey, linkedKey); err != nil {
 		t.Fatal(err)
 	}
 	reaped, err := repository.SweepSourceReservations(context.Background(), time.Minute, 10)
@@ -380,6 +400,46 @@ VALUES (?, CURRENT_TIMESTAMP(3) - INTERVAL 1 HOUR), (?, CURRENT_TIMESTAMP(3) - I
 	}
 	if count := mustCount(t, database, "SELECT COUNT(*) FROM t_external_source_reservation"); count != 0 {
 		t.Fatalf("source reservations after sweep=%d", count)
+	}
+}
+
+func TestSourceReservationSweepSkipsAdmissionLockedObject(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	store := newMemorySourceStore()
+	repository := newTestMySQLJobRepository(t, database, store)
+	tenantID := strings.Repeat("2", 26)
+	sourceID := strings.Repeat("3", 26)
+	objectKey, err := SourceObjectKey(tenantID, sourceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Create(context.Background(), objectKey, []byte("opaque ciphertext")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT INTO t_external_source_reservation(
+object_key, owner_token, lease_until, created_at
+) VALUES (?, RANDOM_BYTES(32), CURRENT_TIMESTAMP(3) - INTERVAL 1 HOUR, CURRENT_TIMESTAMP(3) - INTERVAL 1 HOUR)`, objectKey); err != nil {
+		t.Fatal(err)
+	}
+	admission, err := database.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admission.Exec("SELECT object_key FROM t_external_source_reservation WHERE object_key = ? FOR UPDATE", objectKey); err != nil {
+		_ = admission.Rollback()
+		t.Fatal(err)
+	}
+	reaped, err := repository.SweepSourceReservations(context.Background(), time.Minute, 1)
+	if err != nil || reaped != 0 {
+		_ = admission.Rollback()
+		t.Fatalf("locked reservation sweep reaped=%d error=%v", reaped, err)
+	}
+	if err := admission.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if reaped, err = repository.SweepSourceReservations(context.Background(), time.Minute, 1); err != nil || reaped != 1 {
+		t.Fatalf("unlocked reservation sweep reaped=%d error=%v", reaped, err)
 	}
 }
 

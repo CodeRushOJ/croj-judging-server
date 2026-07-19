@@ -69,23 +69,69 @@ func (repository *MySQLJobRepository) Submit(
 	if err != nil {
 		return SubmitJobResult{}, fmt.Errorf("%w: invalid idempotency key", ErrExternalJobInvalid)
 	}
+	// Canonical identity must remain stable when an operator tightens policy.
+	requestHash, err := CanonicalJobRequestHash(request, int64(len(request.SourceCode)))
+	if err != nil {
+		return SubmitJobResult{}, fmt.Errorf("%w: %v", ErrExternalJobInvalid, err)
+	}
+	sourceExternalID, err := generateExternalID(repository.random)
+	if err != nil {
+		return SubmitJobResult{}, repositoryUnavailable("generate source object ID", err)
+	}
+	jobExternalID, err := generateExternalID(repository.random)
+	if err != nil {
+		return SubmitJobResult{}, repositoryUnavailable("generate job ID", err)
+	}
+	sourceObjectKey, err := SourceObjectKey(tenantExternalID, sourceExternalID)
+	if err != nil {
+		return SubmitJobResult{}, repositoryUnavailable("derive source object key", err)
+	}
+	encrypted, err := repository.sourceCipher.Encrypt(tenantExternalID, sourceExternalID, request.SourceCode)
+	if err != nil {
+		return SubmitJobResult{}, repositoryUnavailable("encrypt source", err)
+	}
+	reservationToken := make([]byte, 32)
+	if _, err := io.ReadFull(repository.random, reservationToken); err != nil {
+		return SubmitJobResult{}, repositoryUnavailable("generate source reservation token", err)
+	}
+	if _, err := repository.database.ExecContext(ctx, `
+INSERT INTO t_external_source_reservation(object_key, owner_token, lease_until)
+VALUES (?, ?, CURRENT_TIMESTAMP(3) + INTERVAL 15 MINUTE)`, sourceObjectKey, reservationToken); err != nil {
+		return SubmitJobResult{}, repositoryUnavailable("reserve encrypted source object", err)
+	}
+	reservationActive := true
+	objectMayExist := false
+	// Registered before the transaction rollback defer: on a definite failure,
+	// rollback releases the reservation row lock before this cleanup needs a DB
+	// connection. Outcome-ambiguous object writes retain the reservation.
+	defer func() {
+		if !reservationActive || objectMayExist {
+			return
+		}
+		cleanupContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, _ = repository.database.ExecContext(cleanupContext, `
+DELETE FROM t_external_source_reservation
+WHERE object_key = ? AND owner_token = ?`, sourceObjectKey, reservationToken)
+	}()
 	tx, err := repository.database.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return SubmitJobResult{}, repositoryUnavailable("begin submit transaction", err)
 	}
 	defer tx.Rollback()
+	var lockedReservation string
+	if err := tx.QueryRowContext(ctx, `
+SELECT object_key FROM t_external_source_reservation
+WHERE object_key = ? AND owner_token = ? FOR UPDATE`, sourceObjectKey, reservationToken).Scan(&lockedReservation); err != nil {
+		return SubmitJobResult{}, repositoryUnavailable("lock encrypted source reservation", err)
+	}
 
 	tenantInternalID, policy, err := lockTenantPolicy(ctx, tx, tenantExternalID)
 	if err != nil {
 		return SubmitJobResult{}, err
 	}
-	// Canonical identity must remain stable when an operator tightens policy.
 	// Current admission limits are applied only after an idempotent replay has
 	// had a chance to return its already-accepted resource.
-	requestHash, err := CanonicalJobRequestHash(request, int64(len(request.SourceCode)))
-	if err != nil {
-		return SubmitJobResult{}, fmt.Errorf("%w: %v", ErrExternalJobInvalid, err)
-	}
 	now := repository.now().UTC()
 	if _, err := tx.ExecContext(ctx, `
 DELETE FROM t_external_idempotency
@@ -108,9 +154,15 @@ WHERE tenant_id = ? AND operation_scope = ? AND key_digest = ?`,
 		if err != nil {
 			return SubmitJobResult{}, repositoryUnavailable("read replayed job", err)
 		}
+		if _, err := tx.ExecContext(ctx, `
+DELETE FROM t_external_source_reservation
+WHERE object_key = ? AND owner_token = ?`, sourceObjectKey, reservationToken); err != nil {
+			return SubmitJobResult{}, repositoryUnavailable("release replay source reservation", err)
+		}
 		if err := tx.Commit(); err != nil {
 			return SubmitJobResult{}, repositoryUnavailable("commit idempotent replay", err)
 		}
+		reservationActive = false
 		return SubmitJobResult{Job: job, Replayed: true}, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
@@ -156,40 +208,7 @@ WHERE tenant_id = ? AND external_id = ? AND disabled_at IS NULL`,
 		callbackInternalID = sql.NullInt64{Int64: callbackID, Valid: true}
 	}
 
-	sourceExternalID, err := generateExternalID(repository.random)
-	if err != nil {
-		return SubmitJobResult{}, repositoryUnavailable("generate source object ID", err)
-	}
-	jobExternalID, err := generateExternalID(repository.random)
-	if err != nil {
-		return SubmitJobResult{}, repositoryUnavailable("generate job ID", err)
-	}
-	sourceObjectKey, err := SourceObjectKey(tenantExternalID, sourceExternalID)
-	if err != nil {
-		return SubmitJobResult{}, repositoryUnavailable("derive source object key", err)
-	}
-	encrypted, err := repository.sourceCipher.Encrypt(tenantExternalID, sourceExternalID, request.SourceCode)
-	if err != nil {
-		return SubmitJobResult{}, repositoryUnavailable("encrypt source", err)
-	}
-	if _, err := repository.database.ExecContext(ctx,
-		"INSERT INTO t_external_source_reservation(object_key) VALUES (?)", sourceObjectKey); err != nil {
-		return SubmitJobResult{}, repositoryUnavailable("reserve encrypted source object", err)
-	}
-	reservationActive := true
-	releaseReservation := func() error {
-		if !reservationActive {
-			return nil
-		}
-		cleanupContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if _, err := repository.database.ExecContext(cleanupContext,
-			"DELETE FROM t_external_source_reservation WHERE object_key = ?", sourceObjectKey); err != nil {
-			return repositoryUnavailable("release encrypted source reservation", err)
-		}
-		reservationActive = false
-		return nil
-	}
+	objectMayExist = true
 	if err := repository.sourceObjects.Create(ctx, sourceObjectKey, encrypted.Ciphertext); err != nil {
 		// Object-store SDK errors commonly embed bucket/key/request details.
 		// Preserve the availability class without making those details loggable.
@@ -197,9 +216,8 @@ WHERE tenant_id = ? AND external_id = ? AND disabled_at IS NULL`,
 		// outcome-ambiguous; the sweeper will check DB ownership before deletion.
 		return SubmitJobResult{}, fmt.Errorf("%w: persist encrypted source", ErrExternalJobUnavailable)
 	}
-	objectPublished := true
 	cleanupObject := func(cause error) error {
-		if !objectPublished {
+		if !objectMayExist {
 			return cause
 		}
 		cleanupContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -207,10 +225,7 @@ WHERE tenant_id = ? AND external_id = ? AND disabled_at IS NULL`,
 		if cleanupErr := repository.sourceObjects.Delete(cleanupContext, sourceObjectKey); cleanupErr != nil {
 			return fmt.Errorf("%w: source compensation failed", ErrExternalJobUnavailable)
 		}
-		objectPublished = false
-		if cleanupErr := releaseReservation(); cleanupErr != nil {
-			return cleanupErr
-		}
+		objectMayExist = false
 		return cause
 	}
 	sourceResult, err := tx.ExecContext(ctx, `
@@ -253,6 +268,11 @@ INSERT INTO t_external_idempotency(
 		jobExternalID, responseJSON, now.Add(repository.idempotencyTTL)); err != nil {
 		return SubmitJobResult{}, cleanupObject(repositoryUnavailable("persist idempotency record", err))
 	}
+	if _, err := tx.ExecContext(ctx, `
+DELETE FROM t_external_source_reservation
+WHERE object_key = ? AND owner_token = ?`, sourceObjectKey, reservationToken); err != nil {
+		return SubmitJobResult{}, cleanupObject(repositoryUnavailable("publish source reservation", err))
+	}
 	job, err := getExternalJob(ctx, tx, tenantExternalID, jobExternalID, false)
 	if err != nil {
 		return SubmitJobResult{}, cleanupObject(repositoryUnavailable("read submitted job", err))
@@ -264,10 +284,8 @@ INSERT INTO t_external_idempotency(
 		// an idempotent retry determines whether the transaction committed.
 		return SubmitJobResult{}, repositoryUnavailable("commit submitted job with unknown outcome", err)
 	}
-	objectPublished = false
-	// A stale reservation is safe: the sweeper observes the authoritative
-	// source metadata and removes only the reservation, never the live object.
-	_ = releaseReservation()
+	reservationActive = false
+	objectMayExist = false
 	return SubmitJobResult{Job: job}, nil
 }
 

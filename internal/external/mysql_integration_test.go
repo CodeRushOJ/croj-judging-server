@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -113,6 +114,59 @@ func TestDurableFencingMigrationResumesAfterCommittedStatementPrefix(t *testing.
 		t.Fatalf("resume after %d committed statements: %v", committed, err)
 	}
 	assertDurableMigrationSchema(t, ctx, database)
+}
+
+func TestDurableFencingMigrationRejectsWrongSameNameChecks(t *testing.T) {
+	database := openMySQLIntegration(t)
+	resetMySQLIntegrationSchema(t, database)
+	defer resetMySQLIntegrationSchema(t, database)
+	migrations, err := Migrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	connection, err := database.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	if err := applyMigrations(ctx, sqlMigrationConnection{connection: connection}, migrations[:2]); err != nil {
+		t.Fatal(err)
+	}
+	statements, err := splitMigrationStatements(migrations[2].SQL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, statement := range statements {
+		if strings.Contains(statement, "chk_external_attempt_active_lease") {
+			statements = statements[:index]
+			break
+		}
+	}
+	for index, statement := range statements {
+		if _, err := connection.ExecContext(ctx, statement); err != nil {
+			t.Fatalf("prepare statement %d: %v", index+1, err)
+		}
+	}
+	if _, err := connection.ExecContext(ctx, `ALTER TABLE t_external_job_attempt
+ADD CONSTRAINT chk_external_attempt_active_lease CHECK (status = 'RUNNING' OR lease_token IS NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := connection.ExecContext(ctx, `ALTER TABLE t_external_job
+ADD CONSTRAINT chk_external_job_active_lease CHECK (status = 'RUNNING' OR worker_id IS NULL OR lease_token IS NULL OR lease_until IS NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyMigrations(ctx, sqlMigrationConnection{connection: connection}, migrations); err == nil || !strings.Contains(err.Error(), "validate migration 3") {
+		t.Fatalf("wrong same-name checks migration error=%v", err)
+	}
+	var recorded int
+	if err := connection.QueryRowContext(ctx, "SELECT COUNT(*) FROM t_judge_schema_history WHERE version = 3").Scan(&recorded); err != nil {
+		t.Fatal(err)
+	}
+	if recorded != 0 {
+		t.Fatalf("invalid migration recorded history rows=%d", recorded)
+	}
 }
 
 func assertDurableMigrationSchema(t *testing.T, ctx context.Context, database *sql.DB) {
