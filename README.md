@@ -4,7 +4,7 @@ Go 判题编排服务，负责消费 `submission-topic`、读取提交快照、�
 
 > 当前状态：Kubernetes EndpointSlice 发现、版本化消息、认证幂等结果回调和不可变 ACM 隐藏测试包链路已经接通。上线 exact checker 前必须先合入 [`croj-sandbox#10`](https://github.com/CodeRushOJ/croj-sandbox/issues/10) 的日志脱敏修复，否则旧 sandbox 会把 WA 的 expected/actual 写入 Pod 日志。
 
-面向外部 OJ 的版本化异步 REST 适配器正在 Draft PR #17 中实施。已有切片包括 RFC 9457 错误、请求 ID、不透明 API Key 的 peppered HMAC 验证与 scope、`GET /api/v1/capabilities`、Judge 自有 MySQL 迁移、租户/密钥预置、不可变 hidden bundle 上传/元数据端点，以及 `POST /api/v1/judge-jobs`、任务列表/详情/取消的脱敏 HTTP 合约和 lease/attempt 状态机。Webhook 已具备精确载荷 HMAC 签名、禁止重定向、状态重试矩阵及 DNS rebinding/私网 SSRF 防护；任务提交的 Redis 原子令牌桶使用 Redis 服务端时间，在多副本间统一租户速率，Redis 不可用时新任务写入 fail closed 为 `503`，任务读取继续可用。上传字节配额类型已预留，但必须等 bundle upload 分支接入后才视为生效。在 MySQL job/outbox repository、worker 和 E2E 门禁完成前，该 HTTP 端口不标记为可发布。
+面向外部 OJ 的版本化异步 REST 适配器正在 Draft PR #17 中实施。已有切片包括 RFC 9457 错误、请求 ID、不透明 API Key 的 peppered HMAC 验证与 scope、`GET /api/v1/capabilities`、Judge 自有 MySQL 迁移、租户/密钥预置、不可变 hidden bundle 上传/元数据端点，以及 `POST /api/v1/judge-jobs`、任务列表/详情/取消的脱敏 HTTP 合约和 lease/attempt 状态机。Webhook 已具备精确载荷 HMAC 签名、禁止重定向、状态重试矩阵及 DNS rebinding/私网 SSRF 防护；Redis 原子令牌桶使用服务端时间，在多副本间统一限制任务提交和 bundle 实际上传字节，配额不可用时新写入 fail closed 为 `503`，读取继续可用。在 MySQL job/outbox repository、worker 和 E2E 门禁完成前，该 HTTP 端口不标记为可发布。
 
 ## 架构
 
@@ -152,6 +152,8 @@ go run ./cmd/judge-admin api-key create \
 ### 外部不可变题包上传
 
 `POST /api/v1/bundles` 只接受一个名为 `bundle` 的 multipart 文件和 16–128 字节可见 ASCII `Idempotency-Key`。HTTP 外层和 Service 内层分别执行请求体/文件体积上限；文件流式写入专用临时文件并同步计算 SHA-256，取消、超限或校验失败都会清理临时文件。安全校验与内部 immutable bundle 共用同一条 ZIP 路径，覆盖路径穿越、link/非普通文件、加密/未知压缩、文件数、单文件/总解压量、压缩比、manifest 严格 schema、case 成对和 256 case 协议上限；每个 case 文件还会流式读取以核对 CRC、声明大小和 UTF-8，损坏内容不会发布。
+
+HTTP 层先用可信 `Content-Length` 对 multipart 总上限做无读取早拒绝；Service 流式落临时文件后，以实际 bundle 字节数执行一次租户 Redis 配额 admission。配额拒绝返回带 `Retry-After` 的 `429`，Redis 状态不可确认返回 `503`；两者都发生在对象 staging 和 MySQL ownership 之前，不会留下持久化半成品。
 
 服务端只能发布到 `external/<tenant-id>/sha256/<lowercase-sha256>.zip`；请求不接受 URL、bucket 或 object key，响应也只返回 `bundleId`/digest/size/case/manifest version/创建时间。`Idempotency-Key` 使用不少于 32 字节独立 pepper 的 `HMAC-SHA256` 后才进入 MySQL，与 job API 使用同一安全语义，原始 key 不落库。
 

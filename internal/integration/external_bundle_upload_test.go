@@ -33,6 +33,12 @@ import (
 
 type integrationCredentialStore struct{ credential *external.Credential }
 
+type integrationAllowQuota struct{}
+
+func (integrationAllowQuota) Allow(context.Context, external.QuotaRequest) (external.QuotaDecision, error) {
+	return external.QuotaDecision{Allowed: true}, nil
+}
+
 func (store integrationCredentialStore) FindCredentialByPrefix(context.Context, string) (*external.Credential, error) {
 	return store.credential, nil
 }
@@ -331,7 +337,9 @@ func TestExternalBundleUploadHTTPIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := httpapi.NewServer(authenticator, integrationCapabilities(), httpapi.WithBundleApplication(service))
+	capabilities := integrationCapabilities()
+	server, err := httpapi.NewServer(authenticator, capabilities, httpapi.WithBundleApplication(service),
+		httpapi.WithBundleWriteQuota(integrationAllowQuota{}, external.QuotaLimit{Capacity: capabilities.Limits.MaxBundleBytes, RefillPeriod: time.Minute}))
 	if err != nil {
 		t.Fatal(err)
 	}

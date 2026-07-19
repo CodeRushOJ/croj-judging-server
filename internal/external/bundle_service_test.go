@@ -292,6 +292,22 @@ func TestBundleServiceNeverPublishesUnownedFinalObject(t *testing.T) {
 	}
 }
 
+func TestBundleServiceAdmitsActualBytesBeforeCreatingDurableArtifacts(t *testing.T) {
+	repository := newMemoryBundleRepository()
+	store := &atomicMemoryObjectStore{}
+	service := newTestBundleService(t, repository, store, t.TempDir(), 1<<20, bundle.DefaultArchiveLimits())
+	body := validExternalBundle(t, "input")
+	wantErr := errors.New("quota exceeded")
+	var admittedBytes int64
+	_, _, err := service.UploadWithAdmission(context.Background(), testTenantID, "upload-key-00001", bytes.NewReader(body), func(_ context.Context, actualBytes int64) error {
+		admittedBytes = actualBytes
+		return wantErr
+	})
+	if !errors.Is(err, wantErr) || admittedBytes != int64(len(body)) || repository.logicalCreates != 0 || len(store.staged) != 0 || len(store.objects) != 0 {
+		t.Fatalf("error=%v admitted=%d rows=%d staged=%d objects=%d", err, admittedBytes, repository.logicalCreates, len(store.staged), len(store.objects))
+	}
+}
+
 func TestBundleServiceReconcilesOwnedObjectAfterPublishFailure(t *testing.T) {
 	repository := newMemoryBundleRepository()
 	store := &atomicMemoryObjectStore{failNext: 1}

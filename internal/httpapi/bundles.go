@@ -8,13 +8,15 @@ import (
 	"math"
 	"mime/multipart"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/CodeRushOJ/croj-judging-server/internal/external"
 )
 
 type BundleApplication interface {
-	Upload(context.Context, string, string, io.Reader) (external.BundleMetadata, bool, error)
+	UploadWithAdmission(context.Context, string, string, io.Reader, external.BundleUploadAdmission) (external.BundleMetadata, bool, error)
 	Get(context.Context, string, string) (external.BundleMetadata, error)
 }
 
@@ -24,6 +26,20 @@ func WithBundleApplication(application BundleApplication) ServerOption {
 			return errors.New("bundle application is required")
 		}
 		server.bundles = application
+		return nil
+	}
+}
+
+func WithBundleWriteQuota(quota external.Quota, uploadBytesLimit external.QuotaLimit) ServerOption {
+	return func(server *Server) error {
+		if quota == nil {
+			return errors.New("bundle write quota is required")
+		}
+		if err := uploadBytesLimit.Validate(); err != nil {
+			return err
+		}
+		server.bundleWriteQuota = quota
+		server.bundleWriteLimit = uploadBytesLimit
 		return nil
 	}
 }
@@ -53,7 +69,12 @@ func (server *Server) serveBundleCollection(response http.ResponseWriter, reques
 		writeBundleProblem(response, requestID, errors.New("bundle upload limit is unavailable"))
 		return
 	}
-	request.Body = http.MaxBytesReader(response, request.Body, maxBundleBytes+multipartEnvelopeBytes)
+	maximumRequestBytes := maxBundleBytes + multipartEnvelopeBytes
+	if request.ContentLength > maximumRequestBytes {
+		writeBundleProblem(response, requestID, external.ErrBundleTooLarge)
+		return
+	}
+	request.Body = http.MaxBytesReader(response, request.Body, maximumRequestBytes)
 	multipartReader, err := request.MultipartReader()
 	if err != nil {
 		writeBundleProblem(response, requestID, external.ErrInvalidBundle)
@@ -68,7 +89,21 @@ func (server *Server) serveBundleCollection(response http.ResponseWriter, reques
 		return
 	}
 	reader := &singleMultipartFile{part: part, multipart: multipartReader}
-	metadata, replay, err := server.bundles.Upload(request.Context(), principal.TenantID, idempotencyKeys[0], reader)
+	metadata, replay, err := server.bundles.UploadWithAdmission(request.Context(), principal.TenantID, idempotencyKeys[0], reader, func(ctx context.Context, actualBytes int64) error {
+		decision, err := server.bundleWriteQuota.Allow(ctx, external.QuotaRequest{
+			TenantID: principal.TenantID, Kind: external.QuotaBundleUploadBytes, Cost: actualBytes, Limit: server.bundleWriteLimit,
+		})
+		if err != nil {
+			if errors.Is(err, external.ErrQuotaUnavailable) {
+				return &bundleQuotaAdmissionError{unavailable: true}
+			}
+			return err
+		}
+		if !decision.Allowed {
+			return &bundleQuotaAdmissionError{retryAfter: decision.RetryAfter}
+		}
+		return nil
+	})
 	_ = part.Close()
 	if err != nil {
 		_ = request.Body.Close()
@@ -147,7 +182,18 @@ func (reader *singleMultipartFile) Read(buffer []byte) (int, error) {
 func writeBundleProblem(response http.ResponseWriter, requestID string, err error) {
 	problem := problemFor(http.StatusServiceUnavailable, "bundle-unavailable", "Bundle service unavailable", "The bundle operation could not be completed.", requestID)
 	var maxBytesError *http.MaxBytesError
+	var quotaError *bundleQuotaAdmissionError
 	switch {
+	case errors.As(err, &quotaError) && quotaError.unavailable:
+		response.Header().Set("Retry-After", "5")
+		problem = problemFor(http.StatusServiceUnavailable, "quota-unavailable", "Quota temporarily unavailable", "Retry the request later.", requestID)
+	case errors.As(err, &quotaError):
+		retrySeconds := int64(math.Ceil(quotaError.retryAfter.Seconds()))
+		if retrySeconds < 1 {
+			retrySeconds = 1
+		}
+		response.Header().Set("Retry-After", strconv.FormatInt(retrySeconds, 10))
+		problem = problemFor(http.StatusTooManyRequests, "quota-exceeded", "Quota exceeded", "Retry after the indicated delay.", requestID)
 	case errors.Is(err, external.ErrBundleTooLarge), errors.As(err, &maxBytesError):
 		problem = problemFor(http.StatusRequestEntityTooLarge, "bundle-too-large", "Bundle too large", "The bundle exceeds the configured upload limit.", requestID)
 	case errors.Is(err, external.ErrInvalidBundle), errors.Is(err, external.ErrInvalidIdempotency), errors.Is(err, errUnexpectedMultipartPart):
@@ -161,6 +207,18 @@ func writeBundleProblem(response http.ResponseWriter, requestID string, err erro
 		problem = problemFor(http.StatusServiceUnavailable, "bundle-publishing", "Bundle publication in progress", "Retry this idempotent upload later.", requestID)
 	}
 	writeProblem(response, problem)
+}
+
+type bundleQuotaAdmissionError struct {
+	unavailable bool
+	retryAfter  time.Duration
+}
+
+func (failure *bundleQuotaAdmissionError) Error() string {
+	if failure != nil && failure.unavailable {
+		return "bundle upload quota is unavailable"
+	}
+	return "bundle upload quota is exceeded"
 }
 
 func encodeJSON(writer io.Writer, value any) error {

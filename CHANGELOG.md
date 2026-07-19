@@ -13,7 +13,7 @@
 - 增加持久化任务状态机，覆盖 attempt CAS、lease heartbeat/过期回收、陈旧 worker 拒绝、取消意图、基础设施重试与终态失败。
 - 增加外部 OJ webhook v1 的 HMAC-SHA256 精确载荷签名、2xx/重试/永久失败矩阵及禁止重定向投递。
 - 增加 callback HTTPS authority 固定、逐次 DNS 解析、混合公私网答案拒绝和 IPv4/IPv6/云元数据 SSRF 防护传输层。
-- 增加 Redis 服务端时间驱动的原子令牌桶，跨 HTTP 副本统一限制租户任务提交；配额状态不确定时新任务写入 fail closed，已授权读请求保持可用。上传字节配额将在 bundle upload 分支接线后启用。
+- 增加 Redis 服务端时间驱动的原子令牌桶，跨 HTTP 副本统一限制租户任务提交与 bundle 实际上传字节；配额状态不确定时新写入 fail closed，已授权读请求保持可用。
 - 增加 `POST/GET /api/v1/bundles`：有界单文件 multipart 流式上传、SHA-256 内容寻址、tenant-scoped 元数据与 RFC 9457 错误。
 - 增加外部题包 ZIP 安全复用校验、case CRC/size/UTF-8 流式核验、取消/超限清理、MySQL 原子 ownership+幂等事务及并发单逻辑记录回归。
 - 外部题包幂等键统一采用独立 pepper 的 HMAC-SHA256；对象发布改为 durable staging→PENDING→CAS-leased PUBLISHING→远端 size/SHA 校验→READY 状态机，增加持久 reconciler、退避/attempt/lease、ABANDONED 审计、单 promoter 和客户端不重放恢复测试。
