@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/netip"
 	"testing"
+	"time"
 )
 
 type resolverStub struct {
@@ -18,7 +19,7 @@ func (resolver resolverStub) LookupNetIP(context.Context, string, string) ([]net
 func TestResolvePublicCallbackRejectsPrivateReservedAndMixedDNS(t *testing.T) {
 	privateAddresses := []string{
 		"0.0.0.0", "10.0.0.1", "100.64.0.1", "127.0.0.1", "169.254.169.254", "172.16.0.1", "192.168.1.1", "224.0.0.1",
-		"::", "::1", "fc00::1", "fe80::1", "ff02::1", "::ffff:127.0.0.1",
+		"::", "::1", "64:ff9b:1::1", "fc00::1", "fec0::1", "fe80::1", "ff02::1", "::ffff:127.0.0.1",
 	}
 	for _, raw := range privateAddresses {
 		t.Run(raw, func(t *testing.T) {
@@ -33,6 +34,17 @@ func TestResolvePublicCallbackRejectsPrivateReservedAndMixedDNS(t *testing.T) {
 	}}, "hooks.example.com")
 	if err == nil {
 		t.Fatal("mixed public/private DNS answer was accepted")
+	}
+}
+
+func TestSafeCallbackTransportBoundsUntrustedResponseHeadersAndConnections(t *testing.T) {
+	client, err := NewSafeCallbackClient("hooks.example.com", 443, time.Second, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapper, ok := client.Transport.(*safeCallbackTransport)
+	if !ok || wrapper.transport.MaxResponseHeaderBytes != 64<<10 || wrapper.transport.MaxConnsPerHost <= 0 {
+		t.Fatalf("transport=%T config=%+v", client.Transport, wrapper)
 	}
 }
 
