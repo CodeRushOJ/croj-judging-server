@@ -561,6 +561,7 @@ func insertTenantBundleAndCallback(t *testing.T, database *sql.DB, tenantID, bun
 	policy := TenantPolicy{
 		MaxQueuedJobs: maxQueued, MaxRunningJobs: 1, MaxSourceBytes: 1 << 20,
 		MaxRetainedBundles: 100, DailyExecutionMillis: 3_600_000, MaxInfrastructureTries: 3,
+		MaxTimeLimitMillis: 10_000, MaxMemoryLimitMiB: 1024,
 	}
 	encodedPolicy, err := json.Marshal(policy)
 	if err != nil {
@@ -576,7 +577,12 @@ func insertTenantBundleAndCallback(t *testing.T, database *sql.DB, tenantID, bun
 	}
 	if _, err := database.Exec(`
 INSERT INTO t_external_bundle(external_id, tenant_id, sha256, object_key, size_bytes, case_count, manifest_version, manifest_json, publication_status, ready_at)
-VALUES (?, ?, UNHEX(SHA2(?, 256)), ?, 128, 1, 1, JSON_OBJECT('schemaVersion', 1, 'cases', JSON_ARRAY()), 'READY', NOW(3))`,
+VALUES (?, ?, UNHEX(SHA2(?, 256)), ?, 128, 1, 1,
+  JSON_OBJECT(
+    'schemaVersion', 1, 'judgeMode', 'ACM', 'checker', 'exact',
+    'limits', JSON_OBJECT('timeLimitMillis', 1000, 'memoryLimitMiB', 256),
+    'cases', JSON_ARRAY(JSON_OBJECT('id', 'case-1', 'input', '1.in', 'output', '1.out', 'weight', 1))
+  ), 'READY', NOW(3))`,
 		bundleID, tenantInternalID, bundleID, "external/"+tenantID+"/sha256/"+bundleID+".zip"); err != nil {
 		t.Fatal(err)
 	}
@@ -586,6 +592,22 @@ INSERT INTO t_external_callback(external_id, tenant_id, destination_url, allowed
 VALUES (?, ?, 'https://callback.example.test/judge', 'callback.example.test', 443, X'0102', 1)`, callbackID, tenantInternalID); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func insertBundleForTenant(t *testing.T, database *sql.DB, tenantID, bundleID string, timeLimitMillis, memoryLimitMiB int) {
+	t.Helper()
+	if _, err := database.Exec(`
+INSERT INTO t_external_bundle(external_id, tenant_id, sha256, object_key, size_bytes, case_count, manifest_version, manifest_json, publication_status, ready_at)
+SELECT ?, tenant.id, UNHEX(SHA2(?, 256)), ?, 128, 1, 1,
+  JSON_OBJECT(
+    'schemaVersion', 1, 'judgeMode', 'ACM', 'checker', 'exact',
+    'limits', JSON_OBJECT('timeLimitMillis', ?, 'memoryLimitMiB', ?),
+    'cases', JSON_ARRAY(JSON_OBJECT('id', 'case-1', 'input', '1.in', 'output', '1.out', 'weight', 1))
+  ), 'READY', NOW(3)
+FROM t_external_tenant AS tenant WHERE tenant.external_id = ?`,
+		bundleID, bundleID, "external/"+tenantID+"/sha256/"+bundleID+".zip", timeLimitMillis, memoryLimitMiB, tenantID); err != nil {
+		t.Fatal(err)
 	}
 }
 

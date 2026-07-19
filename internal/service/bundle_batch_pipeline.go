@@ -38,6 +38,43 @@ type BatchBundlePipeline struct {
 	maxExpectedCheckBytes int
 }
 
+// CanonicalExecutionRequest contains only caller-owned execution data. Test
+// limits remain authoritative in the verified immutable bundle manifest.
+type CanonicalExecutionRequest struct {
+	Language      string
+	SourceCode    string
+	StopOnFailure bool
+}
+
+type CanonicalCaseResult struct {
+	CaseID         string
+	Status         callback.Status
+	TimeUsedMillis int
+	MemoryUsedKB   int
+}
+
+type CanonicalResult struct {
+	Status         callback.Status
+	ExitCode       int
+	TimeUsedMillis int
+	MemoryUsedKB   int
+	Stderr         string
+	CompileError   string
+	Cases          []CanonicalCaseResult
+}
+
+func (result CanonicalResult) CallbackResult() callback.Result {
+	return callback.Result{
+		Status: result.Status, ExitCode: result.ExitCode,
+		TimeUsedMillis: result.TimeUsedMillis, MemoryUsedKB: result.MemoryUsedKB,
+		Stderr: result.Stderr, CompileError: result.CompileError,
+	}
+}
+
+func canonicalSystemError(summary string) CanonicalResult {
+	return CanonicalResult{Status: callback.StatusSystemError, Stderr: callback.TruncateUTF16(summary, 65_536)}
+}
+
 func NewBatchBundlePipeline(selector SandboxSelector, executor SandboxBatchExecutor, maxInfraAttempts int) *BatchBundlePipeline {
 	if maxInfraAttempts <= 0 {
 		maxInfraAttempts = 3
@@ -60,19 +97,33 @@ func (pipeline *BatchBundlePipeline) ExecuteArtifact(
 	if submission == nil || artifact == nil || executionConfig.TimeLimitMillis <= 0 || executionConfig.MemoryLimitMB <= 0 {
 		return callback.Result{}, fmt.Errorf("submission, immutable execution config, and test artifact are required")
 	}
+	result, err := pipeline.ExecuteCanonical(ctx, CanonicalExecutionRequest{
+		Language: submission.Language, SourceCode: submission.Code, StopOnFailure: true,
+	}, artifact)
+	return result.CallbackResult(), err
+}
+
+func (pipeline *BatchBundlePipeline) ExecuteCanonical(
+	ctx context.Context,
+	input CanonicalExecutionRequest,
+	artifact CaseArtifact,
+) (CanonicalResult, error) {
+	if pipeline == nil || artifact == nil || strings.TrimSpace(input.Language) == "" || input.SourceCode == "" {
+		return CanonicalResult{}, fmt.Errorf("canonical execution request and test artifact are required")
+	}
 	manifest := artifact.Manifest()
 	if err := manifest.Validate(); err != nil {
-		return systemErrorResult("bundle manifest became invalid"), nil
+		return canonicalSystemError("bundle manifest became invalid"), nil
 	}
 	if len(manifest.Cases) > maxSandboxBatchCasesV1 {
-		return systemErrorResult("bundle exceeds sandbox batch case limit"), nil
+		return canonicalSystemError("bundle exceeds sandbox batch case limit"), nil
 	}
 	request := &sandboxpb.ExecuteBatchV1Request{
-		Language:      submission.Language,
-		SourceCode:    submission.Code,
-		Timeout:       timeoutSeconds(executionConfig.TimeLimitMillis),
-		MemoryLimit:   boundedInt32(executionConfig.MemoryLimitMB),
-		StopOnFailure: true,
+		Language:      input.Language,
+		SourceCode:    input.SourceCode,
+		Timeout:       timeoutSeconds(manifest.Limits.TimeLimitMillis),
+		MemoryLimit:   boundedInt32(manifest.Limits.MemoryLimitMiB),
+		StopOnFailure: input.StopOnFailure,
 		Cases:         make([]*sandboxpb.ExecuteBatchV1Case, 0, len(manifest.Cases)),
 	}
 	maxRequestBytes := pipeline.maxRequestBytes
@@ -80,7 +131,7 @@ func (pipeline *BatchBundlePipeline) ExecuteArtifact(
 		maxRequestBytes = maxSandboxBatchRequestBytesV1
 	}
 	if proto.Size(request) > maxRequestBytes {
-		return systemErrorResult("submission exceeds sandbox batch byte limit"), nil
+		return canonicalSystemError("submission exceeds sandbox batch byte limit"), nil
 	}
 	expectedChecks := make([]string, 0, len(manifest.Cases))
 	maxExpectedCheckBytes := pipeline.maxExpectedCheckBytes
@@ -91,7 +142,7 @@ func (pipeline *BatchBundlePipeline) ExecuteArtifact(
 	for _, testCase := range manifest.Cases {
 		input, expected, err := artifact.ReadCase(testCase)
 		if err != nil {
-			return systemErrorResult("bundle case could not be read"), nil
+			return canonicalSystemError("bundle case could not be read"), nil
 		}
 		expectedForSandbox := ""
 		expectedTokenSHA256 := ""
@@ -105,7 +156,7 @@ func (pipeline *BatchBundlePipeline) ExecuteArtifact(
 		expectedChecks = append(expectedChecks, expectedCheck)
 		retainedExpectedCheckBytes += len(expectedCheck)
 		if retainedExpectedCheckBytes > maxExpectedCheckBytes {
-			return systemErrorResult("bundle exceeds local expected-check retention limit"), nil
+			return canonicalSystemError("bundle exceeds local expected-check retention limit"), nil
 		}
 		request.Cases = append(request.Cases, &sandboxpb.ExecuteBatchV1Case{
 			CaseId:              testCase.ID,
@@ -115,15 +166,15 @@ func (pipeline *BatchBundlePipeline) ExecuteArtifact(
 			TokenExpectedSha256: expectedTokenSHA256,
 		})
 		if proto.Size(request) > maxRequestBytes {
-			return systemErrorResult("bundle exceeds sandbox batch byte limit"), nil
+			return canonicalSystemError("bundle exceeds sandbox batch byte limit"), nil
 		}
 	}
 	events, invalidResponse, err := pipeline.executeBatch(ctx, request)
 	if err != nil {
-		return callback.Result{}, err
+		return CanonicalResult{}, err
 	}
 	if invalidResponse {
-		return systemErrorResult("sandbox batch response was invalid"), nil
+		return canonicalSystemError("sandbox batch response was invalid"), nil
 	}
 	return aggregateBatchResult(manifest, expectedChecks, events), nil
 }
@@ -208,7 +259,7 @@ func validateBatchEvents(request *sandboxpb.ExecuteBatchV1Request, events []*san
 		}
 		switch event.Kind {
 		case sandboxpb.ExecuteBatchV1Event_CASE_RESULT:
-			if caseIndex > 0 && events[eventIndex-1].Result.Status != "Accepted" {
+			if request.StopOnFailure && caseIndex > 0 && events[eventIndex-1].Result.Status != "Accepted" {
 				return fmt.Errorf("batch continued after contestant verdict")
 			}
 			if caseIndex >= len(request.Cases) || event.Result == nil || event.CaseId != request.Cases[caseIndex].CaseId || !isKnownContestantStatus(event.Result.Status) {
@@ -235,15 +286,15 @@ func aggregateBatchResult(
 	manifest bundle.Manifest,
 	expectedChecks []string,
 	events []*sandboxpb.ExecuteBatchV1Event,
-) callback.Result {
+) CanonicalResult {
 	if events[0].Kind == sandboxpb.ExecuteBatchV1Event_COMPILE_ERROR {
-		return callback.Result{
+		return CanonicalResult{
 			Status:       callback.StatusCompileError,
 			CompileError: "compilation failed; diagnostics redacted",
 			Stderr:       "compilation failed",
 		}
 	}
-	result := callback.Result{Status: callback.StatusAccepted}
+	result := CanonicalResult{Status: callback.StatusAccepted, Cases: make([]CanonicalCaseResult, 0, len(events)-1)}
 	summaries := make([]string, 0, len(events)-1)
 	for index, event := range events[:len(events)-1] {
 		caseStatus := mapBundleStatus(event.Result.Status)
@@ -254,6 +305,11 @@ func aggregateBatchResult(
 		result.MemoryUsedKB = max(result.MemoryUsedKB, boundedMetric(event.Result.MemoryUsed, 2_147_483_647))
 		result.ExitCode = int(event.Result.ExitCode)
 		result.Status = caseStatus
+		result.Cases = append(result.Cases, CanonicalCaseResult{
+			CaseID: event.CaseId, Status: caseStatus,
+			TimeUsedMillis: boundedMetric(event.Result.TimeUsed, 86_400_000),
+			MemoryUsedKB:   boundedMetric(event.Result.MemoryUsed, 2_147_483_647),
+		})
 		summaries = append(summaries, fmt.Sprintf("case=%s sandboxStatus=%s status=%s", event.CaseId, event.Result.Status, caseStatus))
 		result.Stderr = callback.TruncateUTF16(strings.Join(summaries, ";"), 65_536)
 		if caseStatus == callback.StatusCompileError {

@@ -44,15 +44,22 @@ func (provider *Provider) Open(ctx context.Context, metadata *model.TestBundle) 
 	if provider == nil || provider.cache == nil || metadata == nil || metadata.ProblemVersionID <= 0 {
 		return nil, Invalid(fmt.Errorf("test bundle metadata is missing or invalid"))
 	}
-	path, err := provider.cache.Resolve(ctx, Metadata{
+	return provider.OpenMetadata(ctx, Metadata{
 		ObjectKey: metadata.ObjectKey,
 		SHA256:    metadata.SHA256,
 		SizeBytes: metadata.SizeBytes,
-	})
+	}, metadata.ManifestJSON)
+}
+
+func (provider *Provider) OpenMetadata(ctx context.Context, metadata Metadata, manifestJSON []byte) (ArtifactReader, error) {
+	if provider == nil || provider.cache == nil || len(manifestJSON) == 0 {
+		return nil, Invalid(fmt.Errorf("test bundle metadata is missing or invalid"))
+	}
+	path, err := provider.cache.Resolve(ctx, metadata)
 	if err != nil {
 		return nil, err
 	}
-	artifact, err := OpenArchive(path, metadata.ManifestJSON, provider.limits)
+	artifact, err := OpenArchive(path, manifestJSON, provider.limits)
 	if err != nil {
 		return nil, Invalid(err)
 	}

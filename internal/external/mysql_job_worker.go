@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,41 +12,79 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/CodeRushOJ/croj-judging-server/internal/bundle"
 )
 
 var infrastructureCodePattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
 
 func (repository *MySQLJobRepository) LoadClaimSource(ctx context.Context, claim WorkerJobClaim) ([]byte, error) {
+	input, err := repository.LoadClaimInput(ctx, claim)
+	if err != nil {
+		return nil, err
+	}
+	return input.SourceCode, nil
+}
+
+func (repository *MySQLJobRepository) LoadClaimInput(ctx context.Context, claim WorkerJobClaim) (WorkerExecutionInput, error) {
 	if repository == nil || !validWorkerClaim(claim) {
-		return nil, ErrInvalidJobState
+		return WorkerExecutionInput{}, ErrInvalidJobState
 	}
 	var tenantExternalID string
 	var source SourceObjectMetadata
 	var keyVersion uint64
+	var input WorkerExecutionInput
+	var bundleDigest []byte
+	var manifestJSON []byte
+	var encodedPolicy []byte
 	err := repository.database.QueryRowContext(ctx, `
 SELECT tenant.external_id, source.external_id, source.object_key, source.source_sha256,
-       source.source_size_bytes, source.encryption_key_version, source.encryption_nonce
+       source.source_size_bytes, source.encryption_key_version, source.encryption_nonce,
+       job.language_id, job.stop_on_failure, bundle.object_key, bundle.sha256,
+       bundle.size_bytes, bundle.manifest_json, tenant.policy_json
 FROM t_external_job AS job
 JOIN t_external_tenant AS tenant ON tenant.id = job.tenant_id
 JOIN t_external_source_object AS source
   ON source.id = job.source_object_id AND source.tenant_id = job.tenant_id
+JOIN t_external_bundle AS bundle
+  ON bundle.id = job.bundle_id AND bundle.tenant_id = job.tenant_id
 WHERE job.id = ? AND job.status = 'RUNNING' AND job.attempt_no = ? AND job.worker_id = ?
-  AND job.lease_token = ? AND job.lease_until > CURRENT_TIMESTAMP(3)`,
+  AND job.lease_token = ? AND job.lease_until > CURRENT_TIMESTAMP(3)
+  AND tenant.status = 'ACTIVE' AND bundle.publication_status = 'READY'
+  AND bundle.ready_at IS NOT NULL AND bundle.delete_marked_at IS NULL AND bundle.deleted_at IS NULL`,
 		claim.Job.InternalID, claim.AttemptNo, claim.WorkerID, claim.LeaseToken).
 		Scan(
 			&tenantExternalID, &source.ExternalID, &source.ObjectKey, &source.SHA256,
-			&source.SizeBytes, &keyVersion, &source.Nonce,
+			&source.SizeBytes, &keyVersion, &source.Nonce, &input.Language, &input.StopOnFailure,
+			&input.Bundle.ObjectKey, &bundleDigest, &input.Bundle.SizeBytes, &manifestJSON, &encodedPolicy,
 		)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrStaleJobClaim
+		return WorkerExecutionInput{}, ErrStaleJobClaim
 	}
 	if err != nil || keyVersion == 0 || keyVersion > 65535 {
-		return nil, repositoryUnavailable("load authoritative source metadata", err)
+		return WorkerExecutionInput{}, repositoryUnavailable("load authoritative execution metadata", err)
 	}
+	manifest, err := bundle.ParseManifest(manifestJSON)
+	if err != nil {
+		return WorkerExecutionInput{}, repositoryUnavailable("validate authoritative bundle manifest", err)
+	}
+	policy, err := decodeTenantPolicy(encodedPolicy)
+	if err != nil {
+		return WorkerExecutionInput{}, repositoryUnavailable("enforce authoritative bundle limits", err)
+	}
+	if manifest.Limits.TimeLimitMillis > policy.MaxTimeLimitMillis || manifest.Limits.MemoryLimitMiB > policy.MaxMemoryLimitMiB {
+		return WorkerExecutionInput{}, repositoryUnavailable("enforce authoritative bundle limits", ErrExternalJobInvalid)
+	}
+	if len(bundleDigest) != 32 {
+		return WorkerExecutionInput{}, repositoryUnavailable("validate authoritative bundle digest", ErrExternalJobUnavailable)
+	}
+	input.Bundle.SHA256 = hex.EncodeToString(bundleDigest)
+	input.Bundle.ManifestJSON = append([]byte(nil), manifestJSON...)
+	input.Bundle.Manifest = manifest
 	source.KeyVersion = uint16(keyVersion)
 	ciphertext, err := repository.sourceObjects.Get(ctx, source.ObjectKey, source.SizeBytes+sourceCiphertextOverheadBytes)
 	if err != nil {
-		return nil, fmt.Errorf("%w: encrypted source object is unavailable", ErrSourceEncryption)
+		return WorkerExecutionInput{}, fmt.Errorf("%w: encrypted source object is unavailable", ErrSourceEncryption)
 	}
 	encrypted := EncryptedSource{
 		Ciphertext: ciphertext,
@@ -61,9 +100,10 @@ WHERE job.id = ? AND job.status = 'RUNNING' AND job.attempt_no = ? AND job.worke
 	)
 	clear(ciphertext)
 	if err != nil {
-		return nil, fmt.Errorf("%w: encrypted source authentication failed", ErrSourceEncryption)
+		return WorkerExecutionInput{}, fmt.Errorf("%w: encrypted source authentication failed", ErrSourceEncryption)
 	}
-	return plaintext, nil
+	input.SourceCode = plaintext
+	return input, nil
 }
 
 func (repository *MySQLJobRepository) ClaimNext(
@@ -321,6 +361,26 @@ WHERE job_id = ? AND attempt_no = ? AND worker_id = ? AND lease_token = ? AND st
 		return repositoryUnavailable("commit heartbeat", err)
 	}
 	return nil
+}
+
+func (repository *MySQLJobRepository) ClaimCancelled(ctx context.Context, claim WorkerJobClaim) (bool, error) {
+	if repository == nil || !validWorkerClaim(claim) {
+		return false, ErrStaleJobClaim
+	}
+	var cancelled bool
+	err := repository.database.QueryRowContext(ctx, `
+SELECT cancel_requested_at IS NOT NULL
+FROM t_external_job
+WHERE id = ? AND status = 'RUNNING' AND attempt_no = ? AND worker_id = ?
+  AND lease_token = ? AND lease_until > CURRENT_TIMESTAMP(3)`,
+		claim.Job.InternalID, claim.AttemptNo, claim.WorkerID, claim.LeaseToken).Scan(&cancelled)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, ErrStaleJobClaim
+	}
+	if err != nil {
+		return false, repositoryUnavailable("read active claim control", err)
+	}
+	return cancelled, nil
 }
 
 func (repository *MySQLJobRepository) Complete(

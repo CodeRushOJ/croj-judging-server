@@ -124,6 +124,22 @@ func TestSchedulerUsesDeterministicRoundRobin(t *testing.T) {
 	}
 }
 
+func TestTargetSelectorReturnsConfiguredGRPCTarget(t *testing.T) {
+	selector, err := NewTarget("dns:///sandbox-workers.coderushoj.svc.cluster.local:50051")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		target, err := selector.SelectSandbox()
+		if err != nil || target != "dns:///sandbox-workers.coderushoj.svc.cluster.local:50051" {
+			t.Fatalf("target=%q error=%v", target, err)
+		}
+	}
+	if _, err := NewTarget("croj-sandbox:50051"); err == nil {
+		t.Fatal("plain ClusterIP-style target must not be accepted as client-side endpoint balancing")
+	}
+}
+
 func TestRefreshKeepsLastKnownGoodEndpointsOnDiscoveryFailure(t *testing.T) {
 	provider := &fakeDiscovery{endpoints: []string{"sandbox-a:8080"}}
 	scheduler := New(provider)

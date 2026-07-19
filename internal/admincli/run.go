@@ -44,6 +44,8 @@ func createTenant(ctx context.Context, arguments []string, provisioner Provision
 	flags.IntVar(&policy.MaxRetainedBundles, "max-bundles", 200, "maximum retained bundles")
 	flags.Int64Var(&policy.DailyExecutionMillis, "daily-execution-ms", 3_600_000, "daily execution budget")
 	flags.IntVar(&policy.MaxInfrastructureTries, "max-infra-tries", 3, "maximum infrastructure attempts")
+	flags.IntVar(&policy.MaxTimeLimitMillis, "max-time-limit-ms", 10_000, "maximum per-bundle time limit in milliseconds")
+	flags.IntVar(&policy.MaxMemoryLimitMiB, "max-memory-limit-mib", 1024, "maximum per-bundle memory limit in MiB")
 	if err := flags.Parse(arguments); err != nil {
 		return fmt.Errorf("parse tenant flags: %w", err)
 	}

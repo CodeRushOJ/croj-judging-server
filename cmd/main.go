@@ -43,17 +43,38 @@ func main() {
 	if err != nil {
 		log.Fatalf("Invalid sandbox discovery refresh interval: %v", err)
 	}
-	discoveryClient, err := discovery.NewKubernetesDiscovery(
-		cfg.SandboxDiscovery.Namespace,
-		cfg.SandboxDiscovery.Service,
-		cfg.SandboxDiscovery.PortName,
-		cfg.SandboxDiscovery.Kubeconfig,
-	)
-	if err != nil {
-		log.Fatalf("Failed to initialize Kubernetes sandbox discovery: %v", err)
+	var sandboxSelector service.SandboxSelector
+	var legacyScheduler *scheduler.Scheduler
+	var sandboxReadinessProbe func(context.Context) error
+	if cfg.SandboxDiscovery.Target != "" {
+		targetSelector, err := scheduler.NewTarget(cfg.SandboxDiscovery.Target)
+		if err != nil {
+			log.Fatalf("Invalid sandbox gRPC target: %v", err)
+		}
+		sandboxSelector = targetSelector
+		sandboxReadinessProbe = sandboxDNSProbe(cfg.SandboxDiscovery.Target)
+		fmt.Println("gRPC DNS round_robin sandbox target initialized.")
+	} else {
+		if !cfg.SandboxDiscovery.AllowLegacyEndpointSlice {
+			log.Fatal("SANDBOX_GRPC_TARGET is required; set SANDBOX_ALLOW_LEGACY_ENDPOINT_SLICE=true only for the deprecated fallback")
+		}
+		log.Printf("DEPRECATED: direct EndpointSlice scheduling is enabled explicitly; configure SANDBOX_GRPC_TARGET for a headless Service")
+		discoveryClient, err := discovery.NewKubernetesDiscovery(
+			cfg.SandboxDiscovery.Namespace,
+			cfg.SandboxDiscovery.Service,
+			cfg.SandboxDiscovery.PortName,
+			cfg.SandboxDiscovery.Kubeconfig,
+		)
+		if err != nil {
+			log.Fatalf("Failed to initialize legacy Kubernetes sandbox discovery: %v", err)
+		}
+		legacyScheduler = scheduler.New(discoveryClient)
+		sandboxSelector = legacyScheduler
+		sandboxReadinessProbe = func(context.Context) error {
+			_, err := legacyScheduler.SelectSandbox()
+			return err
+		}
 	}
-	sandboxScheduler := scheduler.New(discoveryClient)
-	fmt.Println("Scheduler initialized.")
 
 	executeTimeout, err := time.ParseDuration(cfg.SandboxDiscovery.ExecuteTimeout)
 	if err != nil || executeTimeout <= 0 {
@@ -110,10 +131,23 @@ func main() {
 	}
 	bundleProvider := bundle.NewProvider(bundleCache, archiveLimits)
 	bundlePipeline := service.NewBatchBundlePipeline(
-		sandboxScheduler,
+		sandboxSelector,
 		sandboxClient,
 		cfg.TestBundles.MaxInfraAttempts,
 	)
+	sqlDatabase, err := db.DB.DB()
+	if err != nil {
+		log.Fatalf("Failed to access SQL database: %v", err)
+	}
+	external, err := newExternalRuntime(cfg, sqlDatabase, bundleProvider, bundlePipeline, archiveLimits, sandboxReadinessProbe)
+	if err != nil {
+		log.Fatalf("Failed to initialize external runtime: %v", err)
+	}
+	defer func() {
+		if err := external.Close(); err != nil {
+			log.Printf("Failed to close external runtime: %v", err)
+		}
+	}()
 	executionPipeline := service.NewHiddenTestExecutor(bundleProvider, bundlePipeline)
 	callbackTimeout, err := time.ParseDuration(cfg.JudgeResult.CallbackTimeout)
 	if err != nil || callbackTimeout <= 0 {
@@ -145,7 +179,18 @@ func main() {
 	// 使用 context 来管理 consumer 的生命周期
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go sandboxScheduler.Run(ctx, refreshInterval)
+	if legacyScheduler != nil {
+		go legacyScheduler.Run(ctx, refreshInterval)
+	}
+	if cfg.ExternalAPI.Enabled {
+		go func() {
+			fmt.Printf("Starting external REST API on %s...\n", cfg.ExternalAPI.ListenAddress)
+			if err := external.runtime.Run(ctx); err != nil {
+				log.Printf("External runtime error: %v", err)
+				cancel()
+			}
+		}()
+	}
 
 	go func() {
 		fmt.Println("Starting RocketMQ consumer...")

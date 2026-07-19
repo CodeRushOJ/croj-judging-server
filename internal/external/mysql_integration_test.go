@@ -212,7 +212,7 @@ func TestDurableFencingMigrationRecoversLegacyRunningRows(t *testing.T) {
 	if err := connection.Close(); err != nil {
 		t.Fatal(err)
 	}
-	policy := `{"maxQueuedJobs":4,"maxRunningJobs":1,"maxSourceBytes":1024,"maxRetainedBundles":4,"dailyExecutionMillis":1000,"maxInfrastructureTries":3}`
+	policy := `{"maxQueuedJobs":4,"maxRunningJobs":1,"maxSourceBytes":1024,"maxRetainedBundles":4,"dailyExecutionMillis":1000,"maxInfrastructureTries":3,"maxTimeLimitMillis":10000,"maxMemoryLimitMiB":1024}`
 	tenantResult, err := database.ExecContext(ctx, `
 INSERT INTO t_external_tenant(external_id, name, status, policy_json)
 VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaa', 'legacy tenant', 'ACTIVE', ?)`, policy)

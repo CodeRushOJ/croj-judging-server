@@ -13,6 +13,8 @@ import (
 	sandboxpb "github.com/CodeRushOJ/croj-judging-server/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	grpcresolver "google.golang.org/grpc/resolver"
+	"google.golang.org/grpc/resolver/manual"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 )
@@ -57,6 +59,54 @@ func TestClientCollectsCompleteBatchStream(t *testing.T) {
 	}
 	if len(events) != 3 || events[0].CaseId != "case-1" || events[1].CaseId != "case-2" || events[2].Kind != sandboxpb.ExecuteBatchV1Event_COMPLETED {
 		t.Fatalf("events = %+v", events)
+	}
+}
+
+func TestClientUsesGRPCRoundRobinAcrossResolvedHeadlessServiceEndpoints(t *testing.T) {
+	addresses := make([]string, 0, 2)
+	stops := make([]func(), 0, 2)
+	for _, identity := range []string{"sandbox-a", "sandbox-b"} {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		server := grpc.NewServer()
+		sandboxpb.RegisterSandboxServiceServer(server, &sandboxTestServer{
+			execute: func(context.Context, *sandboxpb.ExecuteRequest) (*sandboxpb.ExecuteResponse, error) {
+				return nil, status.Error(codes.Unimplemented, "unary not configured")
+			},
+			executeBatch: func(request *sandboxpb.ExecuteBatchV1Request, stream grpc.ServerStreamingServer[sandboxpb.ExecuteBatchV1Event]) error {
+				if err := stream.Send(&sandboxpb.ExecuteBatchV1Event{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT, CaseId: request.Cases[0].CaseId, Result: &sandboxpb.ExecuteResponse{Status: "Accepted", Stdout: identity}}); err != nil {
+					return err
+				}
+				return stream.Send(&sandboxpb.ExecuteBatchV1Event{Kind: sandboxpb.ExecuteBatchV1Event_COMPLETED})
+			},
+		})
+		go func() { _ = server.Serve(listener) }()
+		addresses = append(addresses, listener.Addr().String())
+		stops = append(stops, func() { server.Stop(); _ = listener.Close() })
+	}
+	defer func() {
+		for _, stop := range stops {
+			stop()
+		}
+	}()
+
+	resolver := manual.NewBuilderWithScheme("headless-test")
+	resolver.InitialState(grpcresolver.State{Addresses: []grpcresolver.Address{{Addr: addresses[0]}, {Addr: addresses[1]}}})
+	client := NewClientWithCache(time.Second, 4, time.Minute, grpc.WithResolvers(resolver))
+	defer client.Close()
+	seen := map[string]int{}
+	for attempt := 0; attempt < 100 && len(seen) < 2; attempt++ {
+		events, err := client.ExecuteBatch(context.Background(), "headless-test:///sandbox-workers", &sandboxpb.ExecuteBatchV1Request{Cases: []*sandboxpb.ExecuteBatchV1Case{{CaseId: "case-1"}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		seen[events[0].Result.Stdout]++
+		time.Sleep(10 * time.Millisecond)
+	}
+	if seen["sandbox-a"] == 0 || seen["sandbox-b"] == 0 {
+		t.Fatalf("round_robin selections = %v", seen)
 	}
 }
 

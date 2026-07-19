@@ -60,6 +60,8 @@ type BundleCommitInput struct {
 	ObjectKey            string
 	StagingObjectKey     string
 	ManifestJSON         []byte
+	TimeLimitMillis      int
+	MemoryLimitMiB       int
 	Metadata             BundleMetadata
 	IdempotencyExpiresAt time.Time
 }
@@ -99,6 +101,8 @@ type BundleServiceConfig struct {
 	TempDir             string
 	MaxUploadBytes      int64
 	ArchiveLimits       bundle.ArchiveLimits
+	MaxTimeLimitMillis  int
+	MaxMemoryLimitMiB   int
 	IdempotencyTTL      time.Duration
 	IdempotencyPepper   []byte
 	PublicationLease    time.Duration
@@ -119,7 +123,7 @@ func NewBundleService(repository BundleRepository, store BundleObjectStore, conf
 	if repository == nil || store == nil {
 		return nil, fmt.Errorf("bundle repository and object store are required")
 	}
-	if config.MaxUploadBytes <= 0 || config.IdempotencyTTL <= 0 {
+	if config.MaxUploadBytes <= 0 || config.IdempotencyTTL <= 0 || config.MaxTimeLimitMillis <= 0 || config.MaxMemoryLimitMiB <= 0 {
 		return nil, fmt.Errorf("bundle upload and idempotency limits must be positive")
 	}
 	if len(config.IdempotencyPepper) < sha256.Size {
@@ -209,6 +213,9 @@ func (service *BundleService) UploadWithAdmission(ctx context.Context, tenantID,
 	if len(manifest.Cases) > maxExternalBundleCasesV1 {
 		return BundleMetadata{}, false, fmt.Errorf("%w: manifest exceeds %d cases", ErrInvalidBundle, maxExternalBundleCasesV1)
 	}
+	if manifest.Limits.TimeLimitMillis > service.config.MaxTimeLimitMillis || manifest.Limits.MemoryLimitMiB > service.config.MaxMemoryLimitMiB {
+		return BundleMetadata{}, false, fmt.Errorf("%w: execution limits exceed platform maximum", ErrInvalidBundle)
+	}
 	lookup, err := service.repository.FindBundleUpload(ctx, tenantID, idempotencyDigest)
 	if err != nil {
 		return BundleMetadata{}, false, fmt.Errorf("find bundle upload idempotency: %w", err)
@@ -247,11 +254,12 @@ func (service *BundleService) UploadWithAdmission(ctx context.Context, tenantID,
 	result, err := service.repository.CommitBundleUpload(ctx, BundleCommitInput{
 		TenantID: tenantID, IdempotencyDigest: idempotencyDigest, RequestHash: requestHash,
 		ObjectKey: objectKey, StagingObjectKey: stagingKey, ManifestJSON: manifestJSON,
+		TimeLimitMillis: manifest.Limits.TimeLimitMillis, MemoryLimitMiB: manifest.Limits.MemoryLimitMiB,
 		Metadata:             BundleMetadata{BundleID: bundleID, SHA256: digestHex, SizeBytes: written, CaseCount: len(manifest.Cases), ManifestVersion: manifest.SchemaVersion, CreatedAt: now},
 		IdempotencyExpiresAt: now.Add(service.config.IdempotencyTTL),
 	})
 	if err != nil {
-		if errors.Is(err, ErrIdempotencyConflict) || errors.Is(err, ErrBundleNotFound) {
+		if errors.Is(err, ErrIdempotencyConflict) || errors.Is(err, ErrBundleNotFound) || errors.Is(err, ErrInvalidBundle) {
 			_ = service.store.Discard(context.Background(), stagingKey)
 		}
 		return BundleMetadata{}, false, err

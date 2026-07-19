@@ -1,0 +1,240 @@
+package worker
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math"
+	"time"
+
+	"github.com/CodeRushOJ/croj-judging-server/internal/bundle"
+	"github.com/CodeRushOJ/croj-judging-server/internal/callback"
+	"github.com/CodeRushOJ/croj-judging-server/internal/external"
+	"github.com/CodeRushOJ/croj-judging-server/internal/service"
+)
+
+var errCancellationRequested = errors.New("durable job cancellation requested")
+
+type Repository interface {
+	LoadClaimInput(context.Context, external.WorkerJobClaim) (external.WorkerExecutionInput, error)
+	Heartbeat(context.Context, external.WorkerJobClaim, time.Duration) error
+	ClaimCancelled(context.Context, external.WorkerJobClaim) (bool, error)
+	Complete(context.Context, external.WorkerJobClaim, external.DurableJobResult) error
+	FailInfrastructure(context.Context, external.WorkerJobClaim, external.InfrastructureFailure) (external.FailureDisposition, error)
+}
+
+type ClaimRepository interface {
+	Repository
+	ClaimNext(context.Context, string, time.Duration) (external.WorkerJobClaim, error)
+}
+
+type ArtifactProvider interface {
+	OpenMetadata(context.Context, bundle.Metadata, []byte) (bundle.ArtifactReader, error)
+}
+
+type CanonicalCore interface {
+	ExecuteCanonical(context.Context, service.CanonicalExecutionRequest, service.CaseArtifact) (service.CanonicalResult, error)
+}
+
+type Config struct {
+	LeaseDuration       time.Duration
+	HeartbeatInterval   time.Duration
+	ControlPollInterval time.Duration
+	RetryDelay          time.Duration
+}
+
+type Runner struct {
+	repository Repository
+	provider   ArtifactProvider
+	core       CanonicalCore
+	config     Config
+}
+
+func NewRunner(repository Repository, provider ArtifactProvider, core CanonicalCore, config Config) (*Runner, error) {
+	if repository == nil || provider == nil || core == nil || config.LeaseDuration <= 0 || config.LeaseDuration > 15*time.Minute ||
+		config.HeartbeatInterval <= 0 || config.HeartbeatInterval >= config.LeaseDuration ||
+		config.ControlPollInterval <= 0 || config.ControlPollInterval >= config.LeaseDuration ||
+		config.RetryDelay < 0 || config.RetryDelay > time.Hour {
+		return nil, fmt.Errorf("durable worker configuration is invalid")
+	}
+	return &Runner{repository: repository, provider: provider, core: core, config: config}, nil
+}
+
+func (runner *Runner) ExecuteClaim(ctx context.Context, claim external.WorkerJobClaim) error {
+	input, err := runner.repository.LoadClaimInput(ctx, claim)
+	if err != nil {
+		if errors.Is(err, external.ErrStaleJobClaim) {
+			return nil
+		}
+		return runner.failInfrastructure(ctx, claim, "LOAD_EXECUTION_INPUT_FAILED")
+	}
+	defer clear(input.SourceCode)
+	artifact, err := runner.provider.OpenMetadata(ctx, bundle.Metadata{
+		ObjectKey: input.Bundle.ObjectKey, SHA256: input.Bundle.SHA256, SizeBytes: input.Bundle.SizeBytes,
+	}, input.Bundle.ManifestJSON)
+	if err != nil {
+		if bundle.IsInvalid(err) {
+			return runner.complete(ctx, claim, service.CanonicalResult{Status: callback.StatusSystemError})
+		}
+		return runner.failInfrastructure(ctx, claim, "LOAD_BUNDLE_FAILED")
+	}
+	defer artifact.Close()
+
+	executionContext, cancel := context.WithCancel(ctx)
+	controlDone := make(chan struct{})
+	controlResult := make(chan error, 1)
+	go runner.monitorClaim(executionContext, cancel, claim, controlDone, controlResult)
+	result, executionErr := runner.core.ExecuteCanonical(executionContext, service.CanonicalExecutionRequest{
+		Language: input.Language, SourceCode: string(input.SourceCode), StopOnFailure: input.StopOnFailure,
+	}, artifact)
+	close(controlDone)
+	controlErr := <-controlResult
+	cancel()
+
+	if errors.Is(controlErr, errCancellationRequested) {
+		return runner.complete(ctx, claim, service.CanonicalResult{Status: callback.StatusSystemError})
+	}
+	if controlErr != nil {
+		if errors.Is(controlErr, external.ErrStaleJobClaim) {
+			return nil
+		}
+		return runner.failInfrastructure(ctx, claim, "LEASE_CONTROL_FAILED")
+	}
+	if executionErr != nil {
+		if errors.Is(executionErr, context.Canceled) && ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return runner.failInfrastructure(ctx, claim, "SANDBOX_EXECUTION_FAILED")
+	}
+	return runner.complete(ctx, claim, result)
+}
+
+func (runner *Runner) Run(ctx context.Context, workerID string, idleBackoff time.Duration) error {
+	repository, ok := runner.repository.(ClaimRepository)
+	if !ok || workerID == "" || idleBackoff <= 0 || idleBackoff > time.Minute {
+		return fmt.Errorf("durable worker claim loop is invalid")
+	}
+	for {
+		claim, err := repository.ClaimNext(ctx, workerID, runner.config.LeaseDuration)
+		if errors.Is(err, external.ErrJobNotClaimable) {
+			timer := time.NewTimer(idleBackoff)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return ctx.Err()
+			case <-timer.C:
+				continue
+			}
+		}
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("claim durable judge job: %w", err)
+		}
+		if err := runner.ExecuteClaim(ctx, claim); err != nil {
+			return err
+		}
+	}
+}
+
+func (runner *Runner) monitorClaim(ctx context.Context, cancel context.CancelFunc, claim external.WorkerJobClaim, done <-chan struct{}, result chan<- error) {
+	heartbeat := time.NewTicker(runner.config.HeartbeatInterval)
+	control := time.NewTicker(runner.config.ControlPollInterval)
+	defer heartbeat.Stop()
+	defer control.Stop()
+	checkCancellation := func() error {
+		cancelled, err := runner.repository.ClaimCancelled(ctx, claim)
+		if err != nil {
+			return err
+		}
+		if cancelled {
+			cancel()
+			return errCancellationRequested
+		}
+		return nil
+	}
+	if err := checkCancellation(); err != nil {
+		result <- err
+		return
+	}
+	for {
+		select {
+		case <-done:
+			result <- nil
+			return
+		case <-ctx.Done():
+			result <- ctx.Err()
+			return
+		case <-heartbeat.C:
+			if err := runner.repository.Heartbeat(ctx, claim, runner.config.LeaseDuration); err != nil {
+				cancel()
+				result <- err
+				return
+			}
+		case <-control.C:
+			if err := checkCancellation(); err != nil {
+				result <- err
+				return
+			}
+		}
+	}
+}
+
+func (runner *Runner) complete(ctx context.Context, claim external.WorkerJobClaim, result service.CanonicalResult) error {
+	durable, err := durableResult(result)
+	if err != nil {
+		return runner.failInfrastructure(ctx, claim, "INVALID_EXECUTION_RESULT")
+	}
+	err = runner.repository.Complete(ctx, claim, durable)
+	if errors.Is(err, external.ErrStaleJobClaim) {
+		return nil
+	}
+	return err
+}
+
+func (runner *Runner) failInfrastructure(ctx context.Context, claim external.WorkerJobClaim, code string) error {
+	_, err := runner.repository.FailInfrastructure(ctx, claim, external.InfrastructureFailure{Code: code, RetryDelay: runner.config.RetryDelay})
+	if errors.Is(err, external.ErrStaleJobClaim) {
+		return nil
+	}
+	return err
+}
+
+func durableResult(result service.CanonicalResult) (external.DurableJobResult, error) {
+	if !durableVerdict(result.Status) || result.TimeUsedMillis < 0 || result.MemoryUsedKB < 0 || int64(result.MemoryUsedKB) > math.MaxInt64/1024 {
+		return external.DurableJobResult{}, fmt.Errorf("canonical execution result is invalid")
+	}
+	compileStatus := "SUCCEEDED"
+	if result.Status == callback.StatusCompileError {
+		compileStatus = "FAILED"
+	}
+	durable := external.DurableJobResult{
+		Verdict: string(result.Status), CompileStatus: compileStatus,
+		TimeMillis: int64(result.TimeUsedMillis), MemoryBytes: int64(result.MemoryUsedKB) * 1024,
+		Cases: make([]external.DurableCaseResult, 0, len(result.Cases)),
+	}
+	for _, item := range result.Cases {
+		if item.CaseID == "" || !durableVerdict(item.Status) || item.TimeUsedMillis < 0 || item.MemoryUsedKB < 0 || int64(item.MemoryUsedKB) > math.MaxInt64/1024 {
+			return external.DurableJobResult{}, fmt.Errorf("canonical case result is invalid")
+		}
+		durable.Cases = append(durable.Cases, external.DurableCaseResult{
+			CaseID: item.CaseID, Verdict: string(item.Status),
+			TimeMillis: int64(item.TimeUsedMillis), MemoryBytes: int64(item.MemoryUsedKB) * 1024,
+		})
+	}
+	return durable, nil
+}
+
+func durableVerdict(status callback.Status) bool {
+	switch status {
+	case callback.StatusAccepted, callback.StatusWrongAnswer, callback.StatusCompileError,
+		callback.StatusTimeLimitExceeded, callback.StatusMemoryLimitExceeded,
+		callback.StatusRuntimeError, callback.StatusSystemError:
+		return true
+	default:
+		return false
+	}
+}
