@@ -4,7 +4,7 @@ Go 判题编排服务，负责消费 `submission-topic`、读取提交快照、�
 
 > 当前状态：Kubernetes EndpointSlice 发现、版本化消息、认证幂等结果回调和不可变 ACM 隐藏测试包链路已经接通。上线 exact checker 前必须先合入 [`croj-sandbox#10`](https://github.com/CodeRushOJ/croj-sandbox/issues/10) 的日志脱敏修复，否则旧 sandbox 会把 WA 的 expected/actual 写入 Pod 日志。
 
-面向外部 OJ 的版本化异步 REST 适配器正在 Draft PR #17 中实施。已有切片包括 RFC 9457 错误、请求 ID、不透明 API Key 的 peppered HMAC 验证与 scope、`GET /api/v1/capabilities`、Judge 自有 MySQL 迁移、租户/密钥预置、不可变 hidden bundle 上传/元数据端点，以及 `POST /api/v1/judge-jobs`、任务列表/详情/取消的脱敏 HTTP 合约和 lease/attempt 状态机。Webhook 已具备精确载荷 HMAC 签名、禁止重定向、状态重试矩阵及 DNS rebinding/私网 SSRF 防护；Redis 原子令牌桶使用服务端时间，在多副本间统一限制任务提交和 bundle 实际上传字节，配额不可用时新写入 fail closed 为 `503`，读取继续可用。在 MySQL job/outbox repository、worker 和 E2E 门禁完成前，该 HTTP 端口不标记为可发布。
+面向外部 OJ 的版本化异步 REST 适配器正在 Draft PR #17 中实施。已有切片包括 RFC 9457 错误、请求 ID、不透明 API Key 的 peppered HMAC 验证与 scope、`GET /api/v1/capabilities`、Judge 自有 MySQL 迁移、租户/密钥预置、不可变 hidden bundle 上传/元数据端点，以及 `POST /api/v1/judge-jobs`、任务列表/详情/取消的脱敏 HTTP 合约和 lease/attempt 状态机。Webhook 已具备精确载荷 HMAC 签名、禁止重定向、状态重试矩阵及 DNS rebinding/私网 SSRF 防护；Redis 原子令牌桶使用服务端时间，在多副本间统一限制任务提交和 bundle 实际上传字节，配额不可用时新写入 fail closed 为 `503`，读取继续可用。MySQL job/outbox repository、delivery worker 和 E2E 门禁已经完成，但在 production runtime/key ring wiring 完成前，该 HTTP 端口仍不标记为可发布。
 
 ## 架构
 
@@ -149,6 +149,72 @@ go run ./cmd/judge-admin api-key create \
 
 在 Kubernetes 中，DSN 和 pepper 必须来自 Secret；上面的 `export` 只是本机演示。建立租户时会执行 Judge 自有 schema 迁移，通过 MySQL advisory lock 串行化并验证已发布迁移的 SHA-256；不会修改 Backend 的 Flyway history。
 
+### 外部 OJ durable webhook
+
+Callback 只能由运维 CLI 创建，没有公开的 callback 管理 API。URL 必须是公网 DNS 名称的绝对 HTTPS URL；创建时和每次连接时都会拒绝私网、loopback、link-local、文档地址、metadata 类地址以及混合公私网 DNS 结果，且投递不跟随重定向。
+
+```bash
+export JUDGE_DATABASE_DSN='judge_admin:...@tcp(127.0.0.1:3306)/coderushoj_judge?parseTime=true&loc=UTC&charset=utf8mb4'
+export JUDGE_CALLBACK_KEY_VERSION='1'
+# 文件必须只允许当前用户读取，内容形如 {"1":"<base64-encoded-32-byte-AES-key>"}
+export JUDGE_CALLBACK_KEYS_JSON="$(< /path/to/root-only/judge-callback-keys.json)"
+
+go run ./cmd/judge-admin callback create \
+  --tenant '<26-character-tenant-id>' \
+  --url 'https://oj.example.com/webhooks/coderushoj'
+```
+
+命令只显示一次 `callbackId` 和 `croj_whsec_...` secret；应立即写入接收方的 Secret 管理系统，不要进入 Git、Issue、日志或 shell history。MySQL 只保存 AES-256-GCM 密文、12-byte nonce 和 key version，AAD 绑定 tenant、callback、key version 以及完整规范 URL（scheme/host/effective port/path/query）。轮换采用 add-before-switch：先部署同时包含新旧版本的 key ring，再切换 active version；确认没有行引用旧版本后才能移除旧 key。schema v4 会自动禁用缺 nonce 或密文元数据不完整的旧 callback，必须重新创建，绝不会伪造 secret。
+
+任务进入 `SUCCEEDED`、`FAILED` 或 `CANCELLED` 时，job 终态与唯一 outbox event 在同一个 InnoDB 事务提交。`WebhookWorker` 组件使用 MySQL 时钟、`FOR UPDATE SKIP LOCKED`、attempt 和 256-bit lease token 多副本领取；HTTP 请求发生在事务外。远端已接受但 settlement 未提交时，同一 `eventId` 和完全相同的 body 会在 lease 过期后再次投递，因此接收方必须按 `eventId` 持久去重。当前 Task 9 提交尚未把该组件接入 `cmd/main.go` 的生产 lifecycle，也未在 runtime 读取 callback key ring；完成 runtime wiring 前不要把 callback delivery 视为已启用，事件会安全保留为 `PENDING`。
+
+```mermaid
+flowchart LR
+    Job["Terminal job transaction"] --> Outbox["MySQL immutable outbox"]
+    Outbox --> Claim["Fenced lease claim"]
+    Claim --> HTTPS["HTTPS + DNS revalidation + HMAC v1"]
+    HTTPS --> Receiver["External OJ receiver"]
+    Receiver -->|"2xx"| Delivered["DELIVERED audit"]
+    Receiver -->|"408 / 425 / 429 / 5xx / network"| Retry["PENDING with backoff"]
+    Receiver -->|"3xx / other 4xx / unsafe"| Dead["DEAD audit"]
+    Retry --> Claim
+```
+
+请求头：
+
+- `X-CodeRushOJ-Event-Id`: body 中的稳定 `eventId`；
+- `X-CodeRushOJ-Timestamp`: 签名时的 UTC Unix 秒；
+- `X-CodeRushOJ-Signature`: `v1=<lowercase-hex-HMAC-SHA256>`。
+
+HMAC 的精确输入是 `v1\n<eventId字节长度>\n<eventId>\n<timestamp>\n` 后直接拼接原始 body bytes。接收方必须用保存的 callback-specific secret 重新计算 HMAC、constant-time 比较、校验时间窗口，再按 `eventId` 幂等处理；不要重新序列化 JSON 后验签。
+
+body 的 `schemaVersion` 为 `1`，事件类型为 `judge.job.completed`、`judge.job.failed` 或 `judge.job.cancelled`。通用字段是 `eventId`、`eventType`、`occurredAt`、`tenantId`、`jobId`、必填 `status` 和可选 `clientReference`；成功事件包含脱敏 `result`，失败事件只包含稳定 `failureCode`，取消事件不包含两者。源码、hidden case、对象 key、worker/lease 和 callback secret 永不进入 body。
+
+所有 `2xx` 成功；`408`、`425`、`429`、`5xx` 和网络故障重试；`1xx` 终态响应按 `invalid_delivery` 处理，`3xx`、其余 `4xx`、SSRF/authority 拒绝及解密失败进入 `DEAD`。指数退避使用 `[0.5,1.5]` jitter，`Retry-After` 与最终延迟均硬限制为 15 分钟；默认最多 12 次、投递窗口 24 小时（最大可配置 7 天）。`DELIVERED`/`DEAD` 默认保留 30 天用于审计和去重，清理器不会删除 `PENDING`/`DELIVERING`。
+
+CI 使用按 digest 固定的 MySQL 8.4.10 service 执行真实 race 合约测试。下面的脚本只静态验证 workflow 中的镜像、DSN、超时和 focused selector 位于同一个 job/step，并运行防误报 mutation test；它不会启动数据库：
+
+```bash
+scripts/ci/test-webhook-mysql84-contract.sh
+scripts/ci/test-webhook-mysql84-contract-self-test.sh
+```
+
+本机可直接启动带健康检查和独立端口的一次性 MySQL，再运行同一 selector（需要本机 Go 1.26.3）：
+
+```bash
+docker run -d --name croj-webhook-mysql84 -p 33061:3306 \
+  --health-cmd='mysqladmin ping -h 127.0.0.1 -uroot --silent' \
+  --health-interval=2s --health-timeout=5s --health-retries=30 \
+  -e MYSQL_ALLOW_EMPTY_PASSWORD=yes -e MYSQL_DATABASE=croj_webhook_test mysql:8.4.10
+until [ "$(docker inspect -f '{{.State.Health.Status}}' croj-webhook-mysql84)" = healthy ]; do sleep 2; done
+export JUDGE_TEST_MYSQL_DSN='root:@tcp(127.0.0.1:33061)/croj_webhook_test?parseTime=true&loc=UTC&charset=utf8mb4'
+go test -race -count=1 -timeout=10m ./internal/external -run '^TestMySQLWebhook'
+docker rm -f croj-webhook-mysql84
+unset JUDGE_TEST_MYSQL_DSN
+```
+
+不要把生产数据库 DSN 用于集成测试；测试中断时也应执行 `docker rm -f croj-webhook-mysql84` 清理容器。
+
 ### 外部不可变题包上传
 
 `POST /api/v1/bundles` 只接受一个名为 `bundle` 的 multipart 文件和 16–128 字节可见 ASCII `Idempotency-Key`。HTTP 外层和 Service 内层分别执行请求体/文件体积上限；文件流式写入专用临时文件并同步计算 SHA-256，取消、超限或校验失败都会清理临时文件。安全校验与内部 immutable bundle 共用同一条 ZIP 路径，覆盖路径穿越、link/非普通文件、加密/未知压缩、文件数、单文件/总解压量、压缩比、manifest 严格 schema、case 成对和 256 case 协议上限；每个 case 文件还会流式读取以核对 CRC、声明大小和 UTF-8，损坏内容不会发布。
@@ -165,7 +231,7 @@ HTTP 层先用可信 `Content-Length` 对 multipart 总上限做无读取早拒�
 
 ### 异步任务持久化与 worker 恢复
 
-Judge 自有 schema v3 为 job 和 attempt 增加 256-bit lease token，并把 attempt 通过 `(job_id, tenant_id)` 复合外键绑定到租户。`MySQLJobRepository` 在同一个 InnoDB admission 事务中锁定租户策略、校验 READY 且租户自有的 bundle/callback、确认 queued quota、写入 peppered-HMAC 幂等记录以及加密源码元数据。同键同 canonical hash 返回原 job；同键不同请求返回 `409`。只有确认是新 job 后才调用一次 Redis admission，并发同键只扣一次；同 hash replay 即使 Redis 暂时不可用仍返回原 job。已确认的队列配额耗尽返回 `429`，策略或数据库状态无法确认时返回 `503`，不会开放式接收新任务。
+Judge 自有 schema v4 为 job/attempt 增加 256-bit lease token，并把 attempt 通过 `(job_id, tenant_id)` 复合外键绑定到租户，同时升级 durable webhook outbox。`MySQLJobRepository` 在同一个 InnoDB admission 事务中锁定租户策略、校验 READY 且租户自有的 bundle/callback、确认 queued quota、写入 peppered-HMAC 幂等记录以及加密源码元数据。同键同 canonical hash 返回原 job；同键不同请求返回 `409`。只有确认是新 job 后才调用一次 Redis admission，并发同键只扣一次；同 hash replay 即使 Redis 暂时不可用仍返回原 job。已确认的队列配额耗尽返回 `429`，策略或数据库状态无法确认时返回 `503`，不会开放式接收新任务。
 
 源码先使用 AES-256-GCM 加密，tenant ID、source ID 和 key version 作为 AAD；MySQL 仅保存 digest、长度、nonce、key version 和不可公开的对象引用。明文策略上限为 `64 MiB - 16 bytes`，为 GCM tag 预留空间并与对象传输硬上限一致。对象读写由 `SourceObjectStore` 抽象提供；MinIO/S3 实现以 `If-None-Match: *` 原子创建，拒绝随机 ID 碰撞覆盖，并按数据库密文长度有界读取。每次上传前先提交带 owner token/lease 的 durable reservation，admission 事务会锁住它并在发布 metadata/job 时原子删除；明确回滚会立即补偿删除，`COMMIT`/对象写入结果不确定时由 `SweepSourceReservations` 在 lease 与安全窗口都过期后对照权威 source metadata 清除孤儿，已引用或仍被 admission 锁住的对象绝不删除。worker 读取源码前会用 job ID、attempt、worker ID、lease token 和未过期 lease 回查 MySQL 的权威元数据，不信任内存 claim 携带的 object key。
 
