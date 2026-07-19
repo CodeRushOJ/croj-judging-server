@@ -32,6 +32,7 @@ var (
 	ErrJobNotFound         = errors.New("judge job not found")
 	ErrIdempotencyConflict = errors.New("idempotency key conflicts with another request")
 	ErrJobInvalid          = errors.New("judge job request is invalid")
+	ErrJobQuotaExceeded    = errors.New("judge job quota is exceeded")
 	ErrJobUnavailable      = errors.New("judge job service is unavailable")
 	jobIDPattern           = regexp.MustCompile(`^[a-z2-7]{26}$`)
 )
@@ -297,6 +298,9 @@ func (server *Server) writeJobError(response http.ResponseWriter, requestID stri
 		writeProblem(response, problemFor(http.StatusConflict, "idempotency-conflict", "Idempotency conflict", "The Idempotency-Key is already bound to a different request.", requestID))
 	case errors.Is(err, ErrJobInvalid):
 		writeProblem(response, problemFor(http.StatusUnprocessableEntity, "invalid-job", "Judge job is invalid", "The job could not be accepted under tenant policy.", requestID))
+	case errors.Is(err, ErrJobQuotaExceeded):
+		response.Header().Set("Retry-After", "5")
+		writeProblem(response, problemFor(http.StatusTooManyRequests, "job-quota-exceeded", "Judge job quota exceeded", "Wait for queued work to finish before retrying.", requestID))
 	case errors.Is(err, ErrJobUnavailable):
 		response.Header().Set("Retry-After", "5")
 		writeProblem(response, problemFor(http.StatusServiceUnavailable, "job-service-unavailable", "Judge job service unavailable", "Retry the request later.", requestID))

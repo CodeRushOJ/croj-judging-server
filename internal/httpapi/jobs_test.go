@@ -231,6 +231,19 @@ func TestIdempotencyConflictMapsTo409(t *testing.T) {
 	}
 }
 
+func TestQueuedQuotaMapsTo429WithoutPolicyDisclosure(t *testing.T) {
+	service := &jobServiceStub{err: ErrJobQuotaExceeded}
+	server := newJobTestServer(t, service, ScopeJobSubmit)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs", strings.NewReader(`{"bundleId":"ceirceirceirceirceirceircf","language":"cpp20","sourceCode":"x"}`))
+	request.Header.Set("Authorization", "Bearer valid")
+	request.Header.Set("Idempotency-Key", "submission-00000042")
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusTooManyRequests || response.Header().Get("Retry-After") == "" || strings.Contains(response.Body.String(), "maxQueuedJobs") {
+		t.Fatalf("status=%d headers=%v body=%s", response.Code, response.Header(), response.Body.String())
+	}
+}
+
 func TestSubmitJudgeJobEnforcesDistributedQuotaBeforeCreatingJob(t *testing.T) {
 	service := &jobServiceStub{}
 	quota := &writeQuotaStub{decision: external.QuotaDecision{Allowed: false, RetryAfter: 1500 * time.Millisecond}}

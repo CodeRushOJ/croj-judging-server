@@ -163,6 +163,33 @@ HTTP 层先用可信 `Content-Length` 对 multipart 总上限做无读取早拒�
 
 本地未提供 DSN 时 MySQL 集成回归会跳过；对开发专用库设置 `EXTERNAL_JUDGE_MYSQL_TEST_DSN` 后，`go test -race ./internal/integration -run ExternalBundleSQLRepositoryIntegration` 会执行迁移，并真实竞争同 key/同 hash、不同 key/同 hash、同 key/不同 hash 三种事务，断言单 bundle、单 promoter、正确幂等记录数和单一可见对象；还覆盖阻塞发布期间 `404`、客户端不重放的 durable reconciliation、失败退避及 legacy pending 的放弃与重新上传恢复。GitHub Actions 的 `mysql84-bundle-integration` job 使用 digest 固定的 MySQL 8.4.10，因此该测试在 PR 中不得 skip。
 
+### 异步任务持久化与 worker 恢复
+
+Judge 自有 schema v3 为 job 和 attempt 增加 256-bit lease token，并把 attempt 通过 `(job_id, tenant_id)` 复合外键绑定到租户。`MySQLJobRepository` 在同一个 InnoDB admission 事务中锁定租户策略、校验 READY 且租户自有的 bundle/callback、确认 queued quota、写入 peppered-HMAC 幂等记录以及加密源码元数据。同键同 canonical hash 返回原 job；同键不同请求返回 `409`。已确认的队列配额耗尽返回 `429`，策略或数据库状态无法确认时返回 `503`，不会开放式接收新任务。
+
+源码先使用 AES-256-GCM 加密，tenant ID、source ID 和 key version 作为 AAD；MySQL 仅保存 digest、长度、nonce、key version 和不可公开的对象引用。对象读写由 `SourceObjectStore` 抽象提供，写事务失败会使用独立超时上下文补偿删除。worker 读取源码前会用 job ID、attempt、worker ID、lease token 和未过期 lease 回查 MySQL 的权威元数据，不信任内存 claim 携带的 object key。
+
+worker 领取使用 `FOR UPDATE SKIP LOCKED`，并在租户锁内重新确认 running quota。每次领取创建单独 attempt；heartbeat、完成和基础设施失败均以 attempt/worker/lease token 做 CAS。进程重启后只会回收过期 attempt，旧 worker 无法覆盖新结果；已请求取消的过期任务直接恢复为 `CANCELLED`，不会再次执行源码。基础设施失败按 tenant policy 有界重试，耗尽后才进入 `FAILED`。
+
+当前分支提供 `httpapi.NewMySQLJobService` 适配器，但不会在未配置持久对象存储、密钥与执行 worker 时伪造运行状态。平台接线完成前 HTTP Service 保持未启用。
+
+真实 MySQL 8.4 验证使用一次性容器，不需要启动整套 OJ：
+
+```bash
+docker run --rm -d --name croj-job-mysql \
+  -e MYSQL_ROOT_PASSWORD=test-root \
+  -e MYSQL_DATABASE=judge_test \
+  -e MYSQL_USER=judge -e MYSQL_PASSWORD=judge-test \
+  mysql:8.4.10
+
+docker run --rm --link croj-job-mysql:mysql \
+  -e JUDGE_TEST_MYSQL_DSN='judge:judge-test@tcp(mysql:3306)/judge_test?parseTime=true&loc=UTC&charset=utf8mb4' \
+  -v "$PWD:/workspace" -w /workspace golang:1.26.3 \
+  go test -race ./internal/external
+
+docker stop croj-job-mysql
+```
+
 ## 构建镜像
 
 ```bash
