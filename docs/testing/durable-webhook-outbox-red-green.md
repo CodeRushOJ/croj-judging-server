@@ -65,3 +65,19 @@ ok github.com/CodeRushOJ/croj-judging-server/internal/external 0.011s
 ok github.com/CodeRushOJ/croj-judging-server/internal/admincli 0.009s
 ok github.com/CodeRushOJ/croj-judging-server/cmd/judge-admin 0.008s
 ```
+
+## Task 4: Stable redacted terminal event encoding
+
+### RED
+
+```bash
+docker run --rm -v "$PWD:/workspace" -v coderushoj-go-cache:/go/pkg/mod -v coderushoj-go-build-cache:/root/.cache/go-build -w /workspace golang:1.26.3 go test ./internal/external -run 'TestEncodeTerminalWebhook' -count=1
+```
+
+Observed compile failures because `TerminalWebhookEvent` and `EncodeTerminalWebhookEvent` were undefined. Exact payload, state-specific omission, UTC millisecond time, and independent byte storage were specified before implementation.
+
+### GREEN
+
+```text
+ok github.com/CodeRushOJ/croj-judging-server/internal/external 0.022s
+```
