@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -155,7 +156,7 @@ func TestMySQLWorkerDailyExecutionReservationsUseDatabaseDateAndRecover(t *testi
 	prepareExternalJobDatabase(t, database)
 	tenantID, bundleID := strings.Repeat("n", 26), strings.Repeat("p", 26)
 	insertTenantBundleAndCallback(t, database, tenantID, bundleID, "", 4)
-	if _, err := database.Exec(`UPDATE t_external_tenant SET policy_json = JSON_SET(policy_json, '$.maxRunningJobs', 2, '$.dailyExecutionMillis', 1500) WHERE external_id = ?`, tenantID); err != nil {
+	if _, err := database.Exec(`UPDATE t_external_tenant SET policy_json = JSON_SET(policy_json, '$.maxRunningJobs', 2, '$.dailyExecutionMillis', 1600) WHERE external_id = ?`, tenantID); err != nil {
 		t.Fatal(err)
 	}
 	repository := newTestMySQLJobRepository(t, database, newMemorySourceStore())
@@ -171,7 +172,13 @@ func TestMySQLWorkerDailyExecutionReservationsUseDatabaseDateAndRecover(t *testi
 	if _, err := repository.ClaimNext(context.Background(), "daily-worker-b", time.Minute); !errors.Is(err, ErrJobNotClaimable) {
 		t.Fatalf("daily reservation allowed excess claim: %v", err)
 	}
-	if err := repository.Complete(context.Background(), first, DurableJobResult{Verdict: "ACCEPTED", CompileStatus: "SUCCEEDED", TimeMillis: 400}); err != nil {
+	if err := repository.Complete(context.Background(), first, DurableJobResult{
+		Verdict: "ACCEPTED", CompileStatus: "SUCCEEDED", TimeMillis: 400,
+		Cases: []DurableCaseResult{
+			{CaseID: "case-1", Verdict: "ACCEPTED", TimeMillis: 250},
+			{CaseID: "case-2", Verdict: "ACCEPTED", TimeMillis: 350},
+		},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	second, err := repository.ClaimNext(context.Background(), "daily-worker-b", time.Minute)
@@ -186,8 +193,68 @@ func TestMySQLWorkerDailyExecutionReservationsUseDatabaseDateAndRecover(t *testi
 	if err := database.QueryRow(`SELECT reserved_millis, consumed_millis, accounting_day = CURRENT_DATE FROM t_external_execution_daily`).Scan(&reserved, &consumed, &databaseDayMatches); err != nil {
 		t.Fatal(err)
 	}
-	if reserved != 0 || consumed != 400 || !databaseDayMatches {
+	if reserved != 0 || consumed != 600 || !databaseDayMatches {
 		t.Fatalf("daily ledger reserved=%d consumed=%d databaseDay=%v", reserved, consumed, databaseDayMatches)
+	}
+}
+
+func TestMySQLWorkerDailyExecutionSettlementCapsOverflowingCaseSumAtReservation(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	tenantID, bundleID := strings.Repeat("6", 26), strings.Repeat("7", 26)
+	insertTenantBundleAndCallback(t, database, tenantID, bundleID, "", 2)
+	repository := newTestMySQLJobRepository(t, database, newMemorySourceStore())
+	if _, err := repository.Submit(context.Background(), tenantID, "daily-overflow-key", JudgeJobRequest{BundleID: bundleID, Language: "cpp", SourceCode: []byte("int main(){}")}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := repository.ClaimNext(context.Background(), "daily-overflow-worker", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := DurableJobResult{
+		Verdict: "ACCEPTED", CompileStatus: "SUCCEEDED", TimeMillis: 1,
+		Cases: []DurableCaseResult{
+			{CaseID: "case-1", Verdict: "ACCEPTED", TimeMillis: math.MaxInt64},
+			{CaseID: "case-2", Verdict: "ACCEPTED", TimeMillis: math.MaxInt64},
+		},
+	}
+	if err := repository.Complete(context.Background(), claim, result); err != nil {
+		t.Fatal(err)
+	}
+	var reserved, consumed int64
+	if err := database.QueryRow(`SELECT reserved_millis, consumed_millis FROM t_external_execution_daily`).Scan(&reserved, &consumed); err != nil {
+		t.Fatal(err)
+	}
+	if reserved != 0 || consumed != 1000 {
+		t.Fatalf("overflow-safe settlement reserved=%d consumed=%d", reserved, consumed)
+	}
+}
+
+func TestMySQLWorkerDailyQuotaDeferralAdvancesTenantFairness(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	tenantA, tenantB := strings.Repeat("c", 26), strings.Repeat("d", 26)
+	bundleA, bundleB := strings.Repeat("e", 26), strings.Repeat("f", 26)
+	insertTenantBundleAndCallback(t, database, tenantA, bundleA, "", 40)
+	insertTenantBundleAndCallback(t, database, tenantB, bundleB, "", 2)
+	if _, err := database.Exec(`UPDATE t_external_tenant SET policy_json = JSON_SET(policy_json, '$.maxQueuedJobs', 40, '$.dailyExecutionMillis', 500) WHERE external_id = ?`, tenantA); err != nil {
+		t.Fatal(err)
+	}
+	repository := newTestMySQLJobRepository(t, database, newMemorySourceStore())
+	for index := 0; index < 33; index++ {
+		if _, err := repository.Submit(context.Background(), tenantA, fmt.Sprintf("quota-fair-a-%04d", index), JudgeJobRequest{BundleID: bundleA, Language: "cpp", SourceCode: []byte("int main(){}")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := repository.Submit(context.Background(), tenantB, "quota-fair-b-0001", JudgeJobRequest{BundleID: bundleB, Language: "cpp", SourceCode: []byte("int main(){}")}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := repository.ClaimNext(context.Background(), "quota-fair-worker", time.Minute)
+	if err != nil || claim.Job.TenantExternalID != tenantB {
+		t.Fatalf("quota-full tenant starved eligible tenant: claim=%+v error=%v", claim, err)
+	}
+	if impossible := mustCount(t, database, `SELECT COUNT(*) FROM t_external_job WHERE tenant_id = (SELECT id FROM t_external_tenant WHERE external_id = ?) AND status = 'FAILED' AND failure_code = 'DAILY_EXECUTION_LIMIT_TOO_LOW'`, tenantA); impossible != 1 {
+		t.Fatalf("permanently impossible quota jobs failed=%d, want 1", impossible)
 	}
 }
 
@@ -753,6 +820,12 @@ SET next_attempt_at = CURRENT_TIMESTAMP(3) - INTERVAL 1 SECOND WHERE id = ?`, cl
 		}
 		if disposition != want {
 			t.Fatalf("attempt %d disposition = %s, want %s", attempt, disposition, want)
+		}
+		if disposition == FailureRequeued {
+			requeued, err := restarted.Get(context.Background(), tenantID, exhaustedJob.Job.ExternalID)
+			if err != nil || requeued.Status != JobStatusQueued || requeued.FailureCode != "" {
+				t.Fatalf("attempt %d requeued job = %+v, error=%v", attempt, requeued, err)
+			}
 		}
 	}
 	exhausted, err := restarted.Get(context.Background(), tenantID, exhaustedJob.Job.ExternalID)

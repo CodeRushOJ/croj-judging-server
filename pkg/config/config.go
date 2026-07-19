@@ -22,42 +22,43 @@ type Config struct {
 }
 
 type ExternalAPIConfig struct {
-	Enabled                  bool   `yaml:"enabled"`
-	ListenAddress            string `yaml:"listen-address"`
-	WorkerID                 string `yaml:"worker-id"`
-	WorkerConcurrency        int    `yaml:"worker-concurrency"`
-	LeaseDuration            string `yaml:"lease-duration"`
-	HeartbeatInterval        string `yaml:"heartbeat-interval"`
-	ControlPollInterval      string `yaml:"control-poll-interval"`
-	IdleBackoff              string `yaml:"idle-backoff"`
-	RetryDelay               string `yaml:"retry-delay"`
-	ShutdownTimeout          string `yaml:"shutdown-timeout"`
-	ReadinessTimeout         string `yaml:"readiness-timeout"`
-	ReadHeaderTimeout        string `yaml:"read-header-timeout"`
-	ReadTimeout              string `yaml:"read-timeout"`
-	WriteTimeout             string `yaml:"write-timeout"`
-	IdleTimeout              string `yaml:"idle-timeout"`
-	BundleUploadConcurrency  int    `yaml:"bundle-upload-concurrency"`
-	SourceRetention          string `yaml:"source-retention"`
-	RetentionIdleDelay       string `yaml:"retention-idle-delay"`
-	RetentionDeleteTimeout   string `yaml:"retention-delete-timeout"`
-	RedisAddress             string `yaml:"redis-address"`
-	RedisPassword            string `yaml:"redis-password"`
-	RedisDB                  int    `yaml:"redis-db"`
-	RedisQuotaPrefix         string `yaml:"redis-quota-prefix"`
-	AuthPepperBase64         string `yaml:"auth-pepper-base64"`
-	IdempotencyPepperB64     string `yaml:"idempotency-pepper-base64"`
-	CursorKeyBase64          string `yaml:"cursor-key-base64"`
-	SourceKeyVersion         int    `yaml:"source-key-version"`
-	JudgeDatabaseDSN         string `yaml:"-"`
-	SourceKeysJSON           string `yaml:"-"`
-	CallbackKeyVersion       string `yaml:"-"`
-	CallbackKeysJSON         string `yaml:"-"`
-	WebhookWorkerConcurrency int    `yaml:"webhook-worker-concurrency"`
-	IdempotencyTTL           string `yaml:"idempotency-ttl"`
-	QuotaRefillPeriod        string `yaml:"quota-refill-period"`
-	JobSubmitCapacity        int64  `yaml:"job-submit-capacity"`
-	BundleByteCapacity       int64  `yaml:"bundle-byte-capacity"`
+	Enabled                       bool   `yaml:"enabled"`
+	ListenAddress                 string `yaml:"listen-address"`
+	WorkerID                      string `yaml:"worker-id"`
+	WorkerConcurrency             int    `yaml:"worker-concurrency"`
+	LeaseDuration                 string `yaml:"lease-duration"`
+	HeartbeatInterval             string `yaml:"heartbeat-interval"`
+	ControlPollInterval           string `yaml:"control-poll-interval"`
+	IdleBackoff                   string `yaml:"idle-backoff"`
+	RetryDelay                    string `yaml:"retry-delay"`
+	ShutdownTimeout               string `yaml:"shutdown-timeout"`
+	ReadinessTimeout              string `yaml:"readiness-timeout"`
+	ReadHeaderTimeout             string `yaml:"read-header-timeout"`
+	ReadTimeout                   string `yaml:"read-timeout"`
+	WriteTimeout                  string `yaml:"write-timeout"`
+	IdleTimeout                   string `yaml:"idle-timeout"`
+	BundleMinUploadBytesPerSecond int64  `yaml:"bundle-min-upload-bytes-per-second"`
+	BundleUploadConcurrency       int    `yaml:"bundle-upload-concurrency"`
+	SourceRetention               string `yaml:"source-retention"`
+	RetentionIdleDelay            string `yaml:"retention-idle-delay"`
+	RetentionDeleteTimeout        string `yaml:"retention-delete-timeout"`
+	RedisAddress                  string `yaml:"redis-address"`
+	RedisPassword                 string `yaml:"redis-password"`
+	RedisDB                       int    `yaml:"redis-db"`
+	RedisQuotaPrefix              string `yaml:"redis-quota-prefix"`
+	AuthPepperBase64              string `yaml:"auth-pepper-base64"`
+	IdempotencyPepperB64          string `yaml:"idempotency-pepper-base64"`
+	CursorKeyBase64               string `yaml:"cursor-key-base64"`
+	SourceKeyVersion              int    `yaml:"source-key-version"`
+	JudgeDatabaseDSN              string `yaml:"-"`
+	SourceKeysJSON                string `yaml:"-"`
+	CallbackKeyVersion            string `yaml:"-"`
+	CallbackKeysJSON              string `yaml:"-"`
+	WebhookWorkerConcurrency      int    `yaml:"webhook-worker-concurrency"`
+	IdempotencyTTL                string `yaml:"idempotency-ttl"`
+	QuotaRefillPeriod             string `yaml:"quota-refill-period"`
+	JobSubmitCapacity             int64  `yaml:"job-submit-capacity"`
+	BundleByteCapacity            int64  `yaml:"bundle-byte-capacity"`
 }
 
 type LegacyJudgeConfig struct {
@@ -178,6 +179,9 @@ func (config *Config) applyEnvironment() error {
 	overrideString(&config.ExternalAPI.ReadTimeout, "EXTERNAL_API_READ_TIMEOUT")
 	overrideString(&config.ExternalAPI.WriteTimeout, "EXTERNAL_API_WRITE_TIMEOUT")
 	overrideString(&config.ExternalAPI.IdleTimeout, "EXTERNAL_API_IDLE_TIMEOUT")
+	if err := overridePositiveInt64(&config.ExternalAPI.BundleMinUploadBytesPerSecond, "EXTERNAL_BUNDLE_MIN_UPLOAD_BYTES_PER_SECOND"); err != nil {
+		return err
+	}
 	overrideString(&config.ExternalAPI.SourceRetention, "EXTERNAL_SOURCE_RETENTION")
 	overrideString(&config.ExternalAPI.RetentionIdleDelay, "EXTERNAL_RETENTION_IDLE_DELAY")
 	overrideString(&config.ExternalAPI.RetentionDeleteTimeout, "EXTERNAL_RETENTION_DELETE_TIMEOUT")

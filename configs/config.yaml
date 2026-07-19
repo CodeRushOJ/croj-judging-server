@@ -68,9 +68,12 @@ external-api:
   shutdown-timeout: "20s"
   readiness-timeout: "2s"
   read-header-timeout: "5s"
-  read-timeout: "30s"
-  write-timeout: "30s"
+  # 512 MiB at the supported minimum 1 MiB/s needs 8m32s. The extra time
+  # covers multipart framing, object-store publication, and the final response.
+  read-timeout: "15m"
+  write-timeout: "20m"
   idle-timeout: "60s"
+  bundle-min-upload-bytes-per-second: 1048576
   bundle-upload-concurrency: 4
   source-retention: "720h"
   retention-idle-delay: "1m"

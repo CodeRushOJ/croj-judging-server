@@ -942,7 +942,7 @@ components:
       properties:
         id:
           type: string
-          pattern: '^[a-z][a-z0-9._-]{1,31}$'
+          enum: [go, cpp, python, java, javascript]
         displayName:
           type: string
           minLength: 1
@@ -1000,6 +1000,7 @@ components:
           type: array
           items:
             type: string
+            enum: [exact, token]
         limits:
           $ref: '#/components/schemas/CapabilityLimits'
     BundleUpload:
@@ -1044,7 +1045,7 @@ components:
           $ref: '#/components/schemas/ExternalId'
         language:
           type: string
-          pattern: '^[a-z][a-z0-9._-]{1,31}$'
+          enum: [go, cpp, python, java, javascript]
         sourceCode:
           type: string
           minLength: 1

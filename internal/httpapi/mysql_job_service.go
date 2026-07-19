@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/CodeRushOJ/croj-judging-server/internal/external"
+	"github.com/CodeRushOJ/croj-judging-server/internal/judgecontract"
 )
 
 type durableJobRepository interface {
@@ -31,7 +32,7 @@ func (service *MySQLJobService) Submit(
 	command SubmitJobCommand,
 	admit JobAdmission,
 ) (JobView, bool, error) {
-	language, ok := external.ResolveLanguage(command.Language)
+	language, ok := judgecontract.ResolveLanguage(command.Language)
 	if !ok {
 		return JobView{}, false, ErrJobInvalid
 	}
@@ -95,7 +96,10 @@ func publicJobView(job external.ExternalJobRecord) (JobView, error) {
 	}
 	view := JobView{
 		JobID: job.ExternalID, Status: status, CreatedAt: job.CreatedAt,
-		ClientReference: job.ClientReference, FailureCode: job.FailureCode,
+		ClientReference: job.ClientReference,
+	}
+	if job.Status == external.JobStatusFailed {
+		view.FailureCode = job.FailureCode
 	}
 	if job.Result != nil {
 		view.Result = &JobResultView{

@@ -177,6 +177,25 @@ func TestExecutionAccountingAndRetentionMigrationDefinesDurableContracts(t *test
 	}
 }
 
+func TestExecutionAccountingAndRetentionPostconditionCoversRuntimeDependencies(t *testing.T) {
+	validation := strings.ToLower(executionAccountingRetentionValidationSQL)
+	for _, contract := range []string{
+		"idx_external_tenant_fair_claim",
+		"idx_external_job_retention",
+		"idx_external_source_delete",
+		"delete_attempt_count",
+		"delete_last_error_code",
+		"delete_lease_until",
+		"delete_next_attempt_at",
+		"chk_external_attempt_accounting",
+		"chk_external_source_delete_fence",
+	} {
+		if !strings.Contains(validation, contract) {
+			t.Errorf("v6 postcondition is missing runtime dependency %q", contract)
+		}
+	}
+}
+
 func TestMigrationStatementsAreExplicitAndReplaySafe(t *testing.T) {
 	migrations, err := Migrations()
 	if err != nil {

@@ -5,7 +5,7 @@ import (
 	"math"
 	"regexp"
 
-	"github.com/CodeRushOJ/croj-judging-server/internal/external"
+	"github.com/CodeRushOJ/croj-judging-server/internal/judgecontract"
 )
 
 const (
@@ -52,13 +52,13 @@ func normalizeCapabilities(value Capabilities) (Capabilities, error) {
 		if !capabilityLanguageIDPattern.MatchString(language.ID) || language.DisplayName == "" || language.Runtime == "" {
 			return Capabilities{}, fmt.Errorf("language capabilities must contain a valid ID, display name, and runtime")
 		}
-		definition, ok := external.ResolveLanguage(language.ID)
+		definition, ok := judgecontract.ResolveLanguage(language.ID)
 		if !ok || definition.DisplayName != language.DisplayName || definition.Runtime != language.Runtime {
 			return Capabilities{}, fmt.Errorf("language capabilities must match the canonical Sandbox registry")
 		}
 	}
 	for _, checker := range value.Checkers {
-		if !external.IsCanonicalChecker(checker) {
+		if !judgecontract.IsCanonicalChecker(judgecontract.Checker(checker)) {
 			return Capabilities{}, fmt.Errorf("checker capabilities must match bundle manifest identifiers")
 		}
 	}

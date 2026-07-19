@@ -79,6 +79,12 @@ jobs:
         env:
           JUDGE_TEST_MYSQL_DSN: root:@tcp(127.0.0.1:3306)/croj_bundle_ci?parseTime=true&loc=UTC&charset=utf8mb4
         run: go test -race -count=1 ./internal/external
+      - name: Run asynchronous REST end-to-end integration on MySQL 8.4
+        env:
+          ASYNC_REST_E2E_MYSQL_DSN: root:@tcp(127.0.0.1:3306)/croj_async_rest_e2e?parseTime=true&loc=UTC&charset=utf8mb4&multiStatements=true
+        run: |
+          mysql --host=127.0.0.1 --user=root --execute='CREATE DATABASE croj_async_rest_e2e CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci'
+          go test -race -count=1 -run '^TestExternalAsyncRESTEndToEnd' ./internal/integration
       - name: Run durable webhook contract on MySQL 8.4
         env:
           JUDGE_TEST_MYSQL_DSN: root:@tcp(127.0.0.1:3306)/croj_bundle_ci?parseTime=true&loc=UTC&charset=utf8mb4

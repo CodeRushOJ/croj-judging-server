@@ -9,15 +9,17 @@ import (
 	"regexp"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/CodeRushOJ/croj-judging-server/internal/judgecontract"
 )
 
 type JudgeMode string
-type Checker string
+type Checker = judgecontract.Checker
 
 const (
 	JudgeModeACM JudgeMode = "ACM"
-	CheckerExact Checker   = "exact"
-	CheckerToken Checker   = "token"
+	CheckerExact           = judgecontract.CheckerExact
+	CheckerToken           = judgecontract.CheckerToken
 	maxCases               = 10_000
 )
 
@@ -69,7 +71,7 @@ func (manifest Manifest) Validate() error {
 	if manifest.JudgeMode != JudgeModeACM {
 		return fmt.Errorf("unsupported judgeMode %q", manifest.JudgeMode)
 	}
-	if manifest.Checker != CheckerExact && manifest.Checker != CheckerToken {
+	if !judgecontract.IsCanonicalChecker(manifest.Checker) {
 		return fmt.Errorf("unsupported checker %q", manifest.Checker)
 	}
 	if manifest.Limits.TimeLimitMillis <= 0 || manifest.Limits.MemoryLimitMiB <= 0 {
