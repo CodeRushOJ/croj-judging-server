@@ -16,7 +16,7 @@ flowchart LR
     API --> ES["EndpointSlice for croj-sandbox"]
     ES --> Scheduler["Ready endpoint cache + round robin"]
     Scheduler --> GRPC["Bounded reusable gRPC connections"]
-    GRPC --> Sandbox["SandboxService.Execute"]
+    GRPC --> Sandbox["SandboxService.ExecuteBatchV1"]
     Sandbox --> Judge
     Judge -->|"X-CROJ-Service-Token"| Backend["Backend /api/internal/v1/judge-results"]
     Backend -->|"事务 CAS + result receipt"| DB
@@ -51,7 +51,11 @@ flowchart LR
 }
 ```
 
-仅支持 `ACM` 的 `exact` 与 `token`。SPJ/OI 会明确返回 `SYSTEM_ERROR`，由 Issue #12 跟进。`exact` 与 sandbox 保持相同规则：CRLF/CR 统一为 LF，每行 `TrimSpace` 后再移除整体首尾空白；`token` 在 judging 侧按 Unicode whitespace 分词比较。case 按 manifest 顺序执行，首个选手错误早停，最终时间/内存取所有已完成 case 的最大值。
+仅支持 `ACM` 的 `exact` 与 `token`。SPJ/OI 会明确返回 `SYSTEM_ERROR`，由 Issue #12 跟进。`exact` 与 sandbox 保持相同规则：CRLF/CR 统一为 LF，每行 `TrimSpace` 后再移除整体首尾空白；`token` 在 judging 侧按 Unicode whitespace 分词比较。一个提交把有序 case 作为单个 `ExecuteBatchV1` 请求发送到同一 sandbox，在一个私有执行生命周期中只编译一次；每个 case 仍启动独立受限进程。首个选手错误早停，最终时间/内存取所有已完成 case 的最大值。
+
+批量流严格校验 case ID/顺序、已知状态、编译事件和最终完成事件。v1 每批最多 256 个 case，protobuf 请求最多 64 MiB；超限会在 RPC 前确定性返回 `SYSTEM_ERROR`，不会把不可能成功的载荷投入消息重试。`Unavailable`/`ResourceExhausted` 会丢弃不完整流并在另一个 Ready Endpoint 上有界重试完整 batch；选手终态不重试。sandbox PR 必须先于 judging-server 部署，回滚顺序相反。旧 unary `Execute` 客户端仍保留用于兼容，但隐藏测试主链路不再调用它。
+
+`SANDBOX_EXECUTE_TIMEOUT` 是单 case/编译与传输的基础预算；batch deadline 在此基础上按额外 case 的题目时间限制线性扩展，同时仍受上游 context 取消约束，避免把旧 unary 的 60 秒总 deadline 错用于整批评测。
 
 隐藏包路径把 sandbox 视为不可信边界：callback 不转发 stdout、hidden input/output 或 sandbox 诊断。编译错误仅返回固定的 `compilation failed; diagnostics redacted`；后续若要恢复安全的编译诊断，必须由独立的结构化编译阶段提供，不允许从已接触 hidden case 的响应中透传自由文本。
 
@@ -164,7 +168,7 @@ kubectl auth can-i list endpointslices.discovery.k8s.io \
 
 - 需求与验收使用 GitHub Issues 管理；Kubernetes 发现见 Issue #2，真实 gRPC Execute 见 Issue #4。
 - Issue #5 交付版本化 RocketMQ payload、稳定 `resultId` 和后端 authenticated/idempotent result callback；判题进程不再直接写 MySQL。
-- Issue #10 交付不可变 ACM hidden bundles；Issue #11 跟进 sandbox compile-once batch API，当前每个 case 会重复编译但不影响正确性。
+- Issue #10 交付不可变 ACM hidden bundles；Issue #11 交付 sandbox compile-once batch API，隐藏测试主链路一次提交只编译一次。
 - Issue #12 跟进 SPJ/OI，Issue #13 跟进原生 OLE callback 状态；未支持能力不会伪报 Accepted。
 - 变更通过 `codex/*` 分支和 Draft PR 集成，不直接提交到 `main`。
 - 发布遵循 SemVer，并在 GitHub Release 与平台 `CHANGELOG.md` 中记录跨仓库兼容性。

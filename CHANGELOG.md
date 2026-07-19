@@ -20,6 +20,8 @@
 - 增加 checksum-keyed 磁盘缓存、并发下载合并、命中校验、损坏修复、TTL/LRU 和 restart orphan 清理。
 - 增加 ACM 多 case 顺序执行、选手错误早停、最大资源聚合与基础设施故障有界换 endpoint。
 - 增加 fake Kubernetes API + 真实 TCP gRPC + HTTP callback 的跨组件契约测试，覆盖 EndpointSlice churn、过载换节点、bundle digest fail-closed 与 hidden payload 脱敏。
+- 增加 `ExecuteBatchV1` 流式客户端和 compile-once hidden bundle pipeline；一个提交把全部有序 case 发送到一个 sandbox 编译一次。
+- 增加 batch 事件顺序/终结校验、整批 EndpointSlice failover、部分流丢弃和编译诊断脱敏。
 
 ### Changed
 
@@ -33,10 +35,10 @@
 - `Output Limit Exceeded` 在 callback v1 暂映射为 `RUNTIME_ERROR` 且不重试，等待 Issue #13 的正式枚举。
 - 全部 endpoint 均返回 `Unavailable`/`ResourceExhausted` 时保留 gRPC 状态交由 RocketMQ 重试，不再错误发布终态 `SYSTEM_ERROR`。
 - 隐藏包判题不再透传 sandbox 的自由文本编译诊断，防止异常 sandbox 通过 callback 回显源码或 hidden input/output。
+- 隐藏包从逐 case unary RPC 切换为版本化 batch RPC；短暂过载/断连只重试完整 batch，选手终态不重试。
 
 ### Known limitations
 
-- 当前每个 case 会重复编译；Issue #11 跟进 compile-once batch sandbox API。
 - SPJ/OI 尚未支持并返回 `SYSTEM_ERROR`；Issue #12 跟进版本化能力。
 - exact checker 上线依赖 `croj-sandbox#10` 先移除 WA expected/actual 日志，避免 hidden data 泄露。
 - 任务结果缓存是进程级优化，进程重启后的最终幂等由后端 result receipt 保证。

@@ -17,11 +17,80 @@ import (
 
 type sandboxTestServer struct {
 	sandboxpb.UnimplementedSandboxServiceServer
-	execute func(context.Context, *sandboxpb.ExecuteRequest) (*sandboxpb.ExecuteResponse, error)
+	execute      func(context.Context, *sandboxpb.ExecuteRequest) (*sandboxpb.ExecuteResponse, error)
+	executeBatch func(*sandboxpb.ExecuteBatchV1Request, grpc.ServerStreamingServer[sandboxpb.ExecuteBatchV1Event]) error
 }
 
 func (s *sandboxTestServer) Execute(ctx context.Context, request *sandboxpb.ExecuteRequest) (*sandboxpb.ExecuteResponse, error) {
 	return s.execute(ctx, request)
+}
+
+func (s *sandboxTestServer) ExecuteBatchV1(request *sandboxpb.ExecuteBatchV1Request, stream grpc.ServerStreamingServer[sandboxpb.ExecuteBatchV1Event]) error {
+	if s.executeBatch == nil {
+		return status.Error(codes.Unimplemented, "batch not configured")
+	}
+	return s.executeBatch(request, stream)
+}
+
+func TestClientCollectsCompleteBatchStream(t *testing.T) {
+	client, stop := newBufconnBatchClient(t, time.Second, func(request *sandboxpb.ExecuteBatchV1Request, stream grpc.ServerStreamingServer[sandboxpb.ExecuteBatchV1Event]) error {
+		for _, testCase := range request.Cases {
+			if err := stream.Send(&sandboxpb.ExecuteBatchV1Event{
+				Kind:   sandboxpb.ExecuteBatchV1Event_CASE_RESULT,
+				CaseId: testCase.CaseId,
+				Result: &sandboxpb.ExecuteResponse{Status: "Accepted"},
+			}); err != nil {
+				return err
+			}
+		}
+		return stream.Send(&sandboxpb.ExecuteBatchV1Event{Kind: sandboxpb.ExecuteBatchV1Event_COMPLETED})
+	})
+	defer stop()
+
+	events, err := client.ExecuteBatch(context.Background(), "sandbox.test:50051", &sandboxpb.ExecuteBatchV1Request{
+		Cases: []*sandboxpb.ExecuteBatchV1Case{{CaseId: "case-1"}, {CaseId: "case-2"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 3 || events[0].CaseId != "case-1" || events[1].CaseId != "case-2" || events[2].Kind != sandboxpb.ExecuteBatchV1Event_COMPLETED {
+		t.Fatalf("events = %+v", events)
+	}
+}
+
+func TestClientSendsBatchLargerThanDefaultGRPCLimit(t *testing.T) {
+	client, stop := newBufconnBatchClient(t, time.Second, func(_ *sandboxpb.ExecuteBatchV1Request, stream grpc.ServerStreamingServer[sandboxpb.ExecuteBatchV1Event]) error {
+		return stream.Send(&sandboxpb.ExecuteBatchV1Event{Kind: sandboxpb.ExecuteBatchV1Event_COMPLETED})
+	})
+	defer stop()
+
+	_, err := client.ExecuteBatch(context.Background(), "sandbox.test:50051", &sandboxpb.ExecuteBatchV1Request{
+		Cases: []*sandboxpb.ExecuteBatchV1Case{{CaseId: "large", Stdin: string(make([]byte, 5<<20))}},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteBatch 5 MiB request: %v", err)
+	}
+}
+
+func TestClientBatchDeadlineScalesWithCaseCount(t *testing.T) {
+	client, stop := newBufconnBatchClient(t, 20*time.Millisecond, func(request *sandboxpb.ExecuteBatchV1Request, stream grpc.ServerStreamingServer[sandboxpb.ExecuteBatchV1Event]) error {
+		for _, testCase := range request.Cases {
+			time.Sleep(15 * time.Millisecond)
+			if err := stream.Send(&sandboxpb.ExecuteBatchV1Event{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT, CaseId: testCase.CaseId, Result: &sandboxpb.ExecuteResponse{Status: "Accepted"}}); err != nil {
+				return err
+			}
+		}
+		return stream.Send(&sandboxpb.ExecuteBatchV1Event{Kind: sandboxpb.ExecuteBatchV1Event_COMPLETED})
+	})
+	defer stop()
+
+	_, err := client.ExecuteBatch(context.Background(), "sandbox.test:50051", &sandboxpb.ExecuteBatchV1Request{
+		Timeout: 1,
+		Cases:   []*sandboxpb.ExecuteBatchV1Case{{CaseId: "case-1"}, {CaseId: "case-2"}},
+	})
+	if err != nil {
+		t.Fatalf("two-case batch used unary deadline: %v", err)
+	}
 }
 
 func TestClientExecutesOverGRPCAndReusesConnection(t *testing.T) {
@@ -143,7 +212,7 @@ func newBufconnClientWithLimits(
 ) (*Client, func()) {
 	t.Helper()
 	listener := bufconn.Listen(1024 * 1024)
-	server := grpc.NewServer()
+	server := grpc.NewServer(grpc.MaxRecvMsgSize(maxBatchMessageBytesV1))
 	sandboxpb.RegisterSandboxServiceServer(server, &sandboxTestServer{execute: execute})
 	go func() {
 		_ = server.Serve(listener)
@@ -156,6 +225,32 @@ func newBufconnClientWithLimits(
 		return listener.Dial()
 	}
 	client := NewClientWithCache(timeout, maxConnections, idleTTL, grpc.WithContextDialer(dialer))
+	return client, func() {
+		_ = client.Close()
+		server.Stop()
+		_ = listener.Close()
+	}
+}
+
+func newBufconnBatchClient(
+	t *testing.T,
+	timeout time.Duration,
+	executeBatch func(*sandboxpb.ExecuteBatchV1Request, grpc.ServerStreamingServer[sandboxpb.ExecuteBatchV1Event]) error,
+) (*Client, func()) {
+	t.Helper()
+	listener := bufconn.Listen(1024 * 1024)
+	server := grpc.NewServer(grpc.MaxRecvMsgSize(maxBatchMessageBytesV1))
+	sandboxpb.RegisterSandboxServiceServer(server, &sandboxTestServer{
+		execute: func(context.Context, *sandboxpb.ExecuteRequest) (*sandboxpb.ExecuteResponse, error) {
+			return nil, status.Error(codes.Unimplemented, "unary not configured")
+		},
+		executeBatch: executeBatch,
+	})
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	dialer := func(context.Context, string) (net.Conn, error) { return listener.Dial() }
+	client := NewClientWithCache(timeout, 128, 5*time.Minute, grpc.WithContextDialer(dialer))
 	return client, func() {
 		_ = client.Close()
 		server.Stop()
