@@ -70,6 +70,18 @@ func (executor *batchExecutorStub) ExecuteBatch(
 	return executor.events, executor.err
 }
 
+func TestBatchBundlePipelineDoesNotRetryMalformedCompletedStream(t *testing.T) {
+	executor := &sequenceBatchExecutor{eventSets: [][]*sandboxpb.ExecuteBatchV1Event{nil, nil}}
+	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a", "sandbox-b"}}, executor, 2)
+	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validExecutionConfig(), exactArtifact(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != callback.StatusSystemError || len(executor.requests) != 1 {
+		t.Fatalf("result=%+v sandbox calls=%d, want deterministic failure without retry", result, len(executor.requests))
+	}
+}
+
 func TestBatchBundlePipelineSendsAllCasesInOneCompileOnceRequest(t *testing.T) {
 	executor := &batchExecutorStub{events: []*sandboxpb.ExecuteBatchV1Event{
 		{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT, CaseId: "case-1", Result: &sandboxpb.ExecuteResponse{Status: "Accepted", Stdout: "one", TimeUsed: 8, MemoryUsed: 100}},
@@ -161,7 +173,24 @@ func TestBatchBundlePipelineKeepsTokenExpectedOutputOutOfSandbox(t *testing.T) {
 	if result.Status != callback.StatusAccepted {
 		t.Fatalf("result = %+v", result)
 	}
-	if executor.requests[0].Cases[0].ExpectedOutput != "" || executor.requests[0].Cases[0].CompareOutput || !executor.requests[0].StopOnFailure {
+	if executor.requests[0].Cases[0].ExpectedOutput != "" || executor.requests[0].Cases[0].CompareOutput || executor.requests[0].Cases[0].TokenExpectedSha256 != "615f69ed4e249a34955fc08be20fc324c06462f6ae8b817d22280505adca9209" || !executor.requests[0].StopOnFailure {
 		t.Fatalf("token expected output crossed sandbox boundary: %+v", executor.requests[0].Cases[0])
+	}
+}
+
+func TestBatchBundlePipelineStopsTokenBatchAtFirstMismatch(t *testing.T) {
+	artifact := exactArtifact(2)
+	artifact.manifest.Checker = bundle.CheckerToken
+	executor := &batchExecutorStub{events: []*sandboxpb.ExecuteBatchV1Event{
+		{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT, CaseId: "case-1", Result: &sandboxpb.ExecuteResponse{Status: "Wrong Answer", Stdout: "wrong"}},
+		{Kind: sandboxpb.ExecuteBatchV1Event_COMPLETED},
+	}}
+	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a"}}, executor, 1)
+	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validExecutionConfig(), artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != callback.StatusWrongAnswer || executor.requests[0].Cases[0].TokenExpectedSha256 == "" || executor.requests[0].Cases[0].ExpectedOutput != "" {
+		t.Fatalf("result=%+v request=%+v, want hash-only first-case comparison", result, executor.requests[0])
 	}
 }

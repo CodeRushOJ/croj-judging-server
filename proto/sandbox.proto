@@ -44,6 +44,7 @@ message ExecuteBatchV1Case {
   string stdin = 2;
   string expected_output = 3;
   bool compare_output = 4;
+  string token_expected_sha256 = 5;
 }
 
 message ExecuteBatchV1Event {
