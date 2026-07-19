@@ -45,6 +45,24 @@ func TestExpiredLeaseCanBeReclaimedExactlyOnce(t *testing.T) {
 	}
 }
 
+func TestExpiredCancelledLeaseIsReclaimedToReachTerminalState(t *testing.T) {
+	now := time.Date(2026, 7, 19, 10, 0, 0, 0, time.UTC)
+	job := DurableJob{
+		Status: JobStatusRunning, AttemptNo: 1, WorkerID: "dead-worker",
+		LeaseUntil: now.Add(-time.Second), CancelRequestedAt: timePointer(now.Add(-time.Minute)),
+	}
+	claim, err := job.Claim("recovery-worker", now, time.Minute)
+	if err != nil {
+		t.Fatalf("cancelled expired lease became permanently stuck: %v", err)
+	}
+	if err := job.Complete(claim, DurableJobResult{Verdict: "IGNORED", CompileStatus: "IGNORED"}, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != JobStatusCancelled || job.CompletedAt == nil || job.Result != nil {
+		t.Fatalf("recovered cancellation=%+v", job)
+	}
+}
+
 func TestCancellationIsIdempotentAcrossQueuedRunningAndTerminalJobs(t *testing.T) {
 	now := time.Date(2026, 7, 19, 10, 0, 0, 0, time.UTC)
 	queued := DurableJob{Status: JobStatusQueued}
