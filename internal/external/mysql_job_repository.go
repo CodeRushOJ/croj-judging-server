@@ -133,7 +133,10 @@ WHERE object_key = ? AND owner_token = ? FOR UPDATE`, sourceObjectKey, reservati
 	}
 	// Current admission limits are applied only after an idempotent replay has
 	// had a chance to return its already-accepted resource.
-	now := repository.now().UTC()
+	now, err := mysqlCurrentTime(ctx, tx)
+	if err != nil {
+		return SubmitJobResult{}, err
+	}
 	if _, err := tx.ExecContext(ctx, `
 DELETE FROM t_external_idempotency
 WHERE tenant_id = ? AND operation_scope = ? AND key_digest = ? AND expires_at <= ?`,

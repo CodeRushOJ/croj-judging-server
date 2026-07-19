@@ -223,8 +223,10 @@ func TestMySQLWorkerSchedulingAndBackoffUseDatabaseClockDespiteApplicationSkew(t
 	bundleID := strings.Repeat("7", 26)
 	insertTenantBundleAndCallback(t, database, tenantID, bundleID, "", 2)
 	store := newMemorySourceStore()
-	repository := newTestMySQLJobRepository(t, database, store)
-	job, err := repository.Submit(context.Background(), tenantID, "database-clock-schedule", JudgeJobRequest{
+	futureClock := newTestMySQLJobRepositoryWithClock(t, database, store, func() time.Time {
+		return time.Now().Add(10 * 365 * 24 * time.Hour)
+	})
+	job, err := futureClock.Submit(context.Background(), tenantID, "database-clock-schedule", JudgeJobRequest{
 		BundleID: bundleID, Language: "cpp20", SourceCode: []byte("int main(){}"),
 	})
 	if err != nil {
@@ -245,9 +247,6 @@ func TestMySQLWorkerSchedulingAndBackoffUseDatabaseClockDespiteApplicationSkew(t
 		t.Fatalf("database backoff disposition=%s error=%v", disposition, err)
 	}
 
-	futureClock := newTestMySQLJobRepositoryWithClock(t, database, store, func() time.Time {
-		return time.Now().Add(10 * 365 * 24 * time.Hour)
-	})
 	if _, err := futureClock.ClaimNext(context.Background(), "future-clock-worker", time.Minute); !errors.Is(err, ErrJobNotClaimable) {
 		t.Fatalf("future application clock bypassed database backoff: %v", err)
 	}
@@ -267,6 +266,45 @@ SET next_attempt_at = CURRENT_TIMESTAMP(3) - INTERVAL 1 SECOND WHERE id = ?`, cl
 	second, err := futureClock.ClaimNext(context.Background(), "future-clock-worker", time.Minute)
 	if err != nil || second.Job.ExternalID != job.Job.ExternalID || second.AttemptNo != 2 {
 		t.Fatalf("database-due retry with future application clock: claim=%+v error=%v", second, err)
+	}
+}
+
+func TestMySQLSubmitIdempotencyExpiryUsesDatabaseClockDespitePastApplicationClock(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	tenantID := strings.Repeat("q", 26)
+	bundleID := strings.Repeat("r", 26)
+	insertTenantBundleAndCallback(t, database, tenantID, bundleID, "", 2)
+	store := newMemorySourceStore()
+	pastClock := newTestMySQLJobRepositoryWithClock(t, database, store, func() time.Time {
+		return time.Now().Add(-10 * 365 * 24 * time.Hour)
+	})
+	request := JudgeJobRequest{
+		BundleID: bundleID, Language: "cpp20", SourceCode: []byte("int main(){}"),
+	}
+	first, err := pastClock.Submit(context.Background(), tenantID, "database-clock-idempotency", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := newTestMySQLJobRepository(t, database, store)
+	replayed, err := repository.Submit(context.Background(), tenantID, "database-clock-idempotency", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !replayed.Replayed || replayed.Job.ExternalID != first.Job.ExternalID {
+		t.Fatalf("past application clock expired fresh idempotency record: first=%+v replay=%+v", first, replayed)
+	}
+	if jobs := mustCount(t, database, "SELECT COUNT(*) FROM t_external_job"); jobs != 1 {
+		t.Fatalf("idempotent replay jobs=%d", jobs)
+	}
+	var ttlSeconds int
+	if err := database.QueryRow(`
+SELECT TIMESTAMPDIFF(SECOND, CURRENT_TIMESTAMP(3), expires_at)
+FROM t_external_idempotency WHERE resource_external_id = ?`, first.Job.ExternalID).Scan(&ttlSeconds); err != nil {
+		t.Fatal(err)
+	}
+	if ttlSeconds < int((24*time.Hour)/time.Second)-10 || ttlSeconds > int((24*time.Hour)/time.Second) {
+		t.Fatalf("database-relative idempotency ttl seconds=%d", ttlSeconds)
 	}
 }
 
