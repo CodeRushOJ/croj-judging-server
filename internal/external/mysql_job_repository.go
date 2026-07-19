@@ -79,7 +79,10 @@ func (repository *MySQLJobRepository) Submit(
 	if err != nil {
 		return SubmitJobResult{}, err
 	}
-	requestHash, err := CanonicalJobRequestHash(request, policy.MaxSourceBytes)
+	// Canonical identity must remain stable when an operator tightens policy.
+	// Current admission limits are applied only after an idempotent replay has
+	// had a chance to return its already-accepted resource.
+	requestHash, err := CanonicalJobRequestHash(request, int64(len(request.SourceCode)))
 	if err != nil {
 		return SubmitJobResult{}, fmt.Errorf("%w: %v", ErrExternalJobInvalid, err)
 	}
@@ -112,6 +115,9 @@ WHERE tenant_id = ? AND operation_scope = ? AND key_digest = ?`,
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return SubmitJobResult{}, repositoryUnavailable("read idempotency record", err)
+	}
+	if int64(len(request.SourceCode)) > policy.MaxSourceBytes {
+		return SubmitJobResult{}, fmt.Errorf("%w: source code exceeds current tenant policy", ErrExternalJobInvalid)
 	}
 
 	var queuedJobs int
@@ -166,7 +172,7 @@ WHERE tenant_id = ? AND external_id = ? AND disabled_at IS NULL`,
 	if err != nil {
 		return SubmitJobResult{}, repositoryUnavailable("encrypt source", err)
 	}
-	if err := repository.sourceObjects.Put(ctx, sourceObjectKey, encrypted.Ciphertext); err != nil {
+	if err := repository.sourceObjects.Create(ctx, sourceObjectKey, encrypted.Ciphertext); err != nil {
 		return SubmitJobResult{}, repositoryUnavailable("persist encrypted source", err)
 	}
 	objectPublished := true
@@ -227,7 +233,11 @@ INSERT INTO t_external_idempotency(
 		return SubmitJobResult{}, cleanupObject(repositoryUnavailable("read submitted job", err))
 	}
 	if err := tx.Commit(); err != nil {
-		return SubmitJobResult{}, cleanupObject(repositoryUnavailable("commit submitted job", err))
+		// Commit errors can be outcome-ambiguous (the server may have committed
+		// before the connection failed). Deleting here could break a committed
+		// job. Keep this private, content-opaque object for the retention sweeper;
+		// an idempotent retry determines whether the transaction committed.
+		return SubmitJobResult{}, repositoryUnavailable("commit submitted job with unknown outcome", err)
 	}
 	objectPublished = false
 	return SubmitJobResult{Job: job}, nil

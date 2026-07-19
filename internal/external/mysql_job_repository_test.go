@@ -25,9 +25,12 @@ func newMemorySourceStore() *memorySourceStore {
 	return &memorySourceStore{objects: make(map[string][]byte)}
 }
 
-func (store *memorySourceStore) Put(_ context.Context, key string, value []byte) error {
+func (store *memorySourceStore) Create(_ context.Context, key string, value []byte) error {
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
+	if _, exists := store.objects[key]; exists {
+		return ErrSourceObjectExists
+	}
 	store.puts++
 	store.objects[key] = append([]byte(nil), value...)
 	return nil
@@ -228,6 +231,32 @@ func TestMySQLJobRepositoryQueuedQuotaFailsClosed(t *testing.T) {
 	_, puts, _ := store.snapshot()
 	if puts != 1 {
 		t.Fatalf("quota failures wrote source objects: puts=%d", puts)
+	}
+}
+
+func TestMySQLJobRepositoryReplaySurvivesPolicyTightening(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	tenantID := strings.Repeat("e", 26)
+	bundleID := strings.Repeat("f", 26)
+	insertTenantBundleAndCallback(t, database, tenantID, bundleID, "", 3)
+	repository := newTestMySQLJobRepository(t, database, newMemorySourceStore())
+	request := JudgeJobRequest{BundleID: bundleID, Language: "cpp20", SourceCode: []byte("int main(){}")}
+	first, err := repository.Submit(context.Background(), tenantID, "policy-replay-key", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`UPDATE t_external_tenant
+SET policy_json = JSON_SET(policy_json, '$.maxSourceBytes', 1)
+WHERE external_id = ?`, tenantID); err != nil {
+		t.Fatal(err)
+	}
+	replay, err := repository.Submit(context.Background(), tenantID, "policy-replay-key", request)
+	if err != nil || !replay.Replayed || replay.Job.ExternalID != first.Job.ExternalID {
+		t.Fatalf("policy-tightened replay = %+v, error = %v", replay, err)
+	}
+	if _, err := repository.Submit(context.Background(), tenantID, "policy-new-key-001", request); !errors.Is(err, ErrExternalJobInvalid) {
+		t.Fatalf("new oversized request error = %v", err)
 	}
 }
 

@@ -19,10 +19,13 @@ var (
 	ErrExternalJobUnavailable = errors.New("external judge job repository is unavailable")
 	ErrQueuedQuotaExceeded    = errors.New("tenant queued job quota exceeded")
 	ErrInvalidJobCursor       = errors.New("invalid external judge job cursor")
+	ErrSourceObjectExists     = errors.New("encrypted source object already exists")
 )
 
 type SourceObjectStore interface {
-	Put(context.Context, string, []byte) error
+	// Create must be atomic and must return ErrSourceObjectExists instead of
+	// overwriting an existing key. This makes a random-ID collision harmless.
+	Create(context.Context, string, []byte) error
 	Get(context.Context, string) ([]byte, error)
 	Delete(context.Context, string) error
 }
@@ -35,6 +38,9 @@ type SourceObjectMetadata struct {
 	KeyVersion uint16
 	Nonce      []byte
 }
+
+func (SourceObjectMetadata) String() string   { return "[REDACTED SOURCE OBJECT]" }
+func (SourceObjectMetadata) GoString() string { return "[REDACTED SOURCE OBJECT]" }
 
 type ExternalJobRecord struct {
 	InternalID       uint64
@@ -81,6 +87,13 @@ type WorkerJobClaim struct {
 	LeaseToken []byte
 	LeaseUntil time.Time
 }
+
+func (claim WorkerJobClaim) String() string {
+	return fmt.Sprintf("WorkerJobClaim{JobID:%s Status:%s WorkerID:%s AttemptNo:%d LeaseUntil:%s}",
+		claim.Job.ExternalID, claim.Job.Status, claim.WorkerID, claim.AttemptNo, claim.LeaseUntil.UTC().Format(time.RFC3339Nano))
+}
+
+func (claim WorkerJobClaim) GoString() string { return claim.String() }
 
 type InfrastructureFailure struct {
 	Code       string

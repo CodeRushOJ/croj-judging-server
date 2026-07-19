@@ -92,6 +92,39 @@ WHERE external_id = ?`, tenantID); err != nil {
 	}
 }
 
+func TestMySQLWorkerSkipsQuotaFullTenantWithoutStarvingOthers(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	tenantA := strings.Repeat("a", 26)
+	tenantB := strings.Repeat("b", 26)
+	bundleA := strings.Repeat("c", 26)
+	bundleB := strings.Repeat("d", 26)
+	insertTenantBundleAndCallback(t, database, tenantA, bundleA, "", 4)
+	insertTenantBundleAndCallback(t, database, tenantB, bundleB, "", 4)
+	clock := &mutableClock{now: time.Date(2026, 7, 19, 11, 30, 0, 0, time.UTC)}
+	repository := newTestMySQLJobRepositoryWithClock(t, database, newMemorySourceStore(), clock.Now)
+	for index := 0; index < 2; index++ {
+		if _, err := repository.Submit(context.Background(), tenantA, "starve-tenant-a-00"+string(rune('1'+index)), JudgeJobRequest{
+			BundleID: bundleA, Language: "cpp20", SourceCode: []byte("int main(){}"),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := repository.Submit(context.Background(), tenantB, "starve-tenant-b-001", JudgeJobRequest{
+		BundleID: bundleB, Language: "cpp20", SourceCode: []byte("int main(){}"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := repository.ClaimNext(context.Background(), "worker-a", time.Minute)
+	if err != nil || first.Job.TenantExternalID != tenantA {
+		t.Fatalf("first claim = %+v error=%v", first, err)
+	}
+	second, err := repository.ClaimNext(context.Background(), "worker-b", time.Minute)
+	if err != nil || second.Job.TenantExternalID != tenantB {
+		t.Fatalf("quota-full tenant starved runnable tenant: claim=%+v error=%v", second, err)
+	}
+}
+
 func TestMySQLWorkerHeartbeatCompletionAndRestartReclaimAreFenced(t *testing.T) {
 	database := openMySQLIntegration(t)
 	prepareExternalJobDatabase(t, database)
