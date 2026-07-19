@@ -15,11 +15,14 @@ info:
     both return the same `404` response.
 
     A configured webhook is delivered at-least-once. Consumers must deduplicate
-    by `X-CodeRushOJ-Event-Id`. The v1 signature covers the exact raw body using
-    `v1\n<event-id-byte-length>\n<event-id>\n<timestamp>\n<raw-body>` and is sent
-    with `X-CodeRushOJ-Event-Id`, `X-CodeRushOJ-Timestamp`, and
-    `X-CodeRushOJ-Signature`. There is no public callback-management endpoint in
-    this version.
+    by `X-CodeRushOJ-Event-Id`. The v1 signature framing is
+    `v1\n<event-id-byte-length>\n<event-id>\n<timestamp>\n<raw-body>`: the event
+    length is its UTF-8 byte length, timestamp is decimal Unix seconds, and
+    `<raw-body>` is the exact raw body bytes received by the consumer. The
+    server sends `X-CodeRushOJ-Event-Id`, `X-CodeRushOJ-Timestamp`, and
+    `X-CodeRushOJ-Signature: v1=<lowercase-hex(HMAC-SHA256(secret, framing))>`.
+    Compare the decoded digest in constant time. There is no public
+    callback-management endpoint in this version.
 servers:
   - url: https://judge.example.invalid
     description: Placeholder private endpoint; replace with the operator-provided TLS URL.
@@ -73,7 +76,7 @@ paths:
         '403':
           $ref: '#/components/responses/Forbidden'
         '503':
-          $ref: '#/components/responses/ServiceUnavailable'
+          $ref: '#/components/responses/AuthenticationUnavailable'
 
   /api/v1/bundles:
     post:
@@ -144,7 +147,7 @@ paths:
                 manifestVersion: 1
                 createdAt: '2026-07-19T01:02:03Z'
         '400':
-          $ref: '#/components/responses/BadRequest'
+          $ref: '#/components/responses/InvalidBundle'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -156,7 +159,7 @@ paths:
         '429':
           $ref: '#/components/responses/TooManyRequests'
         '503':
-          $ref: '#/components/responses/ServiceUnavailable'
+          $ref: '#/components/responses/BundleWriteUnavailable'
 
   /api/v1/bundles/{bundleId}:
     get:
@@ -192,7 +195,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '503':
-          $ref: '#/components/responses/ServiceUnavailable'
+          $ref: '#/components/responses/BundleReadUnavailable'
 
   /api/v1/judge-jobs:
     post:
@@ -257,7 +260,7 @@ paths:
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
-          $ref: '#/components/responses/NotFound'
+          $ref: '#/components/responses/JobNotFound'
         '409':
           $ref: '#/components/responses/Conflict'
         '422':
@@ -267,7 +270,7 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
         '503':
-          $ref: '#/components/responses/ServiceUnavailable'
+          $ref: '#/components/responses/JobSubmitUnavailable'
     get:
       tags: [Judge jobs]
       operationId: listJudgeJobs
@@ -295,7 +298,7 @@ paths:
                     clientReference: submission-42
                 nextCursor: example-next-cursor
         '400':
-          $ref: '#/components/responses/BadRequest'
+          $ref: '#/components/responses/InvalidListQuery'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -303,7 +306,7 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
         '503':
-          $ref: '#/components/responses/ServiceUnavailable'
+          $ref: '#/components/responses/JobReadUnavailable'
 
   /api/v1/judge-jobs/{jobId}:
     get:
@@ -353,11 +356,11 @@ paths:
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
-          $ref: '#/components/responses/NotFound'
+          $ref: '#/components/responses/JobNotFound'
         '500':
           $ref: '#/components/responses/InternalError'
         '503':
-          $ref: '#/components/responses/ServiceUnavailable'
+          $ref: '#/components/responses/JobReadUnavailable'
 
   /api/v1/judge-jobs/{jobId}/cancel:
     post:
@@ -399,11 +402,11 @@ paths:
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
-          $ref: '#/components/responses/NotFound'
+          $ref: '#/components/responses/JobNotFound'
         '500':
           $ref: '#/components/responses/InternalError'
         '503':
-          $ref: '#/components/responses/ServiceUnavailable'
+          $ref: '#/components/responses/JobReadUnavailable'
 
 components:
   securitySchemes:
@@ -505,6 +508,36 @@ components:
             status: 400
             detail: Provide one request containing only documented fields.
             requestId: unavailable
+    InvalidBundle:
+      description: Invalid idempotency key, multipart envelope, or immutable bundle ZIP.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://coderushoj.dev/problems/invalid-bundle
+            title: Invalid bundle upload
+            status: 400
+            detail: Provide one valid immutable bundle ZIP and an Idempotency-Key.
+            requestId: unavailable
+    InvalidListQuery:
+      description: Unknown, repeated, malformed, or out-of-range list parameter.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://coderushoj.dev/problems/invalid-list-query
+            title: Invalid list query
+            status: 400
+            detail: Use only cursor, limit (1-100), and a documented status.
+            requestId: unavailable
     Unauthorized:
       description: Missing, malformed, unknown, expired, or revoked API key.
       headers:
@@ -551,6 +584,21 @@ components:
             title: Resource not found
             status: 404
             detail: The requested API resource does not exist.
+            requestId: unavailable
+    JobNotFound:
+      description: The job is absent or belongs to another tenant.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://coderushoj.dev/problems/job-not-found
+            title: Judge job not found
+            status: 404
+            detail: The requested judge job does not exist.
             requestId: unavailable
     Conflict:
       description: The Idempotency-Key is already bound to different content.
@@ -629,8 +677,8 @@ components:
             status: 500
             detail: The request could not be completed.
             requestId: unavailable
-    ServiceUnavailable:
-      description: Authentication, quota, publication, or job storage is temporarily unavailable.
+    AuthenticationUnavailable:
+      description: API-key storage is temporarily unavailable.
       headers:
         X-Request-Id:
           $ref: '#/components/headers/XRequestId'
@@ -641,11 +689,136 @@ components:
           schema:
             $ref: '#/components/schemas/Problem'
           example:
-            type: https://coderushoj.dev/problems/job-service-unavailable
-            title: Service temporarily unavailable
+            type: https://coderushoj.dev/problems/authentication-unavailable
+            title: Authentication temporarily unavailable
             status: 503
             detail: Retry the request later.
             requestId: unavailable
+    BundleWriteUnavailable:
+      description: Authentication, upload quota, or bundle publication is temporarily unavailable.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            authenticationUnavailable:
+              value:
+                type: https://coderushoj.dev/problems/authentication-unavailable
+                title: Authentication temporarily unavailable
+                status: 503
+                detail: Retry the request later.
+                requestId: unavailable
+            quotaUnavailable:
+              value:
+                type: https://coderushoj.dev/problems/quota-unavailable
+                title: Quota temporarily unavailable
+                status: 503
+                detail: Retry the request later.
+                requestId: unavailable
+            bundlePublishing:
+              value:
+                type: https://coderushoj.dev/problems/bundle-publishing
+                title: Bundle publication in progress
+                status: 503
+                detail: Retry this idempotent upload later.
+                requestId: unavailable
+            bundleUnavailable:
+              value:
+                type: https://coderushoj.dev/problems/bundle-unavailable
+                title: Bundle service unavailable
+                status: 503
+                detail: The bundle operation could not be completed.
+                requestId: unavailable
+    BundleReadUnavailable:
+      description: Authentication or bundle metadata storage is temporarily unavailable.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            authenticationUnavailable:
+              value:
+                type: https://coderushoj.dev/problems/authentication-unavailable
+                title: Authentication temporarily unavailable
+                status: 503
+                detail: Retry the request later.
+                requestId: unavailable
+            bundleUnavailable:
+              value:
+                type: https://coderushoj.dev/problems/bundle-unavailable
+                title: Bundle service unavailable
+                status: 503
+                detail: The bundle operation could not be completed.
+                requestId: unavailable
+    JobSubmitUnavailable:
+      description: Authentication, submit quota, or job storage is temporarily unavailable.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            authenticationUnavailable:
+              value:
+                type: https://coderushoj.dev/problems/authentication-unavailable
+                title: Authentication temporarily unavailable
+                status: 503
+                detail: Retry the request later.
+                requestId: unavailable
+            quotaUnavailable:
+              value:
+                type: https://coderushoj.dev/problems/quota-unavailable
+                title: Quota temporarily unavailable
+                status: 503
+                detail: Retry the request later.
+                requestId: unavailable
+            jobServiceUnavailable:
+              value:
+                type: https://coderushoj.dev/problems/job-service-unavailable
+                title: Judge job service unavailable
+                status: 503
+                detail: Retry the request later.
+                requestId: unavailable
+    JobReadUnavailable:
+      description: Authentication or job storage is temporarily unavailable.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            authenticationUnavailable:
+              value:
+                type: https://coderushoj.dev/problems/authentication-unavailable
+                title: Authentication temporarily unavailable
+                status: 503
+                detail: Retry the request later.
+                requestId: unavailable
+            jobServiceUnavailable:
+              value:
+                type: https://coderushoj.dev/problems/job-service-unavailable
+                title: Judge job service unavailable
+                status: 503
+                detail: Retry the request later.
+                requestId: unavailable
   schemas:
     ExternalId:
       type: string
