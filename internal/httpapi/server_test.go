@@ -142,6 +142,19 @@ func TestServerRejectsCapabilitiesOutsideThePublishedV1Contract(t *testing.T) {
 	}
 }
 
+func TestCapabilitiesEnforceExactMaximumV1SourceBytes(t *testing.T) {
+	capabilities := testCapabilities()
+	capabilities.Limits.MaxSourceBytes = maximumV1SourceBytes
+	if _, err := NewServer(staticAuthenticator{}, capabilities); err != nil {
+		t.Fatalf("NewServer rejected exact maximum source size: %v", err)
+	}
+
+	capabilities.Limits.MaxSourceBytes = maximumV1SourceBytes + 1
+	if _, err := NewServer(staticAuthenticator{}, capabilities); err == nil {
+		t.Fatal("NewServer accepted source size above the v1 maximum")
+	}
+}
+
 func TestServerNormalizesNilCapabilityCollectionsToJSONArrays(t *testing.T) {
 	capabilities := testCapabilities()
 	capabilities.JudgeModes = nil

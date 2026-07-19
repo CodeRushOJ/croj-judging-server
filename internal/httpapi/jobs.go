@@ -235,7 +235,7 @@ func parseJobListQuery(request *http.Request) (JobListQuery, error) {
 }
 
 func maximumJobRequestBytes(maxSourceBytes int64) int64 {
-	return maxSourceBytes*6 + (64 << 10)
+	return maxSourceBytes*maximumJobRequestEncodingExpansion + maximumJobRequestEnvelopeBytes
 }
 
 func (server *Server) handleJobGet(response http.ResponseWriter, request *http.Request, requestID, jobID string) {

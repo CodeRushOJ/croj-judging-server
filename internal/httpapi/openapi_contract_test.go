@@ -20,6 +20,7 @@ import (
 
 	"github.com/CodeRushOJ/croj-judging-server/internal/external"
 	"github.com/getkin/kin-openapi/openapi3"
+	"gopkg.in/yaml.v3"
 )
 
 func loadOpenAPIContract(t *testing.T) *openapi3.T {
@@ -371,12 +372,9 @@ func TestOpenAPIContractCoversLiveHandlerResponses(t *testing.T) {
 				if value == "" {
 					t.Errorf("live response misses required %s", header)
 				}
-				headerRef := documented.Value.Headers[header]
-				if headerRef == nil {
-					t.Errorf("OpenAPI response misses live header %s", header)
-				} else if value != "" {
-					validateLiveHeader(t, header, value, headerRef)
-				}
+			}
+			for _, finding := range liveResponseHeaderFindings(response.Header(), documented.Value) {
+				t.Error(finding)
 			}
 			contentType := strings.Split(response.Header().Get("Content-Type"), ";")[0]
 			media := documented.Value.Content[contentType]
@@ -415,6 +413,20 @@ func TestOpenAPIContractCoversLiveHandlerResponses(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestLiveResponseHeaderValidationRejectsSensitiveValues(t *testing.T) {
+	document := loadOpenAPIContract(t)
+	documented := operation(t, document, "/api/v1/capabilities", http.MethodGet).Responses.Status(http.StatusUnauthorized)
+	actual := http.Header{
+		"Content-Type":     {"application/problem+json"},
+		"WWW-Authenticate": {"Bearer token=credential-value"},
+	}
+
+	findings := strings.Join(liveResponseHeaderFindings(actual, documented.Value), "\n")
+	if !strings.Contains(findings, `contains forbidden example value marker "token="`) {
+		t.Fatalf("malicious live header was not rejected:\n%s", findings)
 	}
 }
 
@@ -498,10 +510,9 @@ func TestOpenAPIContractPinsSecurityHeadersAndAsynchronousSemantics(t *testing.T
 			t.Errorf("%s Location pattern = %#v, want %q", name, test.header.Value.Schema, test.pattern)
 		}
 	}
-	maxSource := document.Components.Schemas["CapabilityLimits"].Value.Properties["maxSourceBytes"].Value.Max
-	const maximumSupportedSourceBytes = int64(1537228672809118378)
-	if maxSource == nil || *maxSource != float64(maximumSupportedSourceBytes) {
-		t.Errorf("CapabilityLimits.maxSourceBytes maximum = %v, want %d", maxSource, maximumSupportedSourceBytes)
+	maxSource := openAPIIntegerScalar(t, "components", "schemas", "CapabilityLimits", "properties", "maxSourceBytes", "maximum")
+	if maxSource != maximumV1SourceBytes {
+		t.Errorf("CapabilityLimits.maxSourceBytes maximum = %d, want %d", maxSource, maximumV1SourceBytes)
 	}
 	if !strings.Contains(document.Info.Description, "v1\\n<event-id-byte-length>\\n<event-id>\\n<timestamp>\\n<raw-body>") ||
 		!strings.Contains(document.Info.Description, "X-CodeRushOJ-Event-Id") ||
@@ -781,29 +792,115 @@ func operation(t *testing.T, document *openapi3.T, path, method string) *openapi
 	return pathItem.GetOperation(method)
 }
 
-func validateLiveHeader(t *testing.T, name, raw string, reference *openapi3.HeaderRef) {
+func openAPIIntegerScalar(t *testing.T, keys ...string) int64 {
 	t.Helper()
+	filename := filepath.Join("..", "..", "api", "openapi.yaml")
+	raw, err := os.ReadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root yaml.Node
+	if err := yaml.Unmarshal(raw, &root); err != nil {
+		t.Fatalf("decode %s as YAML nodes: %v", filename, err)
+	}
+	if root.Kind != yaml.DocumentNode || len(root.Content) != 1 {
+		t.Fatalf("%s has unexpected YAML document root", filename)
+	}
+	node := root.Content[0]
+	for _, key := range keys {
+		if node.Kind != yaml.MappingNode {
+			t.Fatalf("OpenAPI YAML path %s reaches non-mapping node", strings.Join(keys, "."))
+		}
+		var next *yaml.Node
+		for index := 0; index+1 < len(node.Content); index += 2 {
+			if node.Content[index].Value == key {
+				next = node.Content[index+1]
+				break
+			}
+		}
+		if next == nil {
+			t.Fatalf("OpenAPI YAML path %s is missing key %q", strings.Join(keys, "."), key)
+		}
+		node = next
+	}
+	if node.Kind != yaml.ScalarNode {
+		t.Fatalf("OpenAPI YAML path %s is not a scalar", strings.Join(keys, "."))
+	}
+	value, err := strconv.ParseInt(node.Value, 10, 64)
+	if err != nil {
+		t.Fatalf("OpenAPI YAML path %s is not an exact int64: %v", strings.Join(keys, "."), err)
+	}
+	return value
+}
+
+func liveResponseHeaderFindings(actual http.Header, documented *openapi3.Response) []string {
+	if documented == nil {
+		return []string{"OpenAPI response is missing"}
+	}
+	var findings []string
+	names := make([]string, 0, len(actual))
+	for name := range actual {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if implicitHTTPResponseHeader(name) {
+			continue
+		}
+		reference := documented.Headers[name]
+		if reference == nil {
+			for documentedName, candidate := range documented.Headers {
+				if strings.EqualFold(documentedName, name) {
+					reference = candidate
+					break
+				}
+			}
+		}
+		if reference == nil {
+			findings = append(findings, fmt.Sprintf("OpenAPI response misses live header %s", name))
+			continue
+		}
+		for index, raw := range actual[name] {
+			location := fmt.Sprintf("live response header %s[%d]", name, index)
+			findings = append(findings, liveHeaderValueFindings(location, raw, reference)...)
+			findings = append(findings, publicValueFindings(location, raw)...)
+		}
+	}
+	return findings
+}
+
+func implicitHTTPResponseHeader(name string) bool {
+	switch http.CanonicalHeaderKey(name) {
+	case "Connection", "Content-Length", "Content-Type", "Date", "Trailer", "Transfer-Encoding":
+		return true
+	default:
+		return false
+	}
+}
+
+func liveHeaderValueFindings(name, raw string, reference *openapi3.HeaderRef) []string {
 	if reference.Value == nil || reference.Value.Schema == nil || reference.Value.Schema.Value == nil {
-		t.Fatalf("OpenAPI header %s has no schema", name)
+		return []string{fmt.Sprintf("OpenAPI header %s has no schema", name)}
 	}
 	schema := reference.Value.Schema.Value
 	var value any = raw
 	if schema.Type != nil && schema.Type.Includes("integer") {
 		parsed, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil {
-			t.Fatalf("live header %s=%q is not an integer: %v", name, raw, err)
+			return []string{fmt.Sprintf("live header %s=%q is not an integer: %v", name, raw, err)}
 		}
 		value = parsed
 	} else if schema.Type != nil && schema.Type.Includes("boolean") {
 		parsed, err := strconv.ParseBool(raw)
 		if err != nil {
-			t.Fatalf("live header %s=%q is not a boolean: %v", name, raw, err)
+			return []string{fmt.Sprintf("live header %s=%q is not a boolean: %v", name, raw, err)}
 		}
 		value = parsed
 	}
 	if err := schema.VisitJSON(value); err != nil {
-		t.Errorf("live header %s=%q violates OpenAPI schema: %v", name, raw, err)
+		return []string{fmt.Sprintf("live header %s=%q violates OpenAPI schema: %v", name, raw, err)}
 	}
+	return nil
 }
 
 func requestExample(t *testing.T, document *openapi3.T, path, method string) any {
