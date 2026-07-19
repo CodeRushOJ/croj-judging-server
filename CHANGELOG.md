@@ -13,6 +13,12 @@
 - 增加持久化任务状态机，覆盖 attempt CAS、lease heartbeat/过期回收、陈旧 worker 拒绝、取消意图、基础设施重试与终态失败。
 - 增加外部 OJ webhook v1 的 HMAC-SHA256 精确载荷签名、2xx/重试/永久失败矩阵及禁止重定向投递。
 - 增加 callback HTTPS authority 固定、逐次 DNS 解析、混合公私网答案拒绝和 IPv4/IPv6/云元数据 SSRF 防护传输层。
+- 增加 operator-only `judge-admin callback create`：callback-specific 256-bit secret 只显示一次，并以带完整规范 URL AAD 和 key version 的 AES-256-GCM 保存；支持 add-before-switch key rotation，旧的不完整 callback 迁移时 fail closed 禁用。
+- 增加 MySQL transactional outbox：job 的完成、终态基础设施失败及取消与稳定版本化 webhook event 原子提交，数据库 `UNIQUE(job_id)` 保证每个任务至多一个逻辑事件。
+- 增加多副本 webhook delivery lease：MySQL 时钟、per-tenant head fairness、`FOR UPDATE SKIP LOCKED`、attempt/token fencing、崩溃重领及 stale settlement 拒绝；相同 `eventId`/body 按 at-least-once 语义重投。
+- 增加结构化 webhook outcome、完整 HTTP retry/permanent matrix、有界 `Retry-After`、指数 jitter、12 次/24 小时默认边界、`DEAD` 审计和 30 天 terminal retention。
+- 增加真实 MySQL 8.4.10 webhook 合约门禁，覆盖原子终态、lease recovery、精确 HMAC body、远端成功但 settlement 丢失后的稳定重投。
+- 当前提交完成 outbox 与可注入 delivery worker，但尚未接入 `cmd/main.go` 的生产 lifecycle；runtime wiring 完成前不会宣称 callback delivery 已上线。
 - 增加 Redis 服务端时间驱动的原子令牌桶，跨 HTTP 副本统一限制租户任务提交与 bundle 实际上传字节；配额状态不确定时新写入 fail closed，已授权读请求保持可用。
 - 增加 `POST/GET /api/v1/bundles`：有界单文件 multipart 流式上传、SHA-256 内容寻址、tenant-scoped 元数据与 RFC 9457 错误。
 - 增加外部题包 ZIP 安全复用校验、case CRC/size/UTF-8 流式核验、取消/超限清理、MySQL 原子 ownership+幂等事务及并发单逻辑记录回归。
