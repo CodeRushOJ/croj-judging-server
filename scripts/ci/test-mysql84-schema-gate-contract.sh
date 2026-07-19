@@ -37,8 +37,12 @@ fi
 
 require_literal "${WORKFLOW}" 'mysql84-schema:'
 require_literal "${WORKFLOW}" 'ci-lint:'
+require_literal "${WORKFLOW}" 'timeout-minutes: 20'
 require_literal "${WORKFLOW}" 'timeout-minutes: 15'
 require_literal "${WORKFLOW}" 'timeout-minutes: 5'
+require_literal "${WORKFLOW}" 'services:'
+require_literal "${WORKFLOW}" 'redis:8.4-alpine@sha256:61ea466e4022f3803b9f019e01f7738aac694f01989aee35a013724921d8e742'
+require_literal "${WORKFLOW}" 'REDIS_TEST_ADDR: 127.0.0.1:6379'
 require_literal "${WORKFLOW}" 'bash scripts/ci/mysql84-schema-gate.sh'
 require_literal "${WORKFLOW}" 'actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830'
 require_literal "${WORKFLOW}" 'koalaman/shellcheck@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d'
