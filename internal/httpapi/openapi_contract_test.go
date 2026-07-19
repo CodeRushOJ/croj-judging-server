@@ -356,6 +356,28 @@ func TestOpenAPISourceCodeExistsOnlyInSubmitRequest(t *testing.T) {
 	}
 }
 
+func TestSensitiveExampleValueMarkerRejectsPayloadsButAllowsCapabilityNames(t *testing.T) {
+	for name, value := range map[string]string{
+		"source":  "sourceCode=int main(){}",
+		"hidden":  "hidden input: top secret case",
+		"object":  "object_key=tenant/private.zip",
+		"storage": "storageUrl=https://private.invalid/bundle",
+		"staging": "staging-key: pending/123",
+		"lease":   "leaseToken=worker-claim",
+		"token":   "token=credential-value",
+		"secret":  "secret: credential-value",
+	} {
+		if marker := sensitiveExampleValueMarker(value); marker == "" {
+			t.Errorf("%s leak was not detected in %q", name, value)
+		}
+	}
+	for _, value := range []string{"exact", "token", "Provide a valid active API key.", "The request could not be completed."} {
+		if marker := sensitiveExampleValueMarker(value); marker != "" {
+			t.Errorf("safe value %q matched %q", value, marker)
+		}
+	}
+}
+
 func TestOpenAPIProblemExamplesMatchHandlerProblemTypes(t *testing.T) {
 	document := loadOpenAPIContract(t)
 	for name, test := range map[string]struct {
@@ -385,6 +407,24 @@ func TestOpenAPIProblemExamplesMatchHandlerProblemTypes(t *testing.T) {
 			}
 			if !slicesContains(got, want) {
 				t.Fatalf("problem types = %v, want %s", got, want)
+			}
+		})
+	}
+}
+
+func TestOpenAPIConflictExamplesMatchLiveHandlerDetails(t *testing.T) {
+	document := loadOpenAPIContract(t)
+	for name, test := range map[string]struct {
+		path, detail string
+	}{
+		"bundle": {"/api/v1/bundles", "The Idempotency-Key was already used for different content."},
+		"job":    {"/api/v1/judge-jobs", "The Idempotency-Key is already bound to a different request."},
+	} {
+		t.Run(name, func(t *testing.T) {
+			example := responseExample(t, document, test.path, http.MethodPost, 409)
+			object, ok := example.(map[string]any)
+			if !ok || object["detail"] != test.detail {
+				t.Fatalf("conflict example = %#v, want detail %q", example, test.detail)
 			}
 		})
 	}
@@ -610,7 +650,34 @@ func assertSafePublicExample(t *testing.T, location string, value any) {
 		for index, child := range typed {
 			assertSafePublicExample(t, fmt.Sprintf("%s[%d]", location, index), child)
 		}
+	case string:
+		if marker := sensitiveExampleValueMarker(typed); marker != "" {
+			t.Errorf("%s contains forbidden example value marker %q", location, marker)
+		}
 	}
+}
+
+func sensitiveExampleValueMarker(value string) string {
+	lower := strings.ToLower(value)
+	for _, marker := range []string{
+		"sourcecode", "source_code", "source code",
+		"hiddeninput", "hidden_input", "hidden input",
+		"hiddenoutput", "hidden_output", "hidden output",
+		"expectedoutput", "expected_output", "expected output",
+		"objectkey", "object_key", "object-key", "object key",
+		"objecturl", "object_url", "object-url", "object url",
+		"storagekey", "storage_key", "storage-key", "storage key",
+		"storageurl", "storage_url", "storage-url", "storage url",
+		"stagingkey", "staging_key", "staging-key", "staging key",
+		"stagingurl", "staging_url", "staging-url", "staging url",
+		"leasetoken", "lease_token", "lease-token", "lease token",
+		"token=", "token:", "secret=", "secret:",
+	} {
+		if strings.Contains(lower, marker) {
+			return marker
+		}
+	}
+	return ""
 }
 
 func collectPropertyLocations(location, propertyName string, reference *openapi3.SchemaRef, visited map[*openapi3.Schema]bool, found *[]string) {

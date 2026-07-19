@@ -153,7 +153,7 @@ paths:
         '403':
           $ref: '#/components/responses/Forbidden'
         '409':
-          $ref: '#/components/responses/Conflict'
+          $ref: '#/components/responses/BundleConflict'
         '413':
           $ref: '#/components/responses/PayloadTooLarge'
         '429':
@@ -262,7 +262,7 @@ paths:
         '404':
           $ref: '#/components/responses/JobNotFound'
         '409':
-          $ref: '#/components/responses/Conflict'
+          $ref: '#/components/responses/JobConflict'
         '422':
           $ref: '#/components/responses/UnprocessableEntity'
         '429':
@@ -600,8 +600,23 @@ components:
             status: 404
             detail: The requested judge job does not exist.
             requestId: unavailable
-    Conflict:
-      description: The Idempotency-Key is already bound to different content.
+    BundleConflict:
+      description: The bundle Idempotency-Key was already used for different content.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://coderushoj.dev/problems/idempotency-conflict
+            title: Idempotency conflict
+            status: 409
+            detail: The Idempotency-Key was already used for different content.
+            requestId: unavailable
+    JobConflict:
+      description: The job Idempotency-Key is already bound to a different request.
       headers:
         X-Request-Id:
           $ref: '#/components/headers/XRequestId'
