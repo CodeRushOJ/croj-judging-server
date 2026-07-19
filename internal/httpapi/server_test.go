@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -60,6 +61,23 @@ func TestCapabilitiesRequiresScope(t *testing.T) {
 
 	if response.Code != http.StatusForbidden || response.Header().Get("Content-Type") != "application/problem+json" {
 		t.Fatalf("status=%d headers=%#v body=%s", response.Code, response.Header(), response.Body.String())
+	}
+}
+
+func TestCapabilitiesReturnsRetryableServiceUnavailableWhenAuthenticationStorageFails(t *testing.T) {
+	server, err := NewServer(staticAuthenticator{err: fmt.Errorf("%w: mysql 10.0.0.8 timed out", ErrAuthenticationUnavailable)}, testCapabilities())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/capabilities", nil)
+	request.Header.Set("Authorization", "Bearer syntactically-valid-key")
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable || response.Header().Get("Retry-After") == "" {
+		t.Fatalf("status=%d headers=%#v body=%s", response.Code, response.Header(), response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "10.0.0.8") || strings.Contains(response.Body.String(), "mysql") {
+		t.Fatalf("problem leaked repository details: %s", response.Body.String())
 	}
 }
 

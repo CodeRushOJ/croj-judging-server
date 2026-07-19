@@ -61,14 +61,13 @@ func TestAuthenticatorReturnsOneUniformErrorForInvalidCredentials(t *testing.T) 
 		credential *Credential
 		storeErr   error
 	}{
-		"missing":                {},
-		"wrong scheme":           {header: "Basic abc"},
-		"malformed":              {header: "Bearer croj_short_not-base64!"},
-		"unknown":                {header: "Bearer " + validKey},
-		"repository uncertainty": {header: "Bearer " + validKey, storeErr: errors.New("database unavailable")},
-		"wrong digest":           {header: "Bearer " + validKey, credential: &Credential{TenantID: "tenant-7", Digest: make([]byte, sha256.Size)}},
-		"revoked":                {header: "Bearer " + validKey, credential: &Credential{TenantID: "tenant-7", Digest: keyDigest(pepper, validKey), RevokedAt: pointer(now.Add(-time.Minute))}},
-		"expired":                {header: "Bearer " + validKey, credential: &Credential{TenantID: "tenant-7", Digest: keyDigest(pepper, validKey), ExpiresAt: pointer(now.Add(-time.Second))}},
+		"missing":      {},
+		"wrong scheme": {header: "Basic abc"},
+		"malformed":    {header: "Bearer croj_short_not-base64!"},
+		"unknown":      {header: "Bearer " + validKey},
+		"wrong digest": {header: "Bearer " + validKey, credential: &Credential{TenantID: "tenant-7", Digest: make([]byte, sha256.Size)}},
+		"revoked":      {header: "Bearer " + validKey, credential: &Credential{TenantID: "tenant-7", Digest: keyDigest(pepper, validKey), RevokedAt: pointer(now.Add(-time.Minute))}},
+		"expired":      {header: "Bearer " + validKey, credential: &Credential{TenantID: "tenant-7", Digest: keyDigest(pepper, validKey), ExpiresAt: pointer(now.Add(-time.Second))}},
 	}
 
 	for name, test := range tests {
@@ -83,6 +82,40 @@ func TestAuthenticatorReturnsOneUniformErrorForInvalidCredentials(t *testing.T) 
 				t.Fatalf("error = %v, want uniform unauthenticated", err)
 			}
 		})
+	}
+}
+
+func TestAuthenticatorPreservesCredentialRepositoryUnavailability(t *testing.T) {
+	pepper := []byte("0123456789abcdef0123456789abcdef")
+	secret := base64.RawURLEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
+	storeError := errors.New("database unavailable with internal address")
+	authenticator, err := NewAuthenticator(&credentialStoreStub{err: storeError}, pepper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = authenticator.Authenticate(context.Background(), "Bearer croj_public12_"+secret)
+	if !errors.Is(err, ErrAuthenticationUnavailable) || !errors.Is(err, storeError) {
+		t.Fatalf("error = %v, want typed unavailable preserving cause", err)
+	}
+}
+
+func TestAuthenticatorAcceptsCaseInsensitiveBearerWithOneOrMoreSpaces(t *testing.T) {
+	pepper := []byte("0123456789abcdef0123456789abcdef")
+	secret := base64.RawURLEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
+	key := "croj_public12_" + secret
+	store := &credentialStoreStub{credential: &Credential{
+		TenantID: "tenant-7",
+		Digest:   keyDigest(pepper, key),
+		Scopes:   []Scope{ScopeCapabilitiesRead},
+	}}
+	authenticator, err := NewAuthenticator(store, pepper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, header := range []string{"bearer " + key, "BEARER   " + key} {
+		if _, err := authenticator.Authenticate(context.Background(), header); err != nil {
+			t.Fatalf("header %q: %v", header, err)
+		}
 	}
 }
 

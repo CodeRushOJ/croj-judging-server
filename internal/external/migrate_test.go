@@ -47,6 +47,14 @@ func TestEmbeddedMigrationsDefineTheCompleteJudgeOwnedSchema(t *testing.T) {
 		"check (status in ('queued','running','succeeded','failed','cancelled'))",
 		"check (source_size_bytes > 0)",
 		"check (attempt_no > 0)",
+		"unique key uk_external_bundle_id_tenant (id, tenant_id)",
+		"unique key uk_external_source_id_tenant (id, tenant_id)",
+		"unique key uk_external_callback_id_tenant (id, tenant_id)",
+		"unique key uk_external_job_id_tenant (id, tenant_id)",
+		"foreign key (bundle_id, tenant_id) references t_external_bundle(id, tenant_id)",
+		"foreign key (source_object_id, tenant_id) references t_external_source_object(id, tenant_id)",
+		"foreign key (callback_id, tenant_id) references t_external_callback(id, tenant_id)",
+		"foreign key (job_id, tenant_id) references t_external_job(id, tenant_id)",
 	} {
 		if !strings.Contains(sql, contract) {
 			t.Errorf("migration is missing contract %q", contract)
