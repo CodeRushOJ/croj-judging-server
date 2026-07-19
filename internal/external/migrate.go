@@ -89,6 +89,97 @@ func ApplyMigrations(ctx context.Context, database *sql.DB) error {
 	return applyMigrations(ctx, sqlMigrationConnection{connection: connection}, migrations)
 }
 
+type migrationHistoryQueryer interface {
+	QueryContext(context.Context, string, ...any) (rowsScanner, error)
+}
+
+type migrationHistoryRecord struct {
+	version  int
+	name     string
+	checksum string
+}
+
+// ValidateMigrations verifies that the database has exactly the embedded
+// schema history. It performs no DDL and is safe for startup/readiness checks.
+func ValidateMigrations(ctx context.Context, database *sql.DB) error {
+	if database == nil {
+		return fmt.Errorf("migration database is required")
+	}
+	migrations, err := Migrations()
+	if err != nil {
+		return err
+	}
+	connection := sqlMigrationDatabase{database: database}
+	if err := validateMigrationHistory(ctx, connection, migrations); err != nil {
+		return err
+	}
+	for _, migration := range migrations {
+		if err := validateMigrationPostconditions(ctx, connection, migration); err != nil {
+			return fmt.Errorf("validate migration %d: %w", migration.Version, err)
+		}
+	}
+	return nil
+}
+
+type sqlMigrationDatabase struct{ database *sql.DB }
+
+func (queryer sqlMigrationDatabase) QueryContext(ctx context.Context, query string, arguments ...any) (rowsScanner, error) {
+	return queryer.database.QueryContext(ctx, query, arguments...)
+}
+
+func (queryer sqlMigrationDatabase) QueryRowContext(ctx context.Context, query string, arguments ...any) rowScanner {
+	return queryer.database.QueryRowContext(ctx, query, arguments...)
+}
+
+func (queryer sqlMigrationDatabase) ExecContext(ctx context.Context, query string, arguments ...any) (sql.Result, error) {
+	return queryer.database.ExecContext(ctx, query, arguments...)
+}
+
+func validateMigrationHistory(ctx context.Context, queryer migrationHistoryQueryer, migrations []Migration) error {
+	if queryer == nil {
+		return fmt.Errorf("migration history queryer is required")
+	}
+	rows, err := queryer.QueryContext(ctx, "SELECT version, name, checksum FROM t_judge_schema_history ORDER BY version")
+	if err != nil {
+		return fmt.Errorf("read migration history: %w", err)
+	}
+	defer rows.Close()
+	applied := make(map[int]migrationHistoryRecord, len(migrations))
+	for rows.Next() {
+		var record migrationHistoryRecord
+		if err := rows.Scan(&record.version, &record.name, &record.checksum); err != nil {
+			return fmt.Errorf("scan migration history: %w", err)
+		}
+		if _, duplicate := applied[record.version]; duplicate {
+			return fmt.Errorf("migration history contains duplicate version %d", record.version)
+		}
+		applied[record.version] = record
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate migration history: %w", err)
+	}
+	known := make(map[int]Migration, len(migrations))
+	for _, migration := range migrations {
+		known[migration.Version] = migration
+		record, exists := applied[migration.Version]
+		if !exists {
+			return fmt.Errorf("migration %d %s is not applied", migration.Version, migration.Name)
+		}
+		if record.name != migration.Name {
+			return fmt.Errorf("migration %d name drift: database=%s embedded=%s", migration.Version, record.name, migration.Name)
+		}
+		if record.checksum != migration.Checksum {
+			return fmt.Errorf("migration %d checksum drift: database=%s embedded=%s", migration.Version, record.checksum, migration.Checksum)
+		}
+	}
+	for version := range applied {
+		if _, exists := known[version]; !exists {
+			return fmt.Errorf("database contains unknown migration version %d", version)
+		}
+	}
+	return nil
+}
+
 func applyMigrations(ctx context.Context, connection migrationConnection, migrations []Migration) (resultErr error) {
 	var acquired int
 	if err := connection.QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)", migrationLockName, 30).Scan(&acquired); err != nil {
@@ -188,18 +279,123 @@ func isExplicitlyReplayableMigrationError(statement string, executionErr error) 
 }
 
 func validateMigrationPostconditions(ctx context.Context, connection migrationConnection, migration Migration) error {
-	if migration.Version != 3 || migration.Name != "durable_job_fencing" {
+	var query, description string
+	switch {
+	case migration.Version == 3 && migration.Name == "durable_job_fencing":
+		query = durableFencingSchemaValidationSQL
+		description = "durable fencing schema"
+	case migration.Version == 4 && migration.Name == "tenant_policy_execution_ceilings":
+		query = tenantPolicyCeilingsValidationSQL
+		description = "tenant policy execution ceilings"
+	case migration.Version == 5 && migration.Name == "durable_webhook_outbox":
+		query = durableWebhookSchemaValidationSQL
+		description = "durable webhook schema"
+	default:
 		return nil
 	}
 	var valid int
-	if err := connection.QueryRowContext(ctx, durableFencingSchemaValidationSQL).Scan(&valid); err != nil {
-		return fmt.Errorf("inspect durable fencing schema: %w", err)
+	if err := connection.QueryRowContext(ctx, query).Scan(&valid); err != nil {
+		return fmt.Errorf("inspect %s: %w", description, err)
 	}
 	if valid != 1 {
-		return fmt.Errorf("durable fencing schema does not match the required columns, indexes, constraints, and reservation table")
+		return fmt.Errorf("%s does not match its required postconditions", description)
 	}
 	return nil
 }
+
+const tenantPolicyCeilingsValidationSQL = `SELECT NOT EXISTS (
+    SELECT 1 FROM t_external_tenant
+    WHERE NOT JSON_CONTAINS_PATH(policy_json, 'all', '$.maxTimeLimitMillis', '$.maxMemoryLimitMiB')
+       OR CAST(JSON_UNQUOTE(JSON_EXTRACT(policy_json, '$.maxTimeLimitMillis')) AS UNSIGNED) = 0
+       OR CAST(JSON_UNQUOTE(JSON_EXTRACT(policy_json, '$.maxMemoryLimitMiB')) AS UNSIGNED) = 0
+)`
+
+const durableWebhookSchemaValidationSQL = `SELECT
+    EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = DATABASE() AND table_name = 't_external_callback'
+          AND column_name = 'secret_nonce' AND column_type = 'binary(12)' AND is_nullable = 'YES'
+    )
+    AND EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = DATABASE() AND table_name = 't_external_webhook_outbox'
+          AND column_name = 'payload_body' AND column_type = 'mediumblob' AND is_nullable = 'NO'
+    )
+    AND EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = DATABASE() AND table_name = 't_external_webhook_outbox'
+          AND column_name = 'worker_id' AND column_type = 'varchar(128)'
+          AND character_set_name = 'ascii' AND collation_name = 'ascii_bin' AND is_nullable = 'YES'
+    )
+    AND EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = DATABASE() AND table_name = 't_external_webhook_outbox'
+          AND column_name = 'lease_token' AND column_type = 'binary(32)' AND is_nullable = 'YES'
+    )
+    AND EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = DATABASE() AND table_name = 't_external_webhook_outbox'
+          AND column_name = 'lease_until' AND column_type = 'datetime(3)' AND is_nullable = 'YES'
+    )
+    AND EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = DATABASE() AND table_name = 't_external_webhook_outbox'
+          AND column_name = 'dead_at' AND column_type = 'datetime(3)' AND is_nullable = 'YES'
+    )
+    AND COALESCE((
+        SELECT GROUP_CONCAT(column_name ORDER BY seq_in_index SEPARATOR ',')
+        FROM information_schema.statistics
+        WHERE table_schema = DATABASE() AND table_name = 't_external_webhook_outbox'
+          AND index_name = 'uk_external_webhook_job' AND non_unique = 0
+    ), '') = 'job_id'
+    AND COALESCE((
+        SELECT GROUP_CONCAT(column_name ORDER BY seq_in_index SEPARATOR ',')
+        FROM information_schema.statistics
+        WHERE table_schema = DATABASE() AND table_name = 't_external_webhook_outbox'
+          AND index_name = 'idx_external_webhook_delivery'
+    ), '') = 'status,next_attempt_at,lease_until,tenant_id,id'
+    AND EXISTS (
+        SELECT 1
+        FROM information_schema.table_constraints AS table_constraint
+        JOIN information_schema.check_constraints AS check_constraint
+          ON check_constraint.constraint_schema = table_constraint.constraint_schema
+         AND check_constraint.constraint_name = table_constraint.constraint_name
+        WHERE table_constraint.constraint_schema = DATABASE()
+          AND table_constraint.table_name = 't_external_callback'
+          AND table_constraint.constraint_type = 'CHECK'
+          AND table_constraint.constraint_name = 'chk_external_callback_active_cipher'
+          AND table_constraint.enforced = 'YES'
+          AND REPLACE(REPLACE(LOWER(check_constraint.check_clause), CHAR(96), ''), CHAR(92), '') =
+              '((disabled_at is not null) or ((secret_nonce is not null) and (length(secret_nonce) = 12) and (length(secret_ciphertext) > 16) and (secret_key_version > 0)))'
+    )
+    AND EXISTS (
+        SELECT 1
+        FROM information_schema.table_constraints AS table_constraint
+        JOIN information_schema.check_constraints AS check_constraint
+          ON check_constraint.constraint_schema = table_constraint.constraint_schema
+         AND check_constraint.constraint_name = table_constraint.constraint_name
+        WHERE table_constraint.constraint_schema = DATABASE()
+          AND table_constraint.table_name = 't_external_webhook_outbox'
+          AND table_constraint.constraint_type = 'CHECK'
+          AND table_constraint.constraint_name = 'chk_external_webhook_status'
+          AND table_constraint.enforced = 'YES'
+          AND REPLACE(REPLACE(LOWER(check_constraint.check_clause), CHAR(96), ''), CHAR(92), '') =
+              '(status in (_utf8mb4''pending'',_utf8mb4''delivering'',_utf8mb4''delivered'',_utf8mb4''dead''))'
+    )
+    AND EXISTS (
+        SELECT 1
+        FROM information_schema.table_constraints AS table_constraint
+        JOIN information_schema.check_constraints AS check_constraint
+          ON check_constraint.constraint_schema = table_constraint.constraint_schema
+         AND check_constraint.constraint_name = table_constraint.constraint_name
+        WHERE table_constraint.constraint_schema = DATABASE()
+          AND table_constraint.table_name = 't_external_webhook_outbox'
+          AND table_constraint.constraint_type = 'CHECK'
+          AND table_constraint.constraint_name = 'chk_external_webhook_active_lease'
+          AND table_constraint.enforced = 'YES'
+          AND REPLACE(REPLACE(LOWER(check_constraint.check_clause), CHAR(96), ''), CHAR(92), '') =
+              '(((status = _utf8mb4''delivering'') and (worker_id is not null) and (lease_token is not null) and (lease_until is not null)) or ((status <> _utf8mb4''delivering'') and (worker_id is null) and (lease_token is null) and (lease_until is null)))'
+    )`
 
 const durableFencingSchemaValidationSQL = `SELECT
     EXISTS (

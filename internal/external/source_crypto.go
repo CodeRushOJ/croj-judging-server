@@ -5,10 +5,14 @@ import (
 	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
+	"strings"
 )
 
 const sourceNonceBytes = 12
@@ -47,6 +51,61 @@ func NewSourceCipher(activeVersion uint16, keys map[uint16][]byte, random io.Rea
 		return nil, fmt.Errorf("active source key version %d is missing", activeVersion)
 	}
 	return &SourceCipher{activeVersion: activeVersion, keys: copied, random: random}, nil
+}
+
+func DecodeSourceKeyRing(active, encoded string, random io.Reader) (*SourceCipher, error) {
+	parsedActive, err := strconv.ParseUint(active, 10, 16)
+	if err != nil || parsedActive == 0 {
+		return nil, fmt.Errorf("source active key version must be an integer between 1 and 65535")
+	}
+	decoder := json.NewDecoder(strings.NewReader(encoded))
+	first, err := decoder.Token()
+	if err != nil || first != json.Delim('{') {
+		return nil, fmt.Errorf("source key ring must be a JSON object")
+	}
+	keys := make(map[uint16][]byte)
+	defer func() {
+		for _, key := range keys {
+			clear(key)
+		}
+	}()
+	for decoder.More() {
+		rawVersion, err := decoder.Token()
+		if err != nil {
+			return nil, fmt.Errorf("decode source key version")
+		}
+		versionText, ok := rawVersion.(string)
+		if !ok {
+			return nil, fmt.Errorf("source key version is invalid")
+		}
+		parsedVersion, err := strconv.ParseUint(versionText, 10, 16)
+		if err != nil || parsedVersion == 0 {
+			return nil, fmt.Errorf("source key version must be an integer between 1 and 65535")
+		}
+		version := uint16(parsedVersion)
+		if _, exists := keys[version]; exists {
+			return nil, fmt.Errorf("source key version %d is duplicated", version)
+		}
+		var encodedKey string
+		if err := decoder.Decode(&encodedKey); err != nil {
+			return nil, fmt.Errorf("decode source key version %d", version)
+		}
+		key, err := base64.StdEncoding.DecodeString(encodedKey)
+		if err != nil || len(key) != 32 {
+			clear(key)
+			return nil, fmt.Errorf("source key version %d must be 32 bytes encoded as base64", version)
+		}
+		keys[version] = key
+	}
+	closing, err := decoder.Token()
+	if err != nil || closing != json.Delim('}') {
+		return nil, fmt.Errorf("source key ring object is incomplete")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("source key ring contains trailing data")
+	}
+	return NewSourceCipher(uint16(parsedActive), keys, random)
 }
 
 func (sourceCipher *SourceCipher) Encrypt(tenantID, sourceObjectID string, plaintext []byte) (EncryptedSource, error) {

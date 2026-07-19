@@ -3,7 +3,9 @@ package external
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/base64"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -85,5 +87,47 @@ func TestSourceCipherRejectsUnsafeKeysEmptySourceAndEntropyFailure(t *testing.T)
 	}
 	if _, err := cipher.Encrypt("tenant-7", "src_01", []byte("x")); !errors.Is(err, ErrSourceEncryption) {
 		t.Fatalf("entropy error = %v", err)
+	}
+}
+
+func TestDecodeSourceKeyRingRotatesWithoutOrphaningHistoricalCiphertext(t *testing.T) {
+	keyV1 := bytes.Repeat([]byte{0x31}, 32)
+	keyV2 := bytes.Repeat([]byte{0x32}, 32)
+	legacy, err := NewSourceCipher(1, map[uint16][]byte{1: keyV1}, bytes.NewReader(bytes.Repeat([]byte{0x41}, sourceNonceBytes)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	historical, err := legacy.Encrypt("tenant-a", "source-a", []byte("historical"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ring := `{"1":"` + base64.StdEncoding.EncodeToString(keyV1) + `","2":"` + base64.StdEncoding.EncodeToString(keyV2) + `"}`
+	rotated, err := DecodeSourceKeyRing("2", ring, bytes.NewReader(bytes.Repeat([]byte{0x42}, sourceNonceBytes)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := rotated.Encrypt("tenant-a", "source-b", []byte("current"))
+	if err != nil || current.KeyVersion != 2 {
+		t.Fatalf("current=%+v error=%v", current, err)
+	}
+	recovered, err := rotated.Decrypt("tenant-a", "source-a", historical)
+	if err != nil || string(recovered) != "historical" {
+		t.Fatalf("historical=%q error=%v", recovered, err)
+	}
+}
+
+func TestDecodeSourceKeyRingRejectsAmbiguousOrInvalidConfiguration(t *testing.T) {
+	key := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x51}, 32))
+	for name, input := range map[string]struct{ active, ring string }{
+		"missing active": {active: "2", ring: `{"1":"` + key + `"}`},
+		"duplicate":      {active: "1", ring: `{"1":"` + key + `","1":"` + key + `"}`},
+		"short key":      {active: "1", ring: `{"1":"` + base64.StdEncoding.EncodeToString(make([]byte, 16)) + `"}`},
+		"trailing":       {active: "1", ring: `{"1":"` + key + `"} true`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := DecodeSourceKeyRing(input.active, input.ring, bytes.NewReader(make([]byte, sourceNonceBytes))); err == nil || strings.Contains(err.Error(), key) {
+				t.Fatalf("error=%v", err)
+			}
+		})
 	}
 }

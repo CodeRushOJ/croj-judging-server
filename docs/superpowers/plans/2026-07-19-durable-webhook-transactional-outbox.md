@@ -12,7 +12,7 @@
 
 ## File map
 
-- `internal/external/migrations/004_durable_webhook_outbox.sql`: replay-safe schema upgrade and legacy callback disablement.
+- `internal/external/migrations/005_durable_webhook_outbox.sql`: replay-safe schema upgrade and legacy callback disablement (renumbered after canonical execution ceilings became v4).
 - `internal/external/callback_crypto.go`: canonical destination, callback secret material, AES-GCM key ring, environment decoder.
 - `internal/external/provision.go`: callback provisioning and encrypted persistence.
 - `internal/admincli/run.go`, `cmd/judge-admin/main.go`: operator-only `callback create` command and key-ring injection.
@@ -26,7 +26,7 @@
 ### Task 1: Replay-safe durable outbox migration
 
 **Files:**
-- Create: `internal/external/migrations/004_durable_webhook_outbox.sql`
+- Create: `internal/external/migrations/005_durable_webhook_outbox.sql`
 - Modify: `internal/external/migrate_test.go`
 - Modify: `internal/external/mysql_integration_test.go`
 - Create: `docs/testing/durable-webhook-outbox-red-green.md`
@@ -100,7 +100,7 @@ Expected: PASS (MySQL tests SKIP without `JUDGE_TEST_MYSQL_DSN`). Record GREEN.
 - [ ] **Step 6: Commit Task 1**
 
 ```bash
-git add internal/external/migrations/004_durable_webhook_outbox.sql internal/external/migrate_test.go internal/external/mysql_integration_test.go docs/testing/durable-webhook-outbox-red-green.md
+git add internal/external/migrations/005_durable_webhook_outbox.sql internal/external/migrate_test.go internal/external/mysql_integration_test.go docs/testing/durable-webhook-outbox-red-green.md
 git commit -m "feat(webhook): migrate durable outbox state"
 ```
 

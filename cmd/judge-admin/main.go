@@ -51,12 +51,18 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	startupContext, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
 	if err := database.PingContext(startupContext); err != nil {
+		cancel()
 		return fmt.Errorf("connect judge database: %w", err)
 	}
-	if err := external.ApplyMigrations(startupContext, database); err != nil {
+	cancel()
+	migrationContext, cancelMigration := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancelMigration()
+	if err := external.ApplyMigrations(migrationContext, database); err != nil {
 		return err
+	}
+	if migrationOnly(os.Args[1:]) {
+		return nil
 	}
 	options, err := callbackProvisionerOptions(os.Args[1:], os.Getenv, rand.Reader)
 	if err != nil {
@@ -67,6 +73,10 @@ func run() error {
 		return err
 	}
 	return admincli.Run(ctx, os.Args[1:], provisioner, pepper, os.Stdout)
+}
+
+func migrationOnly(arguments []string) bool {
+	return len(arguments) == 2 && arguments[0] == "schema" && arguments[1] == "migrate"
 }
 
 func callbackProvisionerOptions(arguments []string, getenv func(string) string, random io.Reader) ([]external.ProvisionerOption, error) {

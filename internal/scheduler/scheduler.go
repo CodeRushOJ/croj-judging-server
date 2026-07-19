@@ -63,12 +63,25 @@ func (s *Scheduler) Run(ctx context.Context, interval time.Duration) {
 }
 
 func (s *Scheduler) SelectSandbox() (string, error) {
+	return s.SelectSandboxExcluding(nil)
+}
+
+// SelectSandboxExcluding atomically advances round-robin selection while
+// skipping endpoints already attempted by one logical batch.
+func (s *Scheduler) SelectSandboxExcluding(excluded map[string]struct{}) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.endpoints) == 0 {
 		return "", fmt.Errorf("no ready sandbox endpoints")
 	}
-	selected := s.endpoints[s.next%uint64(len(s.endpoints))]
-	s.next++
-	return selected, nil
+	for offset := range len(s.endpoints) {
+		index := (s.next + uint64(offset)) % uint64(len(s.endpoints))
+		selected := s.endpoints[index]
+		if _, skip := excluded[selected]; skip {
+			continue
+		}
+		s.next = index + 1
+		return selected, nil
+	}
+	return "", fmt.Errorf("no untried ready sandbox endpoints")
 }

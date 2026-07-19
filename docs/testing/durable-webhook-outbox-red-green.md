@@ -10,7 +10,7 @@ Command (Go 1.26.3 container):
 docker run --rm -v "$PWD:/workspace" -v coderushoj-go-cache:/go/pkg/mod -v coderushoj-go-build-cache:/root/.cache/go-build -w /workspace golang:1.26.3 go test ./internal/external -run 'TestDurableWebhookMigrationDefinesFencedOutboxAndDisablesLegacyCallbacks|TestEmbeddedMigrations' -count=1
 ```
 
-Observed failure: `TestDurableWebhookMigrationDefinesFencedOutboxAndDisablesLegacyCallbacks` received only migrations 1–3. This is the expected feature-missing failure before migration 4 exists.
+Observed failure: `TestDurableWebhookMigrationDefinesFencedOutboxAndDisablesLegacyCallbacks` received only migrations 1–3. This was the expected feature-missing failure before the outbox migration existed; canonical integration later assigned tenant policy to v4 and the outbox to v5.
 
 ### GREEN
 

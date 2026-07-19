@@ -40,6 +40,7 @@ func TestMySQLWebhookEndToEndHMACAndAtLeastOnceRecovery(t *testing.T) {
 	tenantID, err := provisioner.CreateTenant(context.Background(), "Webhook contract", TenantPolicy{
 		MaxQueuedJobs: 8, MaxRunningJobs: 1, MaxSourceBytes: 1 << 20,
 		MaxRetainedBundles: 16, DailyExecutionMillis: 3_600_000, MaxInfrastructureTries: 3,
+		MaxTimeLimitMillis: 10_000, MaxMemoryLimitMiB: 1024,
 	})
 	if err != nil {
 		t.Fatal(err)

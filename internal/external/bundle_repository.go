@@ -86,14 +86,22 @@ func (repository *SQLBundleRepository) CommitBundleUpload(ctx context.Context, i
 	}()
 
 	var tenantInternalID uint64
+	var encodedPolicy []byte
 	if err := transaction.QueryRowContext(ctx, `
-SELECT id FROM t_external_tenant
+SELECT id, policy_json FROM t_external_tenant
 WHERE external_id = ? AND status = 'ACTIVE'
-FOR UPDATE`, input.TenantID).Scan(&tenantInternalID); err != nil {
+FOR UPDATE`, input.TenantID).Scan(&tenantInternalID, &encodedPolicy); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return BundleCommitResult{}, ErrBundleNotFound
 		}
 		return BundleCommitResult{}, fmt.Errorf("lock bundle tenant: %w", err)
+	}
+	policy, err := decodeTenantPolicy(encodedPolicy)
+	if err != nil {
+		return BundleCommitResult{}, fmt.Errorf("%w: bundle tenant policy is invalid", ErrInvalidBundle)
+	}
+	if !bundleWithinTenantPolicy(input, policy) {
+		return BundleCommitResult{}, fmt.Errorf("%w: execution limits exceed tenant maximum", ErrInvalidBundle)
 	}
 	if _, err := transaction.ExecContext(ctx, `
 DELETE FROM t_external_idempotency
@@ -483,7 +491,13 @@ func validBundleCommitInput(input BundleCommitInput) bool {
 		input.Metadata.SHA256 == digestHex && input.ObjectKey == path.Join("external", input.TenantID, "sha256", digestHex+".zip") &&
 		validStagingObjectKey(input.TenantID, input.StagingObjectKey, digestHex) &&
 		input.Metadata.CaseCount == len(manifest.Cases) && input.Metadata.ManifestVersion == manifest.SchemaVersion && validBundleMetadata(input.Metadata) &&
+		input.TimeLimitMillis == manifest.Limits.TimeLimitMillis && input.MemoryLimitMiB == manifest.Limits.MemoryLimitMiB &&
 		input.IdempotencyExpiresAt.After(input.Metadata.CreatedAt)
+}
+
+func bundleWithinTenantPolicy(input BundleCommitInput, policy TenantPolicy) bool {
+	return input.TimeLimitMillis > 0 && input.MemoryLimitMiB > 0 &&
+		input.TimeLimitMillis <= policy.MaxTimeLimitMillis && input.MemoryLimitMiB <= policy.MaxMemoryLimitMiB
 }
 
 func validStagingObjectKey(tenantID, key, digestHex string) bool {

@@ -28,3 +28,14 @@ func TestCallbackProvisionerOptionsDecodeTheActiveKeyRing(t *testing.T) {
 		t.Fatalf("callback options=%d error=%v", len(options), err)
 	}
 }
+
+func TestSchemaMigrateIsTheOnlyMigrationOnlyCommand(t *testing.T) {
+	if !migrationOnly([]string{"schema", "migrate"}) {
+		t.Fatal("schema migrate was not recognized")
+	}
+	for _, arguments := range [][]string{{"tenant", "create"}, {"schema", "migrate", "extra"}, {"migrate"}} {
+		if migrationOnly(arguments) {
+			t.Fatalf("unexpected migration-only command: %v", arguments)
+		}
+	}
+}

@@ -101,7 +101,7 @@ func TestCapabilitiesReturnsStableAuthenticatedContract(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &capabilities); err != nil {
 		t.Fatal(err)
 	}
-	if capabilities.APIVersion != "v1" || len(capabilities.Languages) != 1 || capabilities.Languages[0].ID != "cpp20" || capabilities.Limits.MaxCaseCount != 256 {
+	if capabilities.APIVersion != "v1" || len(capabilities.Languages) != 1 || capabilities.Languages[0].ID != "cpp20" || capabilities.Limits.MaxCaseCount != 256 || capabilities.Limits.MaxTimeLimitMillis != 10_000 || capabilities.Limits.MaxMemoryLimitMiB != 1024 {
 		t.Fatalf("capabilities = %+v", capabilities)
 	}
 	if strings.Contains(response.Body.String(), "tenant-7") || strings.Contains(response.Body.String(), "valid-secret") {
@@ -129,10 +129,12 @@ func testCapabilities() Capabilities {
 		JudgeModes: []string{"ACM"},
 		Checkers:   []string{"EXACT", "TOKEN"},
 		Limits: CapabilityLimits{
-			MaxSourceBytes: 1 << 20,
-			MaxBundleBytes: 64 << 20,
-			MaxCaseBytes:   64 << 20,
-			MaxCaseCount:   256,
+			MaxSourceBytes:     1 << 20,
+			MaxBundleBytes:     64 << 20,
+			MaxCaseBytes:       64 << 20,
+			MaxCaseCount:       256,
+			MaxTimeLimitMillis: 10_000,
+			MaxMemoryLimitMiB:  1024,
 		},
 	}
 }

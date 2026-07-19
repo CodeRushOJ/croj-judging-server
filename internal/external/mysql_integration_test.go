@@ -38,19 +38,21 @@ func openMySQLIntegration(t *testing.T) *sql.DB {
 func TestApplyMigrationsOnMySQL84IsReplaySafe(t *testing.T) {
 	database := openMySQLIntegration(t)
 	resetMySQLIntegrationSchema(t, database)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	if err := ApplyMigrations(ctx, database); err != nil {
 		t.Fatal(err)
 	}
-	if err := ApplyMigrations(ctx, database); err != nil {
+	replayContext, cancelReplay := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancelReplay()
+	if err := ApplyMigrations(replayContext, database); err != nil {
 		t.Fatalf("migration replay: %v", err)
 	}
 	var versionCount int
-	if err := database.QueryRowContext(ctx, "SELECT COUNT(*) FROM t_judge_schema_history WHERE version IN (1, 2, 3, 4)").Scan(&versionCount); err != nil {
+	if err := database.QueryRowContext(ctx, "SELECT COUNT(*) FROM t_judge_schema_history WHERE version IN (1, 2, 3, 4, 5)").Scan(&versionCount); err != nil {
 		t.Fatal(err)
 	}
-	if versionCount != 4 {
+	if versionCount != 5 {
 		t.Fatalf("migration versions = %d", versionCount)
 	}
 	var columnCount int
@@ -73,6 +75,26 @@ WHERE constraint_schema = DATABASE() AND constraint_type = 'CHECK'
 	}
 	if constraintCount != 2 {
 		t.Fatalf("active lease constraints = %d", constraintCount)
+	}
+}
+
+func TestValidateMigrationsRejectsDurableWebhookSchemaDrift(t *testing.T) {
+	database := openMySQLIntegration(t)
+	resetMySQLIntegrationSchema(t, database)
+	defer resetMySQLIntegrationSchema(t, database)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if err := ApplyMigrations(ctx, database); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateMigrations(ctx, database); err != nil {
+		t.Fatalf("valid schema rejected: %v", err)
+	}
+	if _, err := database.ExecContext(ctx, `ALTER TABLE t_external_callback MODIFY COLUMN secret_nonce BINARY(16) NULL`); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateMigrations(ctx, database); err == nil {
+		t.Fatal("v5 callback nonce schema drift was accepted")
 	}
 }
 
@@ -173,7 +195,7 @@ FROM t_external_job AS job WHERE job.id = ?`, eventID, payload, jobID); err != n
 			t.Fatal(err)
 		}
 	}
-	if err := ApplyMigrations(ctx, database); err == nil || !strings.Contains(err.Error(), "migration 4") {
+	if err := ApplyMigrations(ctx, database); err == nil || !strings.Contains(err.Error(), "migration 5") {
 		t.Fatalf("duplicate legacy migration error = %v", err)
 	}
 	var count int
@@ -222,6 +244,73 @@ VALUES (?, ?, ?, ?, ?, 'FAILED', 'cpp20', UNHEX(SHA2(?, 256)), CURRENT_TIMESTAMP
 	}
 	jobID, _ := jobResult.LastInsertId()
 	return jobID
+}
+
+func TestTenantPolicyExecutionCeilingsMigrationBackfillsMissingValuesAndReplays(t *testing.T) {
+	database := openMySQLIntegration(t)
+	resetMySQLIntegrationSchema(t, database)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	migrations, err := Migrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(migrations) < 5 {
+		t.Fatalf("migration count = %d, want at least 5", len(migrations))
+	}
+	connection, err := database.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	if err := applyMigrations(ctx, sqlMigrationConnection{connection: connection}, migrations[:3]); err != nil {
+		t.Fatal(err)
+	}
+
+	missingID := "aaaaaaaaaaaaaaaaaaaaaaaaaa"
+	existingID := "bbbbbbbbbbbbbbbbbbbbbbbbbb"
+	if _, err := connection.ExecContext(ctx, `
+INSERT INTO t_external_tenant(external_id, name, status, policy_json) VALUES
+    (?, 'missing ceilings', 'ACTIVE', JSON_OBJECT('maxQueuedJobs', 4)),
+    (?, 'existing ceilings', 'ACTIVE', JSON_OBJECT(
+        'maxQueuedJobs', 4,
+        'maxTimeLimitMillis', 2500,
+        'maxMemoryLimitMiB', 384
+    ))`, missingID, existingID); err != nil {
+		t.Fatal(err)
+	}
+	statements, err := splitMigrationStatements(migrations[3].SQL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statements) != 2 {
+		t.Fatalf("tenant policy ceilings statements = %d, want 2", len(statements))
+	}
+	if _, err := connection.ExecContext(ctx, statements[0]); err != nil {
+		t.Fatalf("execute committed migration prefix: %v", err)
+	}
+
+	if err := applyMigrations(ctx, sqlMigrationConnection{connection: connection}, migrations); err != nil {
+		t.Fatalf("resume tenant policy ceilings migration: %v", err)
+	}
+	if err := applyMigrations(ctx, sqlMigrationConnection{connection: connection}, migrations); err != nil {
+		t.Fatalf("replay tenant policy ceilings migration: %v", err)
+	}
+
+	assertPolicyCeilings := func(externalID string, wantTime, wantMemory int) {
+		t.Helper()
+		var gotTime, gotMemory int
+		if err := connection.QueryRowContext(ctx, `
+SELECT policy_json->>'$.maxTimeLimitMillis', policy_json->>'$.maxMemoryLimitMiB'
+FROM t_external_tenant WHERE external_id = ?`, externalID).Scan(&gotTime, &gotMemory); err != nil {
+			t.Fatal(err)
+		}
+		if gotTime != wantTime || gotMemory != wantMemory {
+			t.Fatalf("tenant %s ceilings = %d/%d, want %d/%d", externalID, gotTime, gotMemory, wantTime, wantMemory)
+		}
+	}
+	assertPolicyCeilings(missingID, 10_000, 1024)
+	assertPolicyCeilings(existingID, 2500, 384)
 }
 
 func TestDurableFencingMigrationResumesAfterCommittedStatementPrefix(t *testing.T) {
@@ -362,7 +451,7 @@ func TestDurableFencingMigrationRecoversLegacyRunningRows(t *testing.T) {
 	if err := connection.Close(); err != nil {
 		t.Fatal(err)
 	}
-	policy := `{"maxQueuedJobs":4,"maxRunningJobs":1,"maxSourceBytes":1024,"maxRetainedBundles":4,"dailyExecutionMillis":1000,"maxInfrastructureTries":3}`
+	policy := `{"maxQueuedJobs":4,"maxRunningJobs":1,"maxSourceBytes":1024,"maxRetainedBundles":4,"dailyExecutionMillis":1000,"maxInfrastructureTries":3,"maxTimeLimitMillis":10000,"maxMemoryLimitMiB":1024}`
 	tenantResult, err := database.ExecContext(ctx, `
 INSERT INTO t_external_tenant(external_id, name, status, policy_json)
 VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaa', 'legacy tenant', 'ACTIVE', ?)`, policy)

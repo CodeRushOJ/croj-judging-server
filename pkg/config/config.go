@@ -16,7 +16,44 @@ type Config struct {
 	JudgeResult      JudgeResultConfig      `yaml:"judge-result"`
 	TestBundles      TestBundleConfig       `yaml:"test-bundles"`
 	SandboxDiscovery SandboxDiscoveryConfig `yaml:"sandbox-discovery"`
+	ExternalAPI      ExternalAPIConfig      `yaml:"external-api"`
+	LegacyJudge      LegacyJudgeConfig      `yaml:"legacy-judge"`
 	// 可以添加其他配置项，例如日志级别、沙盒路径等
+}
+
+type ExternalAPIConfig struct {
+	Enabled                  bool   `yaml:"enabled"`
+	ListenAddress            string `yaml:"listen-address"`
+	WorkerID                 string `yaml:"worker-id"`
+	WorkerConcurrency        int    `yaml:"worker-concurrency"`
+	LeaseDuration            string `yaml:"lease-duration"`
+	HeartbeatInterval        string `yaml:"heartbeat-interval"`
+	ControlPollInterval      string `yaml:"control-poll-interval"`
+	IdleBackoff              string `yaml:"idle-backoff"`
+	RetryDelay               string `yaml:"retry-delay"`
+	ShutdownTimeout          string `yaml:"shutdown-timeout"`
+	ReadinessTimeout         string `yaml:"readiness-timeout"`
+	RedisAddress             string `yaml:"redis-address"`
+	RedisPassword            string `yaml:"redis-password"`
+	RedisDB                  int    `yaml:"redis-db"`
+	RedisQuotaPrefix         string `yaml:"redis-quota-prefix"`
+	AuthPepperBase64         string `yaml:"auth-pepper-base64"`
+	IdempotencyPepperB64     string `yaml:"idempotency-pepper-base64"`
+	CursorKeyBase64          string `yaml:"cursor-key-base64"`
+	SourceKeyVersion         int    `yaml:"source-key-version"`
+	JudgeDatabaseDSN         string `yaml:"-"`
+	SourceKeysJSON           string `yaml:"-"`
+	CallbackKeyVersion       string `yaml:"-"`
+	CallbackKeysJSON         string `yaml:"-"`
+	WebhookWorkerConcurrency int    `yaml:"webhook-worker-concurrency"`
+	IdempotencyTTL           string `yaml:"idempotency-ttl"`
+	QuotaRefillPeriod        string `yaml:"quota-refill-period"`
+	JobSubmitCapacity        int64  `yaml:"job-submit-capacity"`
+	BundleByteCapacity       int64  `yaml:"bundle-byte-capacity"`
+}
+
+type LegacyJudgeConfig struct {
+	Enabled bool `yaml:"enabled"`
 }
 
 // RocketMQConfig RocketMQ 相关配置
@@ -72,23 +109,27 @@ type TestBundleConfig struct {
 	MaxUncompressedBytes int64  `yaml:"max-uncompressed-bytes"`
 	MaxCompressionRatio  uint64 `yaml:"max-compression-ratio"`
 	MaxInfraAttempts     int    `yaml:"max-infra-attempts"`
+	MaxTimeLimitMillis   int    `yaml:"max-time-limit-millis"`
+	MaxMemoryLimitMiB    int    `yaml:"max-memory-limit-mib"`
 }
 
 type SandboxDiscoveryConfig struct {
-	Namespace         string `yaml:"namespace"`
-	Service           string `yaml:"service"`
-	PortName          string `yaml:"port-name"`
-	RefreshInterval   string `yaml:"refresh-interval"`
-	ExecuteTimeout    string `yaml:"execute-timeout"`
-	MaxConnections    int    `yaml:"max-connections"`
-	ConnectionIdleTTL string `yaml:"connection-idle-ttl"`
-	Kubeconfig        string `yaml:"kubeconfig"`
+	Target                   string `yaml:"target"`
+	AllowLegacyEndpointSlice bool   `yaml:"allow-legacy-endpoint-slice"`
+	Namespace                string `yaml:"namespace"`
+	Service                  string `yaml:"service"`
+	PortName                 string `yaml:"port-name"`
+	RefreshInterval          string `yaml:"refresh-interval"`
+	ExecuteTimeout           string `yaml:"execute-timeout"`
+	MaxConnections           int    `yaml:"max-connections"`
+	ConnectionIdleTTL        string `yaml:"connection-idle-ttl"`
+	Kubeconfig               string `yaml:"kubeconfig"`
 }
 
 // LoadConfig 从指定路径加载配置文件
 func LoadConfig(configPath string) (*Config, error) {
 	fmt.Printf("Loading config from: %s\n", configPath)
-	config := &Config{}
+	config := &Config{LegacyJudge: LegacyJudgeConfig{Enabled: true}}
 
 	file, err := os.Open(configPath)
 	if err != nil {
@@ -109,6 +150,63 @@ func LoadConfig(configPath string) (*Config, error) {
 }
 
 func (config *Config) applyEnvironment() error {
+	if value, ok := os.LookupEnv("EXTERNAL_API_ENABLED"); ok {
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("EXTERNAL_API_ENABLED must be true or false")
+		}
+		config.ExternalAPI.Enabled = parsed
+	}
+	overrideString(&config.ExternalAPI.ListenAddress, "EXTERNAL_API_LISTEN_ADDRESS")
+	overrideString(&config.ExternalAPI.WorkerID, "EXTERNAL_WORKER_ID")
+	overrideString(&config.ExternalAPI.LeaseDuration, "EXTERNAL_WORKER_LEASE_DURATION")
+	overrideString(&config.ExternalAPI.HeartbeatInterval, "EXTERNAL_WORKER_HEARTBEAT_INTERVAL")
+	overrideString(&config.ExternalAPI.ControlPollInterval, "EXTERNAL_WORKER_CONTROL_POLL_INTERVAL")
+	overrideString(&config.ExternalAPI.IdleBackoff, "EXTERNAL_WORKER_IDLE_BACKOFF")
+	overrideString(&config.ExternalAPI.RetryDelay, "EXTERNAL_WORKER_RETRY_DELAY")
+	overrideString(&config.ExternalAPI.ShutdownTimeout, "EXTERNAL_API_SHUTDOWN_TIMEOUT")
+	overrideString(&config.ExternalAPI.ReadinessTimeout, "EXTERNAL_API_READINESS_TIMEOUT")
+	overrideString(&config.ExternalAPI.RedisAddress, "REDIS_ADDRESS")
+	overrideString(&config.ExternalAPI.RedisPassword, "REDIS_PASSWORD")
+	overrideString(&config.ExternalAPI.RedisQuotaPrefix, "EXTERNAL_REDIS_QUOTA_PREFIX")
+	overrideString(&config.ExternalAPI.AuthPepperBase64, "EXTERNAL_API_AUTH_PEPPER_BASE64")
+	overrideString(&config.ExternalAPI.IdempotencyPepperB64, "EXTERNAL_IDEMPOTENCY_PEPPER_BASE64")
+	overrideString(&config.ExternalAPI.CursorKeyBase64, "EXTERNAL_CURSOR_KEY_BASE64")
+	overrideString(&config.ExternalAPI.JudgeDatabaseDSN, "JUDGE_DATABASE_DSN")
+	overrideString(&config.ExternalAPI.SourceKeysJSON, "EXTERNAL_SOURCE_KEYS_JSON")
+	overrideString(&config.ExternalAPI.CallbackKeyVersion, "JUDGE_CALLBACK_KEY_VERSION")
+	overrideString(&config.ExternalAPI.CallbackKeysJSON, "JUDGE_CALLBACK_KEYS_JSON")
+	overrideString(&config.ExternalAPI.IdempotencyTTL, "EXTERNAL_IDEMPOTENCY_TTL")
+	overrideString(&config.ExternalAPI.QuotaRefillPeriod, "EXTERNAL_QUOTA_REFILL_PERIOD")
+	if err := overridePositiveInt(&config.ExternalAPI.WorkerConcurrency, "EXTERNAL_WORKER_CONCURRENCY"); err != nil {
+		return err
+	}
+	if err := overridePositiveInt(&config.ExternalAPI.SourceKeyVersion, "EXTERNAL_SOURCE_KEY_VERSION"); err != nil {
+		return err
+	}
+	if err := overridePositiveInt(&config.ExternalAPI.WebhookWorkerConcurrency, "EXTERNAL_WEBHOOK_WORKER_CONCURRENCY"); err != nil {
+		return err
+	}
+	if value, ok := os.LookupEnv("LEGACY_JUDGE_ENABLED"); ok {
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("LEGACY_JUDGE_ENABLED must be true or false")
+		}
+		config.LegacyJudge.Enabled = parsed
+	}
+	if value, ok := os.LookupEnv("REDIS_DB"); ok {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 0 {
+			return fmt.Errorf("REDIS_DB must be a non-negative integer")
+		}
+		config.ExternalAPI.RedisDB = parsed
+	}
+	if err := overridePositiveInt64(&config.ExternalAPI.JobSubmitCapacity, "EXTERNAL_JOB_SUBMIT_CAPACITY"); err != nil {
+		return err
+	}
+	if err := overridePositiveInt64(&config.ExternalAPI.BundleByteCapacity, "EXTERNAL_BUNDLE_BYTE_CAPACITY"); err != nil {
+		return err
+	}
 	overrideString(&config.Database.Host, "DATABASE_HOST")
 	overrideString(&config.Database.User, "DATABASE_USERNAME")
 	overrideString(&config.Database.Password, "DATABASE_PASSWORD")
@@ -153,12 +251,20 @@ func (config *Config) applyEnvironment() error {
 		config.TestBundles.UseTLS = parsed
 	}
 	overrideString(&config.SandboxDiscovery.Namespace, "SANDBOX_NAMESPACE")
+	overrideString(&config.SandboxDiscovery.Target, "SANDBOX_GRPC_TARGET")
 	overrideString(&config.SandboxDiscovery.Service, "SANDBOX_SERVICE")
 	overrideString(&config.SandboxDiscovery.PortName, "SANDBOX_PORT_NAME")
 	overrideString(&config.SandboxDiscovery.RefreshInterval, "SANDBOX_REFRESH_INTERVAL")
 	overrideString(&config.SandboxDiscovery.ExecuteTimeout, "SANDBOX_EXECUTE_TIMEOUT")
 	overrideString(&config.SandboxDiscovery.ConnectionIdleTTL, "SANDBOX_CONNECTION_IDLE_TTL")
 	overrideString(&config.SandboxDiscovery.Kubeconfig, "KUBECONFIG")
+	if value, ok := os.LookupEnv("SANDBOX_ALLOW_LEGACY_ENDPOINT_SLICE"); ok {
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("SANDBOX_ALLOW_LEGACY_ENDPOINT_SLICE must be true or false")
+		}
+		config.SandboxDiscovery.AllowLegacyEndpointSlice = parsed
+	}
 	if value, ok := os.LookupEnv("DATABASE_PORT"); ok {
 		port, err := strconv.Atoi(value)
 		if err != nil || port < 1 || port > 65535 {
@@ -189,6 +295,8 @@ func (config *Config) applyEnvironment() error {
 	}{
 		{&config.TestBundles.MaxFiles, "JUDGE_BUNDLE_MAX_FILES"},
 		{&config.TestBundles.MaxInfraAttempts, "JUDGE_BUNDLE_MAX_INFRA_ATTEMPTS"},
+		{&config.TestBundles.MaxTimeLimitMillis, "JUDGE_MAX_TIME_LIMIT_MILLIS"},
+		{&config.TestBundles.MaxMemoryLimitMiB, "JUDGE_MAX_MEMORY_LIMIT_MIB"},
 	} {
 		if err := overridePositiveInt(override.target, override.name); err != nil {
 			return err

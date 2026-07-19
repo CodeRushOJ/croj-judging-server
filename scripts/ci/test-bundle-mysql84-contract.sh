@@ -10,6 +10,9 @@ grep -Fq -- 'mysql84-bundle-integration:' "${WORKFLOW}"
 grep -Fq -- "image: ${MYSQL_DIGEST}" "${WORKFLOW}"
 grep -Fq -- 'EXTERNAL_JUDGE_MYSQL_TEST_DSN:' "${WORKFLOW}"
 grep -Fq -- "-run '^TestExternalBundleSQLRepositoryIntegration$'" "${WORKFLOW}"
+grep -Fq -- 'TestExternalBundleSQLRepositoryIntegration/tenant_and_platform_execution_ceilings_reject_before_publication' "${WORKFLOW}"
+grep -Fq -- 'TestClientUsesGRPCRoundRobinAcrossResolvedHeadlessServiceEndpoints' "${WORKFLOW}"
+grep -Fq -- 'CGO_ENABLED=0 go build -trimpath ./cmd ./cmd/judge-admin' "${WORKFLOW}"
 grep -Fq -- 'timeout-minutes:' "${WORKFLOW}"
 
 printf 'bundle MySQL 8.4 CI contract: ok\n'

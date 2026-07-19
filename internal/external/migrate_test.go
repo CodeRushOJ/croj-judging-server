@@ -14,7 +14,7 @@ func TestEmbeddedMigrationsDefineTheCompleteJudgeOwnedSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(migrations) != 4 || migrations[0].Version != 1 || migrations[0].Name != "initial_external_judge" || migrations[1].Version != 2 || migrations[1].Name != "external_bundle_ready" || migrations[2].Version != 3 || migrations[2].Name != "durable_job_fencing" || migrations[3].Version != 4 || migrations[3].Name != "durable_webhook_outbox" {
+	if len(migrations) != 5 || migrations[0].Version != 1 || migrations[0].Name != "initial_external_judge" || migrations[1].Version != 2 || migrations[1].Name != "external_bundle_ready" || migrations[2].Version != 3 || migrations[2].Name != "durable_job_fencing" || migrations[3].Version != 4 || migrations[3].Name != "tenant_policy_execution_ceilings" || migrations[4].Version != 5 || migrations[4].Name != "durable_webhook_outbox" {
 		t.Fatalf("migrations = %+v", migrations)
 	}
 	if len(migrations[0].Checksum) != 64 {
@@ -74,6 +74,28 @@ func TestEmbeddedMigrationsDefineTheCompleteJudgeOwnedSchema(t *testing.T) {
 	}
 }
 
+func TestTenantPolicyExecutionCeilingsMigrationBackfillsOnlyMissingValues(t *testing.T) {
+	migrations, err := Migrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(migrations) < 4 {
+		t.Fatalf("migration count = %d, want at least 4", len(migrations))
+	}
+
+	sql := strings.ToLower(migrations[3].SQL)
+	for _, contract := range []string{
+		"json_set(policy_json, '$.maxtimelimitmillis', 10000)",
+		"not json_contains_path(policy_json, 'one', '$.maxtimelimitmillis')",
+		"json_set(policy_json, '$.maxmemorylimitmib', 1024)",
+		"not json_contains_path(policy_json, 'one', '$.maxmemorylimitmib')",
+	} {
+		if !strings.Contains(sql, contract) {
+			t.Errorf("tenant policy ceilings migration is missing %q", contract)
+		}
+	}
+}
+
 func TestDurableJobFencingMigrationAddsTenantBoundLeaseTokens(t *testing.T) {
 	migrations, err := Migrations()
 	if err != nil {
@@ -106,10 +128,10 @@ func TestDurableWebhookMigrationDefinesFencedOutboxAndDisablesLegacyCallbacks(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(migrations) != 4 || migrations[3].Version != 4 || migrations[3].Name != "durable_webhook_outbox" {
+	if len(migrations) != 5 || migrations[4].Version != 5 || migrations[4].Name != "durable_webhook_outbox" {
 		t.Fatalf("migrations = %+v", migrations)
 	}
-	sql := strings.ToLower(migrations[3].SQL)
+	sql := strings.ToLower(migrations[4].SQL)
 	for _, contract := range []string{
 		"add column secret_nonce binary(12)",
 		"set disabled_at = coalesce(disabled_at, current_timestamp(3))",
@@ -187,7 +209,7 @@ func TestApplyMigrationsUsesAnAdvisoryLockAndRecordsChecksums(t *testing.T) {
 		t.Fatalf("first execution = %s", connection.executions[0].query)
 	}
 	last := connection.executions[len(connection.executions)-1]
-	if !strings.Contains(strings.ToLower(last.query), "insert into t_judge_schema_history") || fmt.Sprint(last.arguments) != fmt.Sprint([]any{4, "durable_webhook_outbox", migrations[3].Checksum}) {
+	if !strings.Contains(strings.ToLower(last.query), "insert into t_judge_schema_history") || fmt.Sprint(last.arguments) != fmt.Sprint([]any{5, "durable_webhook_outbox", migrations[4].Checksum}) {
 		t.Fatalf("history execution = %#v", last)
 	}
 }
@@ -210,6 +232,32 @@ func TestApplyMigrationsRejectsChecksumDriftAndStillReleasesTheLock(t *testing.T
 	}
 }
 
+func TestValidateMigrationHistoryRequiresExactCompleteSchema(t *testing.T) {
+	migrations, err := Migrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	complete := make([]migrationHistoryRecord, 0, len(migrations))
+	for _, migration := range migrations {
+		complete = append(complete, migrationHistoryRecord{version: migration.Version, name: migration.Name, checksum: migration.Checksum})
+	}
+	if err := validateMigrationHistory(context.Background(), migrationHistoryQueryStub{records: complete}, migrations); err != nil {
+		t.Fatalf("complete history rejected: %v", err)
+	}
+	for name, records := range map[string][]migrationHistoryRecord{
+		"missing":        complete[:len(complete)-1],
+		"unknown":        append(append([]migrationHistoryRecord(nil), complete...), migrationHistoryRecord{version: 6, name: "unknown", checksum: strings.Repeat("a", 64)}),
+		"name drift":     append([]migrationHistoryRecord{{version: 1, name: "renamed", checksum: complete[0].checksum}}, complete[1:]...),
+		"checksum drift": append([]migrationHistoryRecord{{version: 1, name: complete[0].name, checksum: strings.Repeat("b", 64)}}, complete[1:]...),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := validateMigrationHistory(context.Background(), migrationHistoryQueryStub{records: records}, migrations); err == nil {
+				t.Fatal("invalid migration history was accepted")
+			}
+		})
+	}
+}
+
 type migrationExecution struct {
 	query     string
 	arguments []any
@@ -222,6 +270,36 @@ type migrationConnectionStub struct {
 	executions []migrationExecution
 }
 
+type migrationHistoryQueryStub struct{ records []migrationHistoryRecord }
+
+func (stub migrationHistoryQueryStub) QueryContext(context.Context, string, ...any) (rowsScanner, error) {
+	return &migrationHistoryRows{records: stub.records}, nil
+}
+
+type migrationHistoryRows struct {
+	records []migrationHistoryRecord
+	index   int
+}
+
+func (rows *migrationHistoryRows) Next() bool { return rows.index < len(rows.records) }
+func (rows *migrationHistoryRows) Scan(destinations ...any) error {
+	if len(destinations) != 3 {
+		return fmt.Errorf("unexpected migration history destination count")
+	}
+	record := rows.records[rows.index]
+	version, versionOK := destinations[0].(*int)
+	name, nameOK := destinations[1].(*string)
+	checksum, checksumOK := destinations[2].(*string)
+	if !versionOK || !nameOK || !checksumOK {
+		return fmt.Errorf("unexpected migration history destination types")
+	}
+	*version, *name, *checksum = record.version, record.name, record.checksum
+	rows.index++
+	return nil
+}
+func (rows *migrationHistoryRows) Err() error   { return nil }
+func (rows *migrationHistoryRows) Close() error { return nil }
+
 func (connection *migrationConnectionStub) QueryRowContext(_ context.Context, query string, _ ...any) rowScanner {
 	if strings.Contains(query, "GET_LOCK") {
 		connection.locked = true
@@ -231,7 +309,7 @@ func (connection *migrationConnectionStub) QueryRowContext(_ context.Context, qu
 		connection.released = true
 		return integerRow(1)
 	}
-	if strings.Contains(query, "information_schema") {
+	if strings.Contains(query, "information_schema") || strings.Contains(query, "JSON_CONTAINS_PATH") {
 		return integerRow(1)
 	}
 	return errorRow{err: fmt.Errorf("unexpected row query %q", query)}

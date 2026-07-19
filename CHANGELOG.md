@@ -6,6 +6,12 @@
 
 ### Added
 
+- 增加 RocketMQ 与 durable REST worker 共用的 canonical compile-once batch execution core，按顺序保留 case 结果并统一 AC/WA/CE/TLE/MLE/RE/SE 映射。
+- immutable bundle manifest 增加必填时间/内存限制；tenant policy 与 capabilities 增加对应上限，上传在平台或租户 ceiling 外 fail closed。
+- 增加 headless Kubernetes Service、`dns:///...` gRPC target 与 `round_robin` Pod endpoint 分配，手工 EndpointSlice 调度降级为 deprecated fallback。
+- 增加完整 lease fence 的 durable execution input、heartbeat/取消控制与 worker runner；取消或 lease ownership 丢失会传播 context cancellation，陈旧 worker 不能提交结果。
+- 增加默认关闭、显式 opt-in 的外部 REST/worker production runtime；readiness 同时依赖 MySQL、Redis、MinIO bucket 和 Sandbox DNS，shutdown 先停 worker 后停 HTTP。
+
 - 增加面向外部 OJ 的异步 REST v1 基础：RFC 9457 错误、request ID、scope 鉴权和 capabilities 端点。
 - 增加 Judge 自有 MySQL schema 的嵌入式迁移、advisory lock、checksum drift 拒绝及租户隔离数据结构。
 - 增加不透明 256-bit API Key 生成、peppered HMAC 存储、严格 scope 加载与 `judge-admin` 租户/密钥预置命令。
@@ -18,7 +24,7 @@
 - 增加多副本 webhook delivery lease：MySQL 时钟、per-tenant head fairness、`FOR UPDATE SKIP LOCKED`、attempt/token fencing、崩溃重领及 stale settlement 拒绝；相同 `eventId`/body 按 at-least-once 语义重投。
 - 增加结构化 webhook outcome、完整 HTTP retry/permanent matrix、有界 `Retry-After`、指数 jitter、12 次/24 小时默认边界、`DEAD` 审计和 30 天 terminal retention。
 - 增加真实 MySQL 8.4.10 webhook 合约门禁，覆盖原子终态、lease recovery、精确 HMAC body、远端成功但 settlement 丢失后的稳定重投。
-- 当前提交完成 outbox 与可注入 delivery worker，但尚未接入 `cmd/main.go` 的生产 lifecycle；runtime wiring 完成前不会宣称 callback delivery 已上线。
+- 将 callback/source 多版本 key ring、独立 Judge DSN、schema v5 校验与多副本 webhook worker 接入生产 lifecycle；仅启用异步 REST 时可完全跳过 Backend DB、Backend callback 与 RocketMQ。
 - 增加 Redis 服务端时间驱动的原子令牌桶，跨 HTTP 副本统一限制租户任务提交与 bundle 实际上传字节；配额状态不确定时新写入 fail closed，已授权读请求保持可用。
 - 增加 `POST/GET /api/v1/bundles`：有界单文件 multipart 流式上传、SHA-256 内容寻址、tenant-scoped 元数据与 RFC 9457 错误。
 - 增加外部题包 ZIP 安全复用校验、case CRC/size/UTF-8 流式核验、取消/超限清理、MySQL 原子 ownership+幂等事务及并发单逻辑记录回归。
@@ -43,6 +49,8 @@
 - 增加 checksum-keyed 磁盘缓存、并发下载合并、命中校验、损坏修复、TTL/LRU 和 restart orphan 清理。
 - 增加 ACM 多 case 顺序执行、选手错误早停、最大资源聚合与基础设施故障有界换 endpoint。
 - 增加 fake Kubernetes API + 真实 TCP gRPC + HTTP callback 的跨组件契约测试，覆盖 EndpointSlice churn、过载换节点、bundle digest fail-closed 与 hidden payload 脱敏。
+- 增加 `ExecuteBatchV1` 流式客户端和 compile-once hidden bundle pipeline；一个提交把全部有序 case 发送到一个 sandbox 编译一次。
+- 增加 batch 事件顺序/终结校验、整批 EndpointSlice failover、部分流丢弃和编译诊断脱敏。
 
 ### Changed
 
@@ -56,10 +64,18 @@
 - `Output Limit Exceeded` 在 callback v1 暂映射为 `RUNTIME_ERROR` 且不重试，等待 Issue #13 的正式枚举。
 - 全部 endpoint 均返回 `Unavailable`/`ResourceExhausted` 时保留 gRPC 状态交由 RocketMQ 重试，不再错误发布终态 `SYSTEM_ERROR`。
 - 隐藏包判题不再透传 sandbox 的自由文本编译诊断，防止异常 sandbox 通过 callback 回显源码或 hidden input/output。
+- 隐藏包从逐 case unary RPC 切换为版本化 batch RPC；短暂过载/断连只重试完整 batch，选手终态不重试。
+
+### Fixed
+
+- 正常结束但事件畸形的 batch 流不再换 Endpoint 重编译，只将传输层 `Unavailable`/`ResourceExhausted` 视为可切换容量故障
+- token checker 读取 expected 后只保留规范化 SHA-256，在 sandbox 内恢复首错早停，并在 judging 侧用同一 hash-only 规则复核
+- batch 客户端显式设置有界 64 MiB 收发上限，配合 sandbox 有界编译诊断避免大响应被误判为容量重试
+- batch 请求按 case 增量执行 64 MiB wire-size 检查，响应流在线限制为 `case 数 + 1` 个事件和 64 MiB 累计 protobuf 数据，且要求终结事件
+- 整批 failover 记录已尝试 endpoint，EndpointSlice 更新与并发轮询时也不会在一次逻辑判题中重复选中同一 sandbox
 
 ### Known limitations
 
-- 当前每个 case 会重复编译；Issue #11 跟进 compile-once batch sandbox API。
 - SPJ/OI 尚未支持并返回 `SYSTEM_ERROR`；Issue #12 跟进版本化能力。
 - exact checker 上线依赖 `croj-sandbox#10` 先移除 WA expected/actual 日志，避免 hidden data 泄露。
 - 任务结果缓存是进程级优化，进程重启后的最终幂等由后端 result receipt 保证。
