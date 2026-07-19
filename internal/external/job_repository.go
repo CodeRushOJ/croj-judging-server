@@ -23,6 +23,7 @@ var (
 
 type SourceObjectStore interface {
 	Put(context.Context, string, []byte) error
+	Get(context.Context, string) ([]byte, error)
 	Delete(context.Context, string) error
 }
 
