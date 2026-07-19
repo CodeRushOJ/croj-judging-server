@@ -151,7 +151,7 @@ go run ./cmd/judge-admin api-key create \
 
 ### 外部不可变题包上传
 
-`POST /api/v1/bundles` 只接受一个名为 `bundle` 的 multipart 文件和 16–128 字节可见 ASCII `Idempotency-Key`。HTTP 外层和 Service 内层分别执行请求体/文件体积上限；文件流式写入专用临时文件并同步计算 SHA-256，取消、超限或校验失败都会清理临时文件。安全校验与内部 immutable bundle 共用同一条 ZIP 路径，覆盖路径穿越、link/非普通文件、加密/未知压缩、文件数、单文件/总解压量、压缩比、manifest 严格 schema、case 成对和 256 case 协议上限。
+`POST /api/v1/bundles` 只接受一个名为 `bundle` 的 multipart 文件和 16–128 字节可见 ASCII `Idempotency-Key`。HTTP 外层和 Service 内层分别执行请求体/文件体积上限；文件流式写入专用临时文件并同步计算 SHA-256，取消、超限或校验失败都会清理临时文件。安全校验与内部 immutable bundle 共用同一条 ZIP 路径，覆盖路径穿越、link/非普通文件、加密/未知压缩、文件数、单文件/总解压量、压缩比、manifest 严格 schema、case 成对和 256 case 协议上限；每个 case 文件还会流式读取以核对 CRC、声明大小和 UTF-8，损坏内容不会发布。
 
 服务端只能发布到 `external/<tenant-id>/sha256/<lowercase-sha256>.zip`；请求不接受 URL、bucket 或 object key，响应也只返回 `bundleId`/digest/size/case/manifest version/创建时间。对象完整发布后，MySQL 在租户行锁下原子提交 content ownership 与幂等记录。同租户并发上传同一 digest 只产生一条逻辑 bundle；同一幂等键+同一 digest 返回 `200`，同键不同 digest 返回 `409`。`GET /api/v1/bundles/{bundleId}` 仅查询当前租户元数据，跨租户统一返回 `404`。
 

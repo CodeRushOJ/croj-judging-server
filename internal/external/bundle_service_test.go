@@ -209,6 +209,32 @@ func TestBundleServiceRejectsManifestAboveExternalCaseLimit(t *testing.T) {
 	}
 }
 
+func TestBundleServiceRejectsCorruptCasePayloadBeforePublication(t *testing.T) {
+	body := validExternalBundle(t, "input-that-must-pass-crc")
+	reader, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupted := append([]byte(nil), body...)
+	for _, file := range reader.File {
+		if file.Name != "cases/1.in" {
+			continue
+		}
+		offset, err := file.DataOffset()
+		if err != nil {
+			t.Fatal(err)
+		}
+		corrupted[offset] ^= 0xff
+	}
+	repository := newMemoryBundleRepository()
+	store := &atomicMemoryObjectStore{}
+	service := newTestBundleService(t, repository, store, t.TempDir(), 1<<20, bundle.DefaultArchiveLimits())
+	_, _, err = service.Upload(context.Background(), testTenantID, "upload-key-00001", bytes.NewReader(corrupted))
+	if !errors.Is(err, ErrInvalidBundle) || repository.logicalCreates != 0 || len(store.objects) != 0 {
+		t.Fatalf("error=%v rows=%d objects=%d", err, repository.logicalCreates, len(store.objects))
+	}
+}
+
 func TestBundleServiceIdempotencyAndTenantMetadataIsolation(t *testing.T) {
 	repository := newMemoryBundleRepository()
 	store := &atomicMemoryObjectStore{}
