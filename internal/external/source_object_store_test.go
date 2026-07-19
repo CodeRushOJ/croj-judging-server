@@ -110,7 +110,8 @@ func newSourceS3Server(t *testing.T) *httptest.Server {
 				response.WriteHeader(http.StatusInternalServerError)
 				return
 			}
-			if strings.Contains(request.Header.Get("Content-Encoding"), "aws-chunked") {
+			if strings.Contains(request.Header.Get("Content-Encoding"), "aws-chunked") ||
+				strings.HasPrefix(request.Header.Get("X-Amz-Content-Sha256"), "STREAMING-") {
 				body, err = decodeAWSChunked(body)
 				if err != nil {
 					t.Errorf("decode aws-chunked PUT: %v", err)

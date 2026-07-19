@@ -27,6 +27,8 @@ type SourceObjectStore interface {
 	// overwriting an existing key. This makes a random-ID collision harmless.
 	Create(context.Context, string, []byte) error
 	Get(context.Context, string, int64) ([]byte, error)
+	// Delete must be idempotent so a sweeper can safely retry after an
+	// outcome-ambiguous object or database operation.
 	Delete(context.Context, string) error
 }
 

@@ -73,6 +73,68 @@ WHERE constraint_schema = DATABASE() AND constraint_type = 'CHECK'
 	}
 }
 
+func TestDurableFencingMigrationResumesAfterCommittedStatementPrefix(t *testing.T) {
+	database := openMySQLIntegration(t)
+	resetMySQLIntegrationSchema(t, database)
+	migrations, err := Migrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	statements, err := splitMigrationStatements(migrations[2].SQL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statements) < 2 {
+		t.Fatalf("durable migration statements = %d", len(statements))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	connection, err := database.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := applyMigrations(ctx, sqlMigrationConnection{connection: connection}, migrations[:2]); err != nil {
+		connection.Close()
+		t.Fatal(err)
+	}
+	committed := len(statements) - 1
+	for index := 0; index < committed; index++ {
+		if _, err := connection.ExecContext(ctx, statements[index]); err != nil {
+			connection.Close()
+			t.Fatalf("execute durable statement %d before simulated interruption: %v", index+1, err)
+		}
+	}
+	if err := connection.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ApplyMigrations(ctx, database); err != nil {
+		t.Fatalf("resume after %d committed statements: %v", committed, err)
+	}
+	assertDurableMigrationSchema(t, ctx, database)
+}
+
+func assertDurableMigrationSchema(t *testing.T, ctx context.Context, database *sql.DB) {
+	t.Helper()
+	var versionCount int
+	if err := database.QueryRowContext(ctx, "SELECT COUNT(*) FROM t_judge_schema_history WHERE version = 3").Scan(&versionCount); err != nil {
+		t.Fatal(err)
+	}
+	if versionCount != 1 {
+		t.Fatalf("durable migration history rows = %d", versionCount)
+	}
+	var reservationTableCount int
+	if err := database.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM information_schema.tables
+WHERE table_schema = DATABASE() AND table_name = 't_external_source_reservation'`).Scan(&reservationTableCount); err != nil {
+		t.Fatal(err)
+	}
+	if reservationTableCount != 1 {
+		t.Fatalf("source reservation tables = %d", reservationTableCount)
+	}
+}
+
 func TestDurableFencingMigrationRecoversLegacyRunningRows(t *testing.T) {
 	database := openMySQLIntegration(t)
 	resetMySQLIntegrationSchema(t, database)
@@ -167,7 +229,7 @@ func resetMySQLIntegrationSchema(t *testing.T, database *sql.DB) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	for _, table := range []string{
-		"t_external_webhook_outbox", "t_external_job_attempt", "t_external_idempotency",
+		"t_external_source_reservation", "t_external_webhook_outbox", "t_external_job_attempt", "t_external_idempotency",
 		"t_external_job", "t_external_source_object", "t_external_callback", "t_external_bundle",
 		"t_external_api_key", "t_external_tenant", "t_judge_schema_history",
 	} {

@@ -172,9 +172,29 @@ WHERE tenant_id = ? AND external_id = ? AND disabled_at IS NULL`,
 	if err != nil {
 		return SubmitJobResult{}, repositoryUnavailable("encrypt source", err)
 	}
+	if _, err := repository.database.ExecContext(ctx,
+		"INSERT INTO t_external_source_reservation(object_key) VALUES (?)", sourceObjectKey); err != nil {
+		return SubmitJobResult{}, repositoryUnavailable("reserve encrypted source object", err)
+	}
+	reservationActive := true
+	releaseReservation := func() error {
+		if !reservationActive {
+			return nil
+		}
+		cleanupContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, err := repository.database.ExecContext(cleanupContext,
+			"DELETE FROM t_external_source_reservation WHERE object_key = ?", sourceObjectKey); err != nil {
+			return repositoryUnavailable("release encrypted source reservation", err)
+		}
+		reservationActive = false
+		return nil
+	}
 	if err := repository.sourceObjects.Create(ctx, sourceObjectKey, encrypted.Ciphertext); err != nil {
 		// Object-store SDK errors commonly embed bucket/key/request details.
 		// Preserve the availability class without making those details loggable.
+		// The durable reservation remains because an object-store timeout can be
+		// outcome-ambiguous; the sweeper will check DB ownership before deletion.
 		return SubmitJobResult{}, fmt.Errorf("%w: persist encrypted source", ErrExternalJobUnavailable)
 	}
 	objectPublished := true
@@ -188,6 +208,9 @@ WHERE tenant_id = ? AND external_id = ? AND disabled_at IS NULL`,
 			return fmt.Errorf("%w: source compensation failed", ErrExternalJobUnavailable)
 		}
 		objectPublished = false
+		if cleanupErr := releaseReservation(); cleanupErr != nil {
+			return cleanupErr
+		}
 		return cause
 	}
 	sourceResult, err := tx.ExecContext(ctx, `
@@ -242,6 +265,9 @@ INSERT INTO t_external_idempotency(
 		return SubmitJobResult{}, repositoryUnavailable("commit submitted job with unknown outcome", err)
 	}
 	objectPublished = false
+	// A stale reservation is safe: the sweeper observes the authoritative
+	// source metadata and removes only the reservation, never the live object.
+	_ = releaseReservation()
 	return SubmitJobResult{Job: job}, nil
 }
 
@@ -293,7 +319,7 @@ func (repository *MySQLJobRepository) List(ctx context.Context, tenantExternalID
 	if options.Cursor != "" {
 		cursor, err := repository.cursor.Decode(options.Cursor, tenantExternalID, options.Status)
 		if err != nil {
-			return JobListResult{}, ErrExternalJobInvalid
+			return JobListResult{}, ErrInvalidJobCursor
 		}
 		conditions = append(conditions, "(job.created_at < ? OR (job.created_at = ? AND job.id < ?))")
 		arguments = append(arguments, cursor.CreatedAt, cursor.CreatedAt, cursor.InternalID)

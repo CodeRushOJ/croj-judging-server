@@ -194,6 +194,10 @@ func (server *Server) handleJobList(response http.ResponseWriter, request *http.
 	}
 	page, err := server.jobs.List(request.Context(), principal.TenantID, query)
 	if err != nil {
+		if errors.Is(err, ErrJobInvalid) {
+			writeProblem(response, problemFor(http.StatusBadRequest, "invalid-list-query", "Invalid list query", "Use an untampered cursor issued for this tenant and status filter.", requestID))
+			return
+		}
 		server.writeJobError(response, requestID, err)
 		return
 	}

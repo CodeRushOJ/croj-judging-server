@@ -50,7 +50,7 @@ func NewSourceCipher(activeVersion uint16, keys map[uint16][]byte, random io.Rea
 }
 
 func (sourceCipher *SourceCipher) Encrypt(tenantID, sourceObjectID string, plaintext []byte) (EncryptedSource, error) {
-	if sourceCipher == nil || len(plaintext) == 0 || tenantID == "" || sourceObjectID == "" {
+	if sourceCipher == nil || len(plaintext) == 0 || len(plaintext) > MaximumSourceBytes || tenantID == "" || sourceObjectID == "" {
 		return EncryptedSource{}, fmt.Errorf("tenant, source object, and non-empty source are required")
 	}
 	gcm, err := sourceCipher.gcm(sourceCipher.activeVersion)

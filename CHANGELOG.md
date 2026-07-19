@@ -21,6 +21,7 @@
 - 增加真实 MySQL 8.4 `MySQLJobRepository`：peppered-HMAC 提交幂等、canonical hash 冲突检测、租户自有 bundle/callback、queued/running quota、稳定签名游标、tenant-safe GET/取消。
 - 增加 AES-256-GCM 源码对象生命周期接口、MinIO/S3 conditional-create/bounded-read 实现及事务失败补偿；worker 通过权威数据库元数据加载密文，源码、对象引用和 lease token 不进入 REST view。
 - 增加 `FOR UPDATE SKIP LOCKED` worker 领取、256-bit lease token、tenant-bound attempt、heartbeat/完成 CAS、进程重启过期回收、取消恢复和有界基础设施重试。
+- worker lease 改用 MySQL 权威时钟，并在并发 tenant 候选竞争后重新选择；源码上传增加 durable reservation 与孤儿清扫，租户源码上限与 64 MiB 密文边界保持一致。
 - 增加持久仓储到异步 REST `JobService` 的脱敏适配，并区分配额已耗尽 `429` 与配额状态未知 `503`。
 - 增加与 `croj-sandbox` 一致的 `SandboxService.Execute` protobuf/gRPC 客户端。
 - 为 Pod endpoint 建立可复用连接、显式 RPC deadline 与确定性关闭流程。
