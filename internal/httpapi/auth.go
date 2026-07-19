@@ -111,7 +111,7 @@ func parseBearerKey(authorization string) (key string, prefix string, ok bool) {
 	if key == "" || strings.ContainsAny(key, " \t\r\n") {
 		return "", "", false
 	}
-	parts := strings.Split(key, "_")
+	parts := strings.SplitN(key, "_", 3)
 	if len(parts) != 3 || parts[0] != "croj" || !keyPrefixPattern.MatchString(parts[1]) {
 		return "", "", false
 	}
