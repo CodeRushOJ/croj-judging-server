@@ -167,7 +167,7 @@ HTTP 层先用可信 `Content-Length` 对 multipart 总上限做无读取早拒�
 
 Judge 自有 schema v3 为 job 和 attempt 增加 256-bit lease token，并把 attempt 通过 `(job_id, tenant_id)` 复合外键绑定到租户。`MySQLJobRepository` 在同一个 InnoDB admission 事务中锁定租户策略、校验 READY 且租户自有的 bundle/callback、确认 queued quota、写入 peppered-HMAC 幂等记录以及加密源码元数据。同键同 canonical hash 返回原 job；同键不同请求返回 `409`。已确认的队列配额耗尽返回 `429`，策略或数据库状态无法确认时返回 `503`，不会开放式接收新任务。
 
-源码先使用 AES-256-GCM 加密，tenant ID、source ID 和 key version 作为 AAD；MySQL 仅保存 digest、长度、nonce、key version 和不可公开的对象引用。对象读写由 `SourceObjectStore` 抽象提供，写事务失败会使用独立超时上下文补偿删除。worker 读取源码前会用 job ID、attempt、worker ID、lease token 和未过期 lease 回查 MySQL 的权威元数据，不信任内存 claim 携带的 object key。
+源码先使用 AES-256-GCM 加密，tenant ID、source ID 和 key version 作为 AAD；MySQL 仅保存 digest、长度、nonce、key version 和不可公开的对象引用。对象读写由 `SourceObjectStore` 抽象提供；MinIO/S3 实现以 `If-None-Match: *` 原子创建，拒绝随机 ID 碰撞覆盖，并按数据库密文长度有界读取。写事务失败会使用独立超时上下文补偿删除。worker 读取源码前会用 job ID、attempt、worker ID、lease token 和未过期 lease 回查 MySQL 的权威元数据，不信任内存 claim 携带的 object key。
 
 worker 领取使用 `FOR UPDATE SKIP LOCKED`，并在租户锁内重新确认 running quota。每次领取创建单独 attempt；heartbeat、完成和基础设施失败均以 attempt/worker/lease token 做 CAS。进程重启后只会回收过期 attempt，旧 worker 无法覆盖新结果；已请求取消的过期任务直接恢复为 `CANCELLED`，不会再次执行源码。基础设施失败按 tenant policy 有界重试，耗尽后才进入 `FAILED`。
 
