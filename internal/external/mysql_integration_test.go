@@ -45,10 +45,10 @@ func TestApplyMigrationsOnMySQL84IsReplaySafe(t *testing.T) {
 		t.Fatalf("migration replay: %v", err)
 	}
 	var versionCount int
-	if err := database.QueryRowContext(ctx, "SELECT COUNT(*) FROM t_judge_schema_history WHERE version IN (1, 2, 3)").Scan(&versionCount); err != nil {
+	if err := database.QueryRowContext(ctx, "SELECT COUNT(*) FROM t_judge_schema_history WHERE version IN (1, 2, 3, 4)").Scan(&versionCount); err != nil {
 		t.Fatal(err)
 	}
-	if versionCount != 3 {
+	if versionCount != 4 {
 		t.Fatalf("migration versions = %d", versionCount)
 	}
 	var columnCount int
@@ -72,6 +72,73 @@ WHERE constraint_schema = DATABASE() AND constraint_type = 'CHECK'
 	if constraintCount != 2 {
 		t.Fatalf("active lease constraints = %d", constraintCount)
 	}
+}
+
+func TestTenantPolicyExecutionCeilingsMigrationBackfillsMissingValuesAndReplays(t *testing.T) {
+	database := openMySQLIntegration(t)
+	resetMySQLIntegrationSchema(t, database)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	migrations, err := Migrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(migrations) < 4 {
+		t.Fatalf("migration count = %d, want at least 4", len(migrations))
+	}
+	connection, err := database.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	if err := applyMigrations(ctx, sqlMigrationConnection{connection: connection}, migrations[:3]); err != nil {
+		t.Fatal(err)
+	}
+
+	missingID := "aaaaaaaaaaaaaaaaaaaaaaaaaa"
+	existingID := "bbbbbbbbbbbbbbbbbbbbbbbbbb"
+	if _, err := connection.ExecContext(ctx, `
+INSERT INTO t_external_tenant(external_id, name, status, policy_json) VALUES
+    (?, 'missing ceilings', 'ACTIVE', JSON_OBJECT('maxQueuedJobs', 4)),
+    (?, 'existing ceilings', 'ACTIVE', JSON_OBJECT(
+        'maxQueuedJobs', 4,
+        'maxTimeLimitMillis', 2500,
+        'maxMemoryLimitMiB', 384
+    ))`, missingID, existingID); err != nil {
+		t.Fatal(err)
+	}
+	statements, err := splitMigrationStatements(migrations[3].SQL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statements) != 2 {
+		t.Fatalf("tenant policy ceilings statements = %d, want 2", len(statements))
+	}
+	if _, err := connection.ExecContext(ctx, statements[0]); err != nil {
+		t.Fatalf("execute committed migration prefix: %v", err)
+	}
+
+	if err := applyMigrations(ctx, sqlMigrationConnection{connection: connection}, migrations); err != nil {
+		t.Fatalf("resume tenant policy ceilings migration: %v", err)
+	}
+	if err := applyMigrations(ctx, sqlMigrationConnection{connection: connection}, migrations); err != nil {
+		t.Fatalf("replay tenant policy ceilings migration: %v", err)
+	}
+
+	assertPolicyCeilings := func(externalID string, wantTime, wantMemory int) {
+		t.Helper()
+		var gotTime, gotMemory int
+		if err := connection.QueryRowContext(ctx, `
+SELECT policy_json->>'$.maxTimeLimitMillis', policy_json->>'$.maxMemoryLimitMiB'
+FROM t_external_tenant WHERE external_id = ?`, externalID).Scan(&gotTime, &gotMemory); err != nil {
+			t.Fatal(err)
+		}
+		if gotTime != wantTime || gotMemory != wantMemory {
+			t.Fatalf("tenant %s ceilings = %d/%d, want %d/%d", externalID, gotTime, gotMemory, wantTime, wantMemory)
+		}
+	}
+	assertPolicyCeilings(missingID, 10_000, 1024)
+	assertPolicyCeilings(existingID, 2500, 384)
 }
 
 func TestDurableFencingMigrationResumesAfterCommittedStatementPrefix(t *testing.T) {

@@ -14,7 +14,7 @@ func TestEmbeddedMigrationsDefineTheCompleteJudgeOwnedSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(migrations) != 3 || migrations[0].Version != 1 || migrations[0].Name != "initial_external_judge" || migrations[1].Version != 2 || migrations[1].Name != "external_bundle_ready" || migrations[2].Version != 3 || migrations[2].Name != "durable_job_fencing" {
+	if len(migrations) != 4 || migrations[0].Version != 1 || migrations[0].Name != "initial_external_judge" || migrations[1].Version != 2 || migrations[1].Name != "external_bundle_ready" || migrations[2].Version != 3 || migrations[2].Name != "durable_job_fencing" || migrations[3].Version != 4 || migrations[3].Name != "tenant_policy_execution_ceilings" {
 		t.Fatalf("migrations = %+v", migrations)
 	}
 	if len(migrations[0].Checksum) != 64 {
@@ -71,6 +71,28 @@ func TestEmbeddedMigrationsDefineTheCompleteJudgeOwnedSchema(t *testing.T) {
 	}
 	if strings.Contains(publicationSQL, "update t_external_bundle") || strings.Contains(publicationSQL, "set ready_at = created_at") {
 		t.Fatal("legacy bundle rows must not be promoted to READY without remote verification")
+	}
+}
+
+func TestTenantPolicyExecutionCeilingsMigrationBackfillsOnlyMissingValues(t *testing.T) {
+	migrations, err := Migrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(migrations) < 4 {
+		t.Fatalf("migration count = %d, want at least 4", len(migrations))
+	}
+
+	sql := strings.ToLower(migrations[3].SQL)
+	for _, contract := range []string{
+		"json_set(policy_json, '$.maxtimelimitmillis', 10000)",
+		"not json_contains_path(policy_json, 'one', '$.maxtimelimitmillis')",
+		"json_set(policy_json, '$.maxmemorylimitmib', 1024)",
+		"not json_contains_path(policy_json, 'one', '$.maxmemorylimitmib')",
+	} {
+		if !strings.Contains(sql, contract) {
+			t.Errorf("tenant policy ceilings migration is missing %q", contract)
+		}
 	}
 }
 
@@ -161,7 +183,7 @@ func TestApplyMigrationsUsesAnAdvisoryLockAndRecordsChecksums(t *testing.T) {
 		t.Fatalf("first execution = %s", connection.executions[0].query)
 	}
 	last := connection.executions[len(connection.executions)-1]
-	if !strings.Contains(strings.ToLower(last.query), "insert into t_judge_schema_history") || fmt.Sprint(last.arguments) != fmt.Sprint([]any{3, "durable_job_fencing", migrations[2].Checksum}) {
+	if !strings.Contains(strings.ToLower(last.query), "insert into t_judge_schema_history") || fmt.Sprint(last.arguments) != fmt.Sprint([]any{4, "tenant_policy_execution_ceilings", migrations[3].Checksum}) {
 		t.Fatalf("history execution = %#v", last)
 	}
 }
