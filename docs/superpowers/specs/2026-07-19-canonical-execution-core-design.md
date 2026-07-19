@@ -8,7 +8,7 @@ The slice stacks the four linear `codex/compile-once-batch` commits (`c604b1d`, 
 
 ## Canonical execution boundary
 
-The core receives an immutable execution request containing language, plaintext source, time and memory limits, stop-on-failure policy, and a verified bundle artifact. It creates the existing `ExecuteBatchV1` request, compiles once, executes manifest cases in order, validates the complete server stream, checks exact or token output, and returns a canonical result with one of `AC`, `WA`, `CE`, `TLE`, `MLE`, `RE`, or `SE`, aggregate resource metrics, and ordered per-case results.
+The core receives an immutable execution request containing language, plaintext source, bundle-authoritative time and memory limits, stop-on-failure policy, and a verified bundle artifact. Bundle manifest v1 requires `limits.timeLimitMillis` and `limits.memoryLimitMiB`; different bundles can therefore express different problem limits while a REST caller cannot override them. It creates the existing `ExecuteBatchV1` request, compiles once, executes manifest cases in order, validates the complete server stream, checks exact or token output, and returns a canonical result with one of `AC`, `WA`, `CE`, `TLE`, `MLE`, `RE`, or `SE`, aggregate resource metrics, and ordered per-case results.
 
 The core never loads a database row, claims work, publishes a callback, or changes a lease. Those responsibilities remain in entry adapters. This keeps judging semantics identical across RocketMQ and REST and lets the adapters translate the canonical result into their existing public persistence or callback contracts.
 
@@ -24,7 +24,7 @@ The RocketMQ path keeps its strict versioned event validation, immutable submiss
 
 ## Durable REST worker
 
-The REST worker claims a MySQL job through the existing `ClaimNext` transaction, then loads the encrypted source and tenant-owned ready bundle metadata through the exact active claim fence. It resolves the immutable bundle through the existing bounded cache and archive verifier, constructs the canonical request, and invokes the same core.
+The REST worker claims a MySQL job through the existing `ClaimNext` transaction, then loads the encrypted source and tenant-owned ready bundle metadata through the exact active claim fence. It resolves the immutable bundle through the existing bounded cache and archive verifier, reads execution limits from the verified manifest, constructs the canonical request, and invokes the same core. Missing or malformed persisted limits fail closed.
 
 Each running claim owns a child context. A heartbeat loop extends the job and attempt leases with the MySQL clock. A control poll observes cancellation under the same attempt number, worker ID, and lease token. Cancellation, shutdown, execution timeout, heartbeat rejection, or lease loss cancels the child context, which propagates to the gRPC stream. The worker only calls `Complete` while its claim remains current; MySQL rechecks the full active-lease fence and converts a concurrent cancellation into terminal `CANCELLED`. A stale worker treats `ErrStaleJobClaim` as ownership loss and never overwrites the newer attempt.
 
@@ -36,7 +36,7 @@ The persisted REST result uses the public verdict vocabulary already exposed by 
 
 ## Configuration and lifecycle
 
-Configuration adds the gRPC target, load-balancing policy, worker identity, concurrency, lease duration, heartbeat interval, cancellation poll interval, idle-claim backoff, and an execution grace bound. Validation requires heartbeat and poll intervals to be shorter than the lease and requires a DNS target unless the deprecated EndpointSlice fallback is explicitly enabled.
+Configuration adds the gRPC target, load-balancing policy, platform maximum time and memory, worker identity, concurrency, lease duration, heartbeat interval, cancellation poll interval, idle-claim backoff, and an execution grace bound. Tenant policy adds `maxTimeLimitMillis` and `maxMemoryLimitMiB` as safety ceilings, not per-problem defaults. Bundle upload rejects missing/non-positive limits and limits above either the platform maximum or the active tenant ceiling before publication. Capabilities exposes the platform maxima. Validation requires heartbeat and poll intervals to be shorter than the lease and requires a DNS target unless the deprecated EndpointSlice fallback is explicitly enabled.
 
 Process startup constructs one bundle provider and one canonical core, injects it into both adapters, starts the DNS-backed gRPC channel, REST HTTP server, durable worker pool, and RocketMQ consumer, and stops them from a shared signal context. Shutdown stops new claims first, cancels active execution, closes consumers and gRPC connections, and never starts a persistent service during tests.
 

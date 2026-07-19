@@ -42,6 +42,23 @@
 - [ ] Add a RocketMQ service test first, observe RED, implement the adapter, and record GREEN.
 - [ ] Commit the canonical core slice.
 
+### Task 2A: Make immutable bundle limits authoritative
+
+**Files:**
+- Modify: `internal/bundle/manifest.go`
+- Test: `internal/bundle/manifest_test.go`
+- Modify: `internal/external/provision.go`
+- Test: `internal/external/provision_test.go`
+- Modify: `internal/external/bundle_service.go`
+- Test: `internal/external/bundle_service_test.go`
+- Modify: `internal/httpapi/capabilities.go`
+- Test: `internal/httpapi/capabilities_test.go`
+
+- [ ] Write tests requiring manifest `limits.timeLimitMillis` and `limits.memoryLimitMiB`, rejecting missing/non-positive values, rejecting upload above platform or tenant ceilings, and preserving different limits for different bundles.
+- [ ] Run focused bundle/external/HTTP tests, confirm RED for missing limits and admission enforcement, and record it.
+- [ ] Add required manifest limits, tenant maximum limit fields, platform capability maxima, upload admission checks, and synchronized fixtures/admin examples.
+- [ ] Run focused race tests, confirm GREEN, record it, and commit.
+
 ### Task 3: Add one DNS-backed gRPC round-robin client
 
 **Files:**
