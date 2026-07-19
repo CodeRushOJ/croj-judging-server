@@ -119,6 +119,16 @@ docker run --rm \
 
 `internal/integration/judge_sandbox_contract_test.go` 使用一次性的 fake Kubernetes API、真实 TCP gRPC server 和 HTTP callback 验证完整进程内契约：EndpointSlice churn、过载换节点、不可变 ZIP/SHA-256、隐藏 case 执行和 callback 脱敏。测试不要求也不会启动持久集群或服务。
 
+Judge 自有 schema 使用真实 MySQL 8.4.10 做兼容性门禁。脚本在私有 Docker network 中启动 digest 固定的 MySQL，使用真实 `judge-admin` 完成首次迁移和幂等 replay，并验证 migration history checksum、同租户 job/outbox 写入以及两类跨租户外键拒绝；不暴露宿主机端口，也不要求宿主机安装 MySQL 客户端：
+
+```bash
+MYSQL84_GO_MOD_CACHE="$PWD/.ci-cache/mysql84-go-mod" \
+MYSQL84_GO_BUILD_CACHE="$PWD/.ci-cache/mysql84-go-build" \
+bash scripts/ci/mysql84-schema-gate.sh
+```
+
+缓存目录只保存 Go module/build cache，可安全删除；数据库本身使用容器 tmpfs，并在脚本退出时销毁。CI 中 `test`、`mysql84-schema` 和 `ci-lint` 三个 job 并行执行。
+
 静态检查和构建：
 
 ```bash
