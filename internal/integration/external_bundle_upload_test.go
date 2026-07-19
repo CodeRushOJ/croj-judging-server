@@ -19,6 +19,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -150,6 +151,7 @@ func TestExternalBundleUploadHTTPIntegration(t *testing.T) {
 	objectRoot := t.TempDir()
 	service, err := external.NewBundleService(repository, &integrationFileObjectStore{root: objectRoot}, external.BundleServiceConfig{
 		TempDir: t.TempDir(), MaxUploadBytes: 1 << 20, ArchiveLimits: bundle.DefaultArchiveLimits(), IdempotencyTTL: 24 * time.Hour,
+		IdempotencyPepper: bytes.Repeat([]byte{0x42}, sha256.Size),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -204,35 +206,174 @@ func TestExternalBundleSQLRepositoryIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer database.Close()
+	database.SetMaxOpenConns(32)
+	database.SetMaxIdleConns(32)
 	if err := external.ApplyMigrations(context.Background(), database); err != nil {
 		t.Fatal(err)
 	}
+
+	t.Run("same key and hash replay one row", func(t *testing.T) {
+		tenantID, service, objectRoot := newSQLBundleFixture(t, database)
+		body := integrationBundleZIPWithInput(t, "same")
+		requests := make([]sqlUploadRequest, 16)
+		for index := range requests {
+			requests[index] = sqlUploadRequest{idempotencyKey: "same-key-0000001", body: body}
+		}
+		results := runConcurrentSQLUploads(service, tenantID, requests)
+		assertSuccessfulSQLUploadGroup(t, results, 1)
+		assertSQLBundleRows(t, database, tenantID, 1, 1)
+		assertVisibleBundleObjects(t, objectRoot, 1)
+	})
+
+	t.Run("different keys and same hash deduplicate bundle", func(t *testing.T) {
+		tenantID, service, objectRoot := newSQLBundleFixture(t, database)
+		body := integrationBundleZIPWithInput(t, "same")
+		requests := make([]sqlUploadRequest, 16)
+		for index := range requests {
+			requests[index] = sqlUploadRequest{idempotencyKey: "unique-key-" + strings.Repeat("0", 5-len(strconv.Itoa(index))) + strconv.Itoa(index), body: body}
+		}
+		results := runConcurrentSQLUploads(service, tenantID, requests)
+		assertSuccessfulSQLUploadGroup(t, results, 1)
+		assertSQLBundleRows(t, database, tenantID, 1, len(requests))
+		assertVisibleBundleObjects(t, objectRoot, 1)
+	})
+
+	t.Run("same key and different hash conflict", func(t *testing.T) {
+		tenantID, service, objectRoot := newSQLBundleFixture(t, database)
+		results := runConcurrentSQLUploads(service, tenantID, []sqlUploadRequest{
+			{idempotencyKey: "conflict-key-0001", body: integrationBundleZIPWithInput(t, "first")},
+			{idempotencyKey: "conflict-key-0001", body: integrationBundleZIPWithInput(t, "second")},
+		})
+		successes, conflicts := 0, 0
+		for _, result := range results {
+			switch {
+			case result.err == nil:
+				successes++
+			case errors.Is(result.err, external.ErrIdempotencyConflict):
+				conflicts++
+			default:
+				t.Fatalf("unexpected concurrent result error: %v", result.err)
+			}
+		}
+		if successes != 1 || conflicts != 1 {
+			t.Fatalf("successes=%d conflicts=%d", successes, conflicts)
+		}
+		assertSQLBundleRows(t, database, tenantID, 1, 1)
+		assertVisibleBundleObjects(t, objectRoot, 1)
+	})
+}
+
+type sqlUploadRequest struct {
+	idempotencyKey string
+	body           []byte
+}
+
+type sqlUploadResult struct {
+	metadata external.BundleMetadata
+	replay   bool
+	err      error
+}
+
+func newSQLBundleFixture(t *testing.T, database *sql.DB) (string, *external.BundleService, string) {
+	t.Helper()
 	tenantID := randomExternalID(t)
 	if _, err := database.Exec(`INSERT INTO t_external_tenant(external_id, name, status, policy_json) VALUES (?, ?, 'ACTIVE', ?)`, tenantID, "bundle-integration", `{"maxQueuedJobs":10}`); err != nil {
 		t.Fatal(err)
 	}
-	defer database.Exec(`DELETE FROM t_external_tenant WHERE external_id = ?`, tenantID)
+	t.Cleanup(func() {
+		_, _ = database.Exec(`DELETE FROM t_external_idempotency WHERE tenant_id = (SELECT id FROM t_external_tenant WHERE external_id = ?)`, tenantID)
+		_, _ = database.Exec(`DELETE FROM t_external_bundle WHERE tenant_id = (SELECT id FROM t_external_tenant WHERE external_id = ?)`, tenantID)
+		_, _ = database.Exec(`DELETE FROM t_external_tenant WHERE external_id = ?`, tenantID)
+	})
 	repository, err := external.NewSQLBundleRepository(database)
 	if err != nil {
 		t.Fatal(err)
 	}
-	service, err := external.NewBundleService(repository, &integrationFileObjectStore{root: t.TempDir()}, external.BundleServiceConfig{
+	objectRoot := t.TempDir()
+	service, err := external.NewBundleService(repository, &integrationFileObjectStore{root: objectRoot}, external.BundleServiceConfig{
 		TempDir: t.TempDir(), MaxUploadBytes: 1 << 20, ArchiveLimits: bundle.DefaultArchiveLimits(), IdempotencyTTL: time.Hour,
+		IdempotencyPepper: bytes.Repeat([]byte{0x42}, sha256.Size),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	metadata, replay, err := service.Upload(context.Background(), tenantID, "upload-key-00001", bytes.NewReader(integrationBundleZIP(t)))
-	if err != nil || replay {
-		t.Fatalf("metadata=%+v replay=%v error=%v", metadata, replay, err)
+	return tenantID, service, objectRoot
+}
+
+func runConcurrentSQLUploads(service *external.BundleService, tenantID string, requests []sqlUploadRequest) []sqlUploadResult {
+	start := make(chan struct{})
+	results := make(chan sqlUploadResult, len(requests))
+	var wait sync.WaitGroup
+	for _, request := range requests {
+		request := request
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			metadata, replay, err := service.Upload(context.Background(), tenantID, request.idempotencyKey, bytes.NewReader(request.body))
+			results <- sqlUploadResult{metadata: metadata, replay: replay, err: err}
+		}()
 	}
-	defer func() {
-		_, _ = database.Exec(`DELETE FROM t_external_idempotency WHERE tenant_id = (SELECT id FROM t_external_tenant WHERE external_id = ?)`, tenantID)
-		_, _ = database.Exec(`DELETE FROM t_external_bundle WHERE tenant_id = (SELECT id FROM t_external_tenant WHERE external_id = ?)`, tenantID)
-	}()
-	got, err := service.Get(context.Background(), tenantID, metadata.BundleID)
-	if err != nil || got.BundleID != metadata.BundleID {
-		t.Fatalf("got=%+v error=%v", got, err)
+	close(start)
+	wait.Wait()
+	close(results)
+	collected := make([]sqlUploadResult, 0, len(requests))
+	for result := range results {
+		collected = append(collected, result)
+	}
+	return collected
+}
+
+func assertSuccessfulSQLUploadGroup(t *testing.T, results []sqlUploadResult, wantCreated int) {
+	t.Helper()
+	bundleID := ""
+	created := 0
+	for _, result := range results {
+		if result.err != nil {
+			t.Fatalf("concurrent upload error: %v", result.err)
+		}
+		if bundleID == "" {
+			bundleID = result.metadata.BundleID
+		}
+		if result.metadata.BundleID != bundleID {
+			t.Fatalf("bundle IDs differ: %q and %q", bundleID, result.metadata.BundleID)
+		}
+		if !result.replay {
+			created++
+		}
+	}
+	if created != wantCreated {
+		t.Fatalf("created responses=%d want=%d", created, wantCreated)
+	}
+}
+
+func assertSQLBundleRows(t *testing.T, database *sql.DB, tenantID string, wantBundles, wantIdempotency int) {
+	t.Helper()
+	var bundles, idempotency int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM t_external_bundle AS bundle JOIN t_external_tenant AS tenant ON tenant.id = bundle.tenant_id WHERE tenant.external_id = ?`, tenantID).Scan(&bundles); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.QueryRow(`SELECT COUNT(*) FROM t_external_idempotency AS idempotency JOIN t_external_tenant AS tenant ON tenant.id = idempotency.tenant_id WHERE tenant.external_id = ? AND idempotency.operation_scope = 'bundle-upload'`, tenantID).Scan(&idempotency); err != nil {
+		t.Fatal(err)
+	}
+	if bundles != wantBundles || idempotency != wantIdempotency {
+		t.Fatalf("bundle rows=%d/%d idempotency rows=%d/%d", bundles, wantBundles, idempotency, wantIdempotency)
+	}
+}
+
+func assertVisibleBundleObjects(t *testing.T, root string, want int) {
+	t.Helper()
+	visible := 0
+	if err := filepath.WalkDir(root, func(_ string, entry os.DirEntry, err error) error {
+		if err == nil && !entry.IsDir() {
+			visible++
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if visible != want {
+		t.Fatalf("visible bundle objects=%d want=%d", visible, want)
 	}
 }
 
@@ -260,6 +401,10 @@ func performBundleUpload(t *testing.T, server http.Handler, apiKey, idempotencyK
 }
 
 func integrationBundleZIP(t *testing.T) []byte {
+	return integrationBundleZIPWithInput(t, "input")
+}
+
+func integrationBundleZIPWithInput(t *testing.T, input string) []byte {
 	t.Helper()
 	manifest, err := json.Marshal(bundle.Manifest{SchemaVersion: 1, JudgeMode: bundle.JudgeModeACM, Checker: bundle.CheckerExact, Cases: []bundle.Case{{ID: "case-1", Input: "1.in", Output: "1.out", Weight: 1}}})
 	if err != nil {
@@ -267,7 +412,7 @@ func integrationBundleZIP(t *testing.T) []byte {
 	}
 	var body bytes.Buffer
 	writer := zip.NewWriter(&body)
-	for name, content := range map[string][]byte{"manifest.json": manifest, "1.in": []byte("input"), "1.out": []byte("answer")} {
+	for name, content := range map[string][]byte{"manifest.json": manifest, "1.in": []byte(input), "1.out": []byte("answer")} {
 		part, err := writer.Create(name)
 		if err != nil {
 			t.Fatal(err)

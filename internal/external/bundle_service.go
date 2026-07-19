@@ -10,7 +10,6 @@ import (
 	"io"
 	"os"
 	"path"
-	"regexp"
 	"time"
 
 	"github.com/CodeRushOJ/croj-judging-server/internal/bundle"
@@ -23,8 +22,6 @@ var (
 	ErrIdempotencyConflict = errors.New("idempotency key was reused with different content")
 	ErrInvalidIdempotency  = errors.New("idempotency key is invalid")
 )
-
-var idempotencyKeyPattern = regexp.MustCompile(`^[\x21-\x7e]{16,128}$`)
 
 const maxExternalBundleCasesV1 = 256
 
@@ -65,11 +62,12 @@ type BundleRepository interface {
 }
 
 type BundleServiceConfig struct {
-	TempDir        string
-	MaxUploadBytes int64
-	ArchiveLimits  bundle.ArchiveLimits
-	IdempotencyTTL time.Duration
-	Random         io.Reader
+	TempDir           string
+	MaxUploadBytes    int64
+	ArchiveLimits     bundle.ArchiveLimits
+	IdempotencyTTL    time.Duration
+	IdempotencyPepper []byte
+	Random            io.Reader
 }
 
 type BundleService struct {
@@ -86,6 +84,9 @@ func NewBundleService(repository BundleRepository, store BundleObjectStore, conf
 	if config.MaxUploadBytes <= 0 || config.IdempotencyTTL <= 0 {
 		return nil, fmt.Errorf("bundle upload and idempotency limits must be positive")
 	}
+	if len(config.IdempotencyPepper) < sha256.Size {
+		return nil, fmt.Errorf("idempotency pepper must contain at least 256 bits")
+	}
 	if err := bundle.ValidateArchiveLimits(config.ArchiveLimits); err != nil {
 		return nil, err
 	}
@@ -95,6 +96,7 @@ func NewBundleService(repository BundleRepository, store BundleObjectStore, conf
 	if config.TempDir == "" {
 		config.TempDir = os.TempDir()
 	}
+	config.IdempotencyPepper = append([]byte(nil), config.IdempotencyPepper...)
 	return &BundleService{repository: repository, store: store, config: config, now: time.Now}, nil
 }
 
@@ -102,9 +104,12 @@ func (service *BundleService) Upload(ctx context.Context, tenantID, idempotencyK
 	if service == nil || source == nil || !externalIDPattern.MatchString(tenantID) {
 		return BundleMetadata{}, false, fmt.Errorf("%w: tenant and bundle stream are required", ErrInvalidBundle)
 	}
-	if !idempotencyKeyPattern.MatchString(idempotencyKey) {
+	idempotencyDigestBytes, err := DigestIdempotencyKey(idempotencyKey, service.config.IdempotencyPepper)
+	if err != nil {
 		return BundleMetadata{}, false, ErrInvalidIdempotency
 	}
+	var idempotencyDigest [sha256.Size]byte
+	copy(idempotencyDigest[:], idempotencyDigestBytes)
 	staged, err := os.CreateTemp(service.config.TempDir, ".external-bundle-*.zip")
 	if err != nil {
 		return BundleMetadata{}, false, fmt.Errorf("create bundle staging file: %w", err)
@@ -143,7 +148,6 @@ func (service *BundleService) Upload(ctx context.Context, tenantID, idempotencyK
 	if len(manifest.Cases) > maxExternalBundleCasesV1 {
 		return BundleMetadata{}, false, fmt.Errorf("%w: manifest exceeds %d cases", ErrInvalidBundle, maxExternalBundleCasesV1)
 	}
-	idempotencyDigest := sha256.Sum256([]byte(idempotencyKey))
 	lookup, err := service.repository.FindBundleUpload(ctx, tenantID, idempotencyDigest)
 	if err != nil {
 		return BundleMetadata{}, false, fmt.Errorf("find bundle upload idempotency: %w", err)
@@ -152,14 +156,15 @@ func (service *BundleService) Upload(ctx context.Context, tenantID, idempotencyK
 		if lookup.RequestHash != requestHash {
 			return BundleMetadata{}, false, ErrIdempotencyConflict
 		}
+		objectKey := bundleObjectKey(tenantID, requestHash)
+		if err := service.store.Publish(ctx, objectKey, filename, written, requestHash); err != nil {
+			return BundleMetadata{}, false, fmt.Errorf("reconcile immutable bundle object: %w", err)
+		}
 		return lookup.Metadata, true, nil
 	}
 
 	digestHex := hex.EncodeToString(requestHash[:])
-	objectKey := path.Join("external", tenantID, "sha256", digestHex+".zip")
-	if err := service.store.Publish(ctx, objectKey, filename, written, requestHash); err != nil {
-		return BundleMetadata{}, false, err
-	}
+	objectKey := bundleObjectKey(tenantID, requestHash)
 	bundleID, err := generateExternalID(service.config.Random)
 	if err != nil {
 		return BundleMetadata{}, false, err
@@ -174,7 +179,17 @@ func (service *BundleService) Upload(ctx context.Context, tenantID, idempotencyK
 	if err != nil {
 		return BundleMetadata{}, false, err
 	}
+	// The database record owns the deterministic final object key before it can
+	// become visible. A failed publish is safely repaired by retrying the same
+	// idempotent upload; no unowned final-prefix object can be created.
+	if err := service.store.Publish(ctx, objectKey, filename, written, requestHash); err != nil {
+		return BundleMetadata{}, false, fmt.Errorf("publish owned immutable bundle object: %w", err)
+	}
 	return result.Metadata, result.Replay, nil
+}
+
+func bundleObjectKey(tenantID string, digest [sha256.Size]byte) string {
+	return path.Join("external", tenantID, "sha256", hex.EncodeToString(digest[:])+".zip")
 }
 
 func (service *BundleService) Get(ctx context.Context, tenantID, bundleID string) (BundleMetadata, error) {

@@ -28,6 +28,7 @@ type memoryBundleRepository struct {
 	idempotency    map[string]bundleUploadRecord
 	bundles        map[string]BundleMetadata
 	logicalCreates int
+	commitErr      error
 }
 
 type bundleUploadRecord struct {
@@ -49,6 +50,9 @@ func (repository *memoryBundleRepository) FindBundleUpload(_ context.Context, te
 func (repository *memoryBundleRepository) CommitBundleUpload(_ context.Context, input BundleCommitInput) (BundleCommitResult, error) {
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
+	if repository.commitErr != nil {
+		return BundleCommitResult{}, repository.commitErr
+	}
 	idempotencyKey := input.TenantID + ":" + hex.EncodeToString(input.IdempotencyDigest[:])
 	if record, found := repository.idempotency[idempotencyKey]; found {
 		if record.requestHash != input.RequestHash {
@@ -82,6 +86,7 @@ type atomicMemoryObjectStore struct {
 	mu        sync.Mutex
 	objects   map[string][]byte
 	publishes int
+	failNext  int
 }
 
 func (store *atomicMemoryObjectStore) Publish(_ context.Context, key, filename string, size int64, digest [sha256.Size]byte) error {
@@ -95,14 +100,48 @@ func (store *atomicMemoryObjectStore) Publish(_ context.Context, key, filename s
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	store.publishes++
+	if store.failNext > 0 {
+		store.failNext--
+		return errors.New("injected object publish failure")
+	}
 	if store.objects == nil {
 		store.objects = map[string][]byte{}
 	}
 	if _, exists := store.objects[key]; !exists {
+		store.publishes++
 		store.objects[key] = append([]byte(nil), data...)
 	}
 	return nil
+}
+
+func TestBundleServiceNeverPublishesUnownedFinalObject(t *testing.T) {
+	repository := newMemoryBundleRepository()
+	repository.commitErr = errors.New("injected commit failure")
+	store := &atomicMemoryObjectStore{}
+	service := newTestBundleService(t, repository, store, t.TempDir(), 1<<20, bundle.DefaultArchiveLimits())
+
+	_, _, err := service.Upload(context.Background(), testTenantID, "upload-key-00001", bytes.NewReader(validExternalBundle(t, "input")))
+	if err == nil || len(store.objects) != 0 || store.publishes != 0 {
+		t.Fatalf("error=%v objects=%d publishes=%d", err, len(store.objects), store.publishes)
+	}
+}
+
+func TestBundleServiceReconcilesOwnedObjectAfterPublishFailure(t *testing.T) {
+	repository := newMemoryBundleRepository()
+	store := &atomicMemoryObjectStore{failNext: 1}
+	service := newTestBundleService(t, repository, store, t.TempDir(), 1<<20, bundle.DefaultArchiveLimits())
+	body := validExternalBundle(t, "input")
+
+	if _, _, err := service.Upload(context.Background(), testTenantID, "upload-key-00001", bytes.NewReader(body)); err == nil {
+		t.Fatal("expected injected publish failure")
+	}
+	if repository.logicalCreates != 1 || len(store.objects) != 0 {
+		t.Fatalf("owned rows=%d visible objects=%d", repository.logicalCreates, len(store.objects))
+	}
+	metadata, replay, err := service.Upload(context.Background(), testTenantID, "upload-key-00001", bytes.NewReader(body))
+	if err != nil || !replay || metadata.BundleID == "" || len(store.objects) != 1 {
+		t.Fatalf("metadata=%+v replay=%v error=%v objects=%d", metadata, replay, err, len(store.objects))
+	}
 }
 
 func TestBundleServiceStreamsValidUploadToTenantContentAddress(t *testing.T) {
@@ -124,7 +163,24 @@ func TestBundleServiceStreamsValidUploadToTenantContentAddress(t *testing.T) {
 	if len(store.objects) != 1 || !bytes.Equal(store.objects[wantKey], body) || repository.logicalCreates != 1 {
 		t.Fatalf("objects=%v logicalCreates=%d", mapsKeys(store.objects), repository.logicalCreates)
 	}
+	idempotencyDigest, err := DigestIdempotencyKey("upload-key-00001", testIdempotencyPepper())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found := repository.idempotency[testTenantID+":"+hex.EncodeToString(idempotencyDigest)]; !found {
+		t.Fatal("bundle upload must use the shared HMAC idempotency digest")
+	}
 	assertDirectoryEmpty(t, tempDir)
+}
+
+func TestNewBundleServiceRejectsShortIdempotencyPepper(t *testing.T) {
+	_, err := NewBundleService(newMemoryBundleRepository(), &atomicMemoryObjectStore{}, BundleServiceConfig{
+		TempDir: t.TempDir(), MaxUploadBytes: 1 << 20, ArchiveLimits: bundle.DefaultArchiveLimits(),
+		IdempotencyTTL: time.Hour, IdempotencyPepper: bytes.Repeat([]byte{0x11}, sha256.Size-1),
+	})
+	if err == nil {
+		t.Fatal("expected short idempotency pepper rejection")
+	}
 }
 
 func TestBundleServiceRejectsOversizeAndCancelledStreamsWithoutArtifacts(t *testing.T) {
@@ -305,13 +361,17 @@ func newTestBundleService(t *testing.T, repository BundleRepository, store Bundl
 	t.Helper()
 	service, err := NewBundleService(repository, store, BundleServiceConfig{
 		TempDir: tempDir, MaxUploadBytes: maxUploadBytes, ArchiveLimits: limits,
-		IdempotencyTTL: 24 * time.Hour, Random: rand.Reader,
+		IdempotencyTTL: 24 * time.Hour, IdempotencyPepper: testIdempotencyPepper(), Random: rand.Reader,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	service.now = func() time.Time { return time.Date(2026, 7, 19, 1, 2, 3, 0, time.UTC) }
 	return service
+}
+
+func testIdempotencyPepper() []byte {
+	return bytes.Repeat([]byte{0x42}, sha256.Size)
 }
 
 type zipEntry struct {
