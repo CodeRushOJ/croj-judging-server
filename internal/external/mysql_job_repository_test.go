@@ -582,8 +582,14 @@ VALUES (?, ?, UNHEX(SHA2(?, 256)), ?, 128, 1, 1, JSON_OBJECT('schemaVersion', 1,
 	}
 	if callbackID != "" {
 		if _, err := database.Exec(`
-INSERT INTO t_external_callback(external_id, tenant_id, destination_url, allowed_host, allowed_port, secret_ciphertext, secret_key_version)
-VALUES (?, ?, 'https://callback.example.test/judge', 'callback.example.test', 443, X'0102', 1)`, callbackID, tenantInternalID); err != nil {
+INSERT INTO t_external_callback(
+    external_id, tenant_id, destination_url, allowed_host, allowed_port,
+    secret_ciphertext, secret_nonce, secret_key_version
+)
+VALUES (
+    ?, ?, 'https://callback.example.test/judge', 'callback.example.test', 443,
+    X'0102030405060708090A0B0C0D0E0F1011', X'000102030405060708090A0B', 1
+)`, callbackID, tenantInternalID); err != nil {
 			t.Fatal(err)
 		}
 	}

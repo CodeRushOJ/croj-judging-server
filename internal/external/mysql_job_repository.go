@@ -16,25 +16,27 @@ import (
 const submitJobIdempotencyScope = "judge-job-submit"
 
 type MySQLJobRepositoryConfig struct {
-	Database          *sql.DB
-	Random            io.Reader
-	Now               func() time.Time
-	IdempotencyPepper []byte
-	CursorKey         []byte
-	SourceCipher      *SourceCipher
-	SourceObjects     SourceObjectStore
-	IdempotencyTTL    time.Duration
+	Database              *sql.DB
+	Random                io.Reader
+	Now                   func() time.Time
+	IdempotencyPepper     []byte
+	CursorKey             []byte
+	SourceCipher          *SourceCipher
+	SourceObjects         SourceObjectStore
+	IdempotencyTTL        time.Duration
+	WebhookDeliveryWindow time.Duration
 }
 
 type MySQLJobRepository struct {
-	database          *sql.DB
-	random            io.Reader
-	now               func() time.Time
-	idempotencyPepper []byte
-	cursor            *JobCursorCodec
-	sourceCipher      *SourceCipher
-	sourceObjects     SourceObjectStore
-	idempotencyTTL    time.Duration
+	database              *sql.DB
+	random                io.Reader
+	now                   func() time.Time
+	idempotencyPepper     []byte
+	cursor                *JobCursorCodec
+	sourceCipher          *SourceCipher
+	sourceObjects         SourceObjectStore
+	idempotencyTTL        time.Duration
+	webhookDeliveryWindow time.Duration
 }
 
 func NewMySQLJobRepository(config MySQLJobRepositoryConfig) (*MySQLJobRepository, error) {
@@ -44,6 +46,12 @@ func NewMySQLJobRepository(config MySQLJobRepositoryConfig) (*MySQLJobRepository
 	if len(config.IdempotencyPepper) < sha256.Size || config.IdempotencyTTL <= 0 || config.IdempotencyTTL > 7*24*time.Hour {
 		return nil, fmt.Errorf("idempotency pepper and a retention window up to seven days are required")
 	}
+	if config.WebhookDeliveryWindow == 0 {
+		config.WebhookDeliveryWindow = 24 * time.Hour
+	}
+	if config.WebhookDeliveryWindow < time.Minute || config.WebhookDeliveryWindow > 7*24*time.Hour {
+		return nil, fmt.Errorf("webhook delivery window must be between one minute and seven days")
+	}
 	cursor, err := NewJobCursorCodec(config.CursorKey)
 	if err != nil {
 		return nil, err
@@ -52,7 +60,8 @@ func NewMySQLJobRepository(config MySQLJobRepositoryConfig) (*MySQLJobRepository
 		database: config.Database, random: config.Random, now: config.Now,
 		idempotencyPepper: append([]byte(nil), config.IdempotencyPepper...), cursor: cursor,
 		sourceCipher: config.SourceCipher, sourceObjects: config.SourceObjects,
-		idempotencyTTL: config.IdempotencyTTL,
+		idempotencyTTL:        config.IdempotencyTTL,
+		webhookDeliveryWindow: config.WebhookDeliveryWindow,
 	}, nil
 }
 
@@ -202,7 +211,10 @@ WHERE tenant_id = ? AND external_id = ? AND publication_status = 'READY' AND rea
 		var callbackID int64
 		if err := tx.QueryRowContext(ctx, `
 SELECT id FROM t_external_callback
-WHERE tenant_id = ? AND external_id = ? AND disabled_at IS NULL`,
+WHERE tenant_id = ? AND external_id = ? AND disabled_at IS NULL
+  AND secret_nonce IS NOT NULL AND OCTET_LENGTH(secret_nonce) = 12
+  AND OCTET_LENGTH(secret_ciphertext) > 16 AND secret_key_version > 0
+FOR SHARE`,
 			tenantInternalID, request.CallbackID).Scan(&callbackID); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return SubmitJobResult{}, fmt.Errorf("%w: callback is unavailable", ErrExternalJobInvalid)
@@ -409,9 +421,14 @@ func (repository *MySQLJobRepository) Cancel(ctx context.Context, tenantExternal
 	if err != nil {
 		return ExternalJobRecord{}, repositoryUnavailable("lock job for cancellation", err)
 	}
-	now := repository.now().UTC()
+	now, err := mysqlCurrentTime(ctx, tx)
+	if err != nil {
+		return ExternalJobRecord{}, err
+	}
+	emitTerminalEvent := false
 	switch job.Status {
 	case JobStatusQueued:
+		emitTerminalEvent = true
 		_, err = tx.ExecContext(ctx, `
 UPDATE t_external_job
 SET status = 'CANCELLED', cancel_requested_at = ?, completed_at = ?, worker_id = NULL,
@@ -431,6 +448,11 @@ WHERE id = ? AND status = 'QUEUED'`, now, now, job.InternalID)
 	job, err = getExternalJob(ctx, tx, tenantExternalID, jobExternalID, false)
 	if err != nil {
 		return ExternalJobRecord{}, repositoryUnavailable("read cancelled job", err)
+	}
+	if emitTerminalEvent {
+		if _, err := repository.insertTerminalWebhookEvent(ctx, tx, now, job); err != nil {
+			return ExternalJobRecord{}, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return ExternalJobRecord{}, repositoryUnavailable("commit cancellation", err)

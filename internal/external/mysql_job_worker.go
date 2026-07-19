@@ -183,9 +183,17 @@ LIMIT 1 FOR UPDATE SKIP LOCKED`, candidateTenantID, leaseNow, leaseNow).
 		if cancelRequested.Valid {
 			if _, err := tx.ExecContext(ctx, `
 UPDATE t_external_job
-SET status = 'CANCELLED', completed_at = ?, worker_id = NULL, lease_token = NULL, lease_until = NULL
+SET status = 'CANCELLED', result_json = NULL, failure_code = NULL, completed_at = ?,
+    worker_id = NULL, lease_token = NULL, lease_until = NULL
 WHERE id = ? AND status = 'RUNNING' AND attempt_no = ?`, leaseNow, jobInternalID, attemptNo); err != nil {
 				return WorkerJobClaim{}, false, repositoryUnavailable("recover expired cancellation", err)
+			}
+			job, err := getExternalJobByInternalID(ctx, tx, jobInternalID)
+			if err != nil {
+				return WorkerJobClaim{}, false, repositoryUnavailable("read recovered cancellation", err)
+			}
+			if _, err := repository.insertTerminalWebhookEvent(ctx, tx, leaseNow, job); err != nil {
+				return WorkerJobClaim{}, false, err
 			}
 			if err := tx.Commit(); err != nil {
 				return WorkerJobClaim{}, false, repositoryUnavailable("commit expired cancellation", err)
@@ -199,6 +207,13 @@ SET status = 'FAILED', failure_code = 'LEASE_EXPIRED', completed_at = ?,
     worker_id = NULL, lease_token = NULL, lease_until = NULL
 WHERE id = ? AND status = 'RUNNING' AND attempt_no = ?`, leaseNow, jobInternalID, attemptNo); err != nil {
 				return WorkerJobClaim{}, false, repositoryUnavailable("finish exhausted expired job", err)
+			}
+			job, err := getExternalJobByInternalID(ctx, tx, jobInternalID)
+			if err != nil {
+				return WorkerJobClaim{}, false, repositoryUnavailable("read exhausted expired job", err)
+			}
+			if _, err := repository.insertTerminalWebhookEvent(ctx, tx, leaseNow, job); err != nil {
+				return WorkerJobClaim{}, false, err
 			}
 			if err := tx.Commit(); err != nil {
 				return WorkerJobClaim{}, false, repositoryUnavailable("commit exhausted expired job", err)
@@ -371,6 +386,13 @@ WHERE id = ? AND status = 'RUNNING' AND attempt_no = ? AND worker_id = ? AND lea
 	if err := finishAttempt(ctx, tx, claim, attemptStatus, "", now); err != nil {
 		return err
 	}
+	job, err := getExternalJobByInternalID(ctx, tx, claim.Job.InternalID)
+	if err != nil {
+		return repositoryUnavailable("read completed job", err)
+	}
+	if _, err := repository.insertTerminalWebhookEvent(ctx, tx, now, job); err != nil {
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		return repositoryUnavailable("commit completion", err)
 	}
@@ -404,11 +426,15 @@ func (repository *MySQLJobRepository) FailInfrastructure(
 	}
 	disposition := FailureTerminal
 	jobStatus := JobStatusFailed
+	failureCode := any(failure.Code)
+	attemptFailureCode := failure.Code
 	completedAt := any(now)
 	nextAttemptAt := any(now)
 	if cancelled {
 		disposition = FailureCancelled
 		jobStatus = JobStatusCancelled
+		failureCode = nil
+		attemptFailureCode = ""
 	} else if int(claim.AttemptNo) < policy.MaxInfrastructureTries {
 		disposition = FailureRequeued
 		jobStatus = JobStatusQueued
@@ -420,7 +446,7 @@ UPDATE t_external_job
 SET status = ?, next_attempt_at = ?, failure_code = ?, completed_at = ?,
     worker_id = NULL, lease_token = NULL, lease_until = NULL
 WHERE id = ? AND status = 'RUNNING' AND attempt_no = ? AND worker_id = ? AND lease_token = ?`,
-		jobStatus, nextAttemptAt, failure.Code, completedAt,
+		jobStatus, nextAttemptAt, failureCode, completedAt,
 		claim.Job.InternalID, claim.AttemptNo, claim.WorkerID, claim.LeaseToken)
 	if err != nil {
 		return "", repositoryUnavailable("persist infrastructure failure", err)
@@ -432,8 +458,17 @@ WHERE id = ? AND status = 'RUNNING' AND attempt_no = ? AND worker_id = ? AND lea
 	if cancelled {
 		attemptStatus = "CANCELLED"
 	}
-	if err := finishAttempt(ctx, tx, claim, attemptStatus, failure.Code, now); err != nil {
+	if err := finishAttempt(ctx, tx, claim, attemptStatus, attemptFailureCode, now); err != nil {
 		return "", err
+	}
+	if disposition != FailureRequeued {
+		job, err := getExternalJobByInternalID(ctx, tx, claim.Job.InternalID)
+		if err != nil {
+			return "", repositoryUnavailable("read terminal failed job", err)
+		}
+		if _, err := repository.insertTerminalWebhookEvent(ctx, tx, now, job); err != nil {
+			return "", err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return "", repositoryUnavailable("commit infrastructure failure", err)
