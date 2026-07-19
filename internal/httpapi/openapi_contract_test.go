@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -120,6 +121,40 @@ func TestOpenAPIContractCoversLiveHandlerResponses(t *testing.T) {
 		request.Header.Set("Idempotency-Key", "upload-key-00001")
 		return server, request
 	}
+	newBundleServer := func(t *testing.T, authenticator RequestAuthenticator, application BundleApplication, quota external.Quota) *Server {
+		if quota == nil {
+			quota = &writeQuotaStub{decision: external.QuotaDecision{Allowed: true}}
+		}
+		capabilities := testCapabilities()
+		server, err := NewServer(authenticator, capabilities, WithBundleApplication(application),
+			WithBundleWriteQuota(quota, external.QuotaLimit{Capacity: capabilities.Limits.MaxBundleBytes, RefillPeriod: time.Minute}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return server
+	}
+	newJobServer := func(t *testing.T, authenticator RequestAuthenticator, service JobService, quota external.Quota) *Server {
+		if quota == nil {
+			quota = &writeQuotaStub{decision: external.QuotaDecision{Allowed: true}}
+		}
+		server, err := NewServer(authenticator, testCapabilities(), WithJobService(service),
+			WithJobWriteQuota(quota, external.QuotaLimit{Capacity: 20, RefillPeriod: time.Second}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return server
+	}
+	allScopes := map[Scope]struct{}{
+		ScopeCapabilitiesRead: {}, ScopeBundleWrite: {}, ScopeBundleRead: {},
+		ScopeJobSubmit: {}, ScopeJobRead: {}, ScopeJobCancel: {},
+	}
+	validBundleUpload := func(t *testing.T) *http.Request {
+		body, contentType := multipartBody(t, []multipartValue{{name: "bundle", filename: "tests.zip", body: []byte("zip")}})
+		request := httptest.NewRequest(http.MethodPost, "/api/v1/bundles", bytes.NewReader(body))
+		request.Header.Set("Content-Type", contentType)
+		request.Header.Set("Idempotency-Key", "upload-key-00001")
+		return request
+	}
 
 	cases := map[string]liveCase{
 		"capabilities success": {"/api/v1/capabilities", http.MethodGet, func(t *testing.T) (*Server, *http.Request) {
@@ -186,6 +221,34 @@ func TestOpenAPIContractCoversLiveHandlerResponses(t *testing.T) {
 		"bundle publishing": {"/api/v1/bundles", http.MethodPost, func(t *testing.T) (*Server, *http.Request) {
 			return bundleRequest(t, &bundleApplicationStub{err: external.ErrBundlePublishing}, nil)
 		}, 503, []string{"X-Request-Id", "Retry-After"}},
+		"bundle invalid upload": {"/api/v1/bundles", http.MethodPost, func(t *testing.T) (*Server, *http.Request) {
+			server := newBundleServer(t, staticAuthenticator{principal: Principal{TenantID: "tenant-7", scopes: allScopes}}, &bundleApplicationStub{}, nil)
+			return server, httptest.NewRequest(http.MethodPost, "/api/v1/bundles", nil)
+		}, 400, []string{"X-Request-Id"}},
+		"bundle unauthenticated": {"/api/v1/bundles", http.MethodPost, func(t *testing.T) (*Server, *http.Request) {
+			server := newBundleServer(t, staticAuthenticator{err: ErrUnauthenticated}, &bundleApplicationStub{}, nil)
+			return server, validBundleUpload(t)
+		}, 401, []string{"X-Request-Id", "WWW-Authenticate"}},
+		"bundle forbidden": {"/api/v1/bundles", http.MethodPost, func(t *testing.T) (*Server, *http.Request) {
+			server := newBundleServer(t, staticAuthenticator{principal: Principal{TenantID: "tenant-7", scopes: map[Scope]struct{}{}}}, &bundleApplicationStub{}, nil)
+			return server, validBundleUpload(t)
+		}, 403, []string{"X-Request-Id"}},
+		"bundle quota unavailable": {"/api/v1/bundles", http.MethodPost, func(t *testing.T) (*Server, *http.Request) {
+			quota := &writeQuotaStub{err: external.ErrQuotaUnavailable}
+			return bundleRequest(t, &bundleApplicationStub{}, quota)
+		}, 503, []string{"X-Request-Id", "Retry-After"}},
+		"bundle get success": {"/api/v1/bundles/{bundleId}", http.MethodGet, func(t *testing.T) (*Server, *http.Request) {
+			server := newBundleServer(t, staticAuthenticator{principal: Principal{TenantID: "tenant-7", scopes: allScopes}}, &bundleApplicationStub{metadata: testBundleMetadata()}, nil)
+			return server, httptest.NewRequest(http.MethodGet, "/api/v1/bundles/aaaaaaaaaaaaaaaaaaaaaaaaaa", nil)
+		}, 200, []string{"X-Request-Id"}},
+		"bundle get not found": {"/api/v1/bundles/{bundleId}", http.MethodGet, func(t *testing.T) (*Server, *http.Request) {
+			server := newBundleServer(t, staticAuthenticator{principal: Principal{TenantID: "tenant-7", scopes: allScopes}}, &bundleApplicationStub{err: external.ErrBundleNotFound}, nil)
+			return server, httptest.NewRequest(http.MethodGet, "/api/v1/bundles/aaaaaaaaaaaaaaaaaaaaaaaaaa", nil)
+		}, 404, []string{"X-Request-Id"}},
+		"bundle get unavailable": {"/api/v1/bundles/{bundleId}", http.MethodGet, func(t *testing.T) (*Server, *http.Request) {
+			server := newBundleServer(t, staticAuthenticator{principal: Principal{TenantID: "tenant-7", scopes: allScopes}}, &bundleApplicationStub{err: fmt.Errorf("store unavailable")}, nil)
+			return server, httptest.NewRequest(http.MethodGet, "/api/v1/bundles/aaaaaaaaaaaaaaaaaaaaaaaaaa", nil)
+		}, 503, []string{"X-Request-Id"}},
 		"job accepted": {"/api/v1/judge-jobs", http.MethodPost, func(t *testing.T) (*Server, *http.Request) {
 			return jobRequest(t, &jobServiceStub{view: JobView{JobID: "ceirceirceirceirceirceirce", Status: JobQueued}})
 		}, 202, []string{"X-Request-Id", "Location"}},
@@ -219,18 +282,76 @@ func TestOpenAPIContractCoversLiveHandlerResponses(t *testing.T) {
 		"job unavailable": {"/api/v1/judge-jobs", http.MethodPost, func(t *testing.T) (*Server, *http.Request) {
 			return jobRequest(t, &jobServiceStub{err: ErrJobUnavailable})
 		}, 503, []string{"X-Request-Id", "Retry-After"}},
+		"job unauthenticated": {"/api/v1/judge-jobs", http.MethodPost, func(t *testing.T) (*Server, *http.Request) {
+			server := newJobServer(t, staticAuthenticator{err: ErrUnauthenticated}, &jobServiceStub{}, nil)
+			return server, httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs", nil)
+		}, 401, []string{"X-Request-Id", "WWW-Authenticate"}},
+		"job forbidden": {"/api/v1/judge-jobs", http.MethodPost, func(t *testing.T) (*Server, *http.Request) {
+			server := newJobServer(t, staticAuthenticator{principal: Principal{TenantID: "tenant-7", scopes: map[Scope]struct{}{}}}, &jobServiceStub{}, nil)
+			return server, httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs", nil)
+		}, 403, []string{"X-Request-Id"}},
+		"job quota exceeded": {"/api/v1/judge-jobs", http.MethodPost, func(t *testing.T) (*Server, *http.Request) {
+			quota := &writeQuotaStub{decision: external.QuotaDecision{Allowed: false, RetryAfter: time.Second}}
+			server := newJobServer(t, staticAuthenticator{principal: Principal{TenantID: "tenant-7", scopes: allScopes}}, &jobServiceStub{view: JobView{JobID: "ceirceirceirceirceirceirce"}}, quota)
+			request := httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs", strings.NewReader(`{"bundleId":"ceirceirceirceirceirceircf","language":"cpp20","sourceCode":"x"}`))
+			request.Header.Set("Idempotency-Key", "submission-00000042")
+			return server, request
+		}, 429, []string{"X-Request-Id", "Retry-After"}},
+		"job quota unavailable": {"/api/v1/judge-jobs", http.MethodPost, func(t *testing.T) (*Server, *http.Request) {
+			quota := &writeQuotaStub{err: external.ErrQuotaUnavailable}
+			server := newJobServer(t, staticAuthenticator{principal: Principal{TenantID: "tenant-7", scopes: allScopes}}, &jobServiceStub{view: JobView{JobID: "ceirceirceirceirceirceirce"}}, quota)
+			request := httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs", strings.NewReader(`{"bundleId":"ceirceirceirceirceirceircf","language":"cpp20","sourceCode":"x"}`))
+			request.Header.Set("Idempotency-Key", "submission-00000042")
+			return server, request
+		}, 503, []string{"X-Request-Id", "Retry-After"}},
 		"invalid list": {"/api/v1/judge-jobs", http.MethodGet, func(t *testing.T) (*Server, *http.Request) {
 			server := newJobTestServer(t, &jobServiceStub{}, ScopeJobRead)
 			return server, httptest.NewRequest(http.MethodGet, "/api/v1/judge-jobs?limit=0", nil)
 		}, 400, []string{"X-Request-Id"}},
+		"job list success": {"/api/v1/judge-jobs", http.MethodGet, func(t *testing.T) (*Server, *http.Request) {
+			server := newJobServer(t, staticAuthenticator{principal: Principal{TenantID: "tenant-7", scopes: allScopes}}, &jobServiceStub{listPage: JobListPage{Items: []JobView{}}}, nil)
+			return server, httptest.NewRequest(http.MethodGet, "/api/v1/judge-jobs", nil)
+		}, 200, []string{"X-Request-Id"}},
+		"job list unavailable": {"/api/v1/judge-jobs", http.MethodGet, func(t *testing.T) (*Server, *http.Request) {
+			server := newJobServer(t, staticAuthenticator{principal: Principal{TenantID: "tenant-7", scopes: allScopes}}, &jobServiceStub{err: ErrJobUnavailable}, nil)
+			return server, httptest.NewRequest(http.MethodGet, "/api/v1/judge-jobs", nil)
+		}, 503, []string{"X-Request-Id", "Retry-After"}},
+		"job list internal": {"/api/v1/judge-jobs", http.MethodGet, func(t *testing.T) (*Server, *http.Request) {
+			server := newJobServer(t, staticAuthenticator{principal: Principal{TenantID: "tenant-7", scopes: allScopes}}, &jobServiceStub{err: fmt.Errorf("database detail")}, nil)
+			return server, httptest.NewRequest(http.MethodGet, "/api/v1/judge-jobs", nil)
+		}, 500, []string{"X-Request-Id"}},
+		"job get success": {"/api/v1/judge-jobs/{jobId}", http.MethodGet, func(t *testing.T) (*Server, *http.Request) {
+			server := newJobServer(t, staticAuthenticator{principal: Principal{TenantID: "tenant-7", scopes: allScopes}}, &jobServiceStub{view: JobView{JobID: "ceirceirceirceirceirceirce", Status: JobRunning}}, nil)
+			return server, httptest.NewRequest(http.MethodGet, "/api/v1/judge-jobs/ceirceirceirceirceirceirce", nil)
+		}, 200, []string{"X-Request-Id"}},
 		"job get not found": {"/api/v1/judge-jobs/{jobId}", http.MethodGet, func(t *testing.T) (*Server, *http.Request) {
 			server := newJobTestServer(t, &jobServiceStub{err: ErrJobNotFound}, ScopeJobRead)
 			return server, httptest.NewRequest(http.MethodGet, "/api/v1/judge-jobs/ceirceirceirceirceirceirce", nil)
 		}, 404, []string{"X-Request-Id"}},
+		"job get unavailable": {"/api/v1/judge-jobs/{jobId}", http.MethodGet, func(t *testing.T) (*Server, *http.Request) {
+			server := newJobServer(t, staticAuthenticator{principal: Principal{TenantID: "tenant-7", scopes: allScopes}}, &jobServiceStub{err: ErrJobUnavailable}, nil)
+			return server, httptest.NewRequest(http.MethodGet, "/api/v1/judge-jobs/ceirceirceirceirceirceirce", nil)
+		}, 503, []string{"X-Request-Id", "Retry-After"}},
+		"job get internal": {"/api/v1/judge-jobs/{jobId}", http.MethodGet, func(t *testing.T) (*Server, *http.Request) {
+			server := newJobServer(t, staticAuthenticator{principal: Principal{TenantID: "tenant-7", scopes: allScopes}}, &jobServiceStub{err: fmt.Errorf("database detail")}, nil)
+			return server, httptest.NewRequest(http.MethodGet, "/api/v1/judge-jobs/ceirceirceirceirceirceirce", nil)
+		}, 500, []string{"X-Request-Id"}},
 		"job cancel success": {"/api/v1/judge-jobs/{jobId}/cancel", http.MethodPost, func(t *testing.T) (*Server, *http.Request) {
 			server := newJobTestServer(t, &jobServiceStub{view: JobView{JobID: "ceirceirceirceirceirceirce", Status: JobCancelled}}, ScopeJobCancel)
 			return server, httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs/ceirceirceirceirceirceirce/cancel", nil)
 		}, 200, []string{"X-Request-Id"}},
+		"job cancel not found": {"/api/v1/judge-jobs/{jobId}/cancel", http.MethodPost, func(t *testing.T) (*Server, *http.Request) {
+			server := newJobServer(t, staticAuthenticator{principal: Principal{TenantID: "tenant-7", scopes: allScopes}}, &jobServiceStub{err: ErrJobNotFound}, nil)
+			return server, httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs/ceirceirceirceirceirceirce/cancel", nil)
+		}, 404, []string{"X-Request-Id"}},
+		"job cancel unavailable": {"/api/v1/judge-jobs/{jobId}/cancel", http.MethodPost, func(t *testing.T) (*Server, *http.Request) {
+			server := newJobServer(t, staticAuthenticator{principal: Principal{TenantID: "tenant-7", scopes: allScopes}}, &jobServiceStub{err: ErrJobUnavailable}, nil)
+			return server, httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs/ceirceirceirceirceirceirce/cancel", nil)
+		}, 503, []string{"X-Request-Id", "Retry-After"}},
+		"job cancel internal": {"/api/v1/judge-jobs/{jobId}/cancel", http.MethodPost, func(t *testing.T) (*Server, *http.Request) {
+			server := newJobServer(t, staticAuthenticator{principal: Principal{TenantID: "tenant-7", scopes: allScopes}}, &jobServiceStub{err: fmt.Errorf("database detail")}, nil)
+			return server, httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs/ceirceirceirceirceirceirce/cancel", nil)
+		}, 500, []string{"X-Request-Id"}},
 	}
 
 	for name, test := range cases {
@@ -246,15 +367,34 @@ func TestOpenAPIContractCoversLiveHandlerResponses(t *testing.T) {
 				t.Fatalf("live response %d is not documented", response.Code)
 			}
 			for _, header := range test.headers {
-				if response.Header().Get(header) == "" {
+				value := response.Header().Get(header)
+				if value == "" {
 					t.Errorf("live response misses required %s", header)
 				}
-				if documented.Value.Headers[header] == nil {
+				headerRef := documented.Value.Headers[header]
+				if headerRef == nil {
 					t.Errorf("OpenAPI response misses live header %s", header)
+				} else if value != "" {
+					validateLiveHeader(t, header, value, headerRef)
 				}
 			}
-			if contentType := strings.Split(response.Header().Get("Content-Type"), ";")[0]; contentType != "" && documented.Value.Content[contentType] == nil {
-				t.Errorf("OpenAPI response misses live content type %s", contentType)
+			contentType := strings.Split(response.Header().Get("Content-Type"), ";")[0]
+			media := documented.Value.Content[contentType]
+			if contentType != "" && media == nil {
+				t.Fatalf("OpenAPI response misses live content type %s", contentType)
+			}
+			if response.Body.Len() > 0 {
+				if media == nil || media.Schema == nil || media.Schema.Value == nil {
+					t.Fatalf("OpenAPI response misses schema for live content type %s", contentType)
+				}
+				var body any
+				if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+					t.Fatalf("decode live response body: %v", err)
+				}
+				if err := media.Schema.Value.VisitJSON(body); err != nil {
+					t.Errorf("live response body violates OpenAPI schema: %v; body=%s", err, response.Body.String())
+				}
+				assertSafePublicExample(t, "live response body", body)
 			}
 			if response.Code >= 400 {
 				var actual Problem
@@ -347,6 +487,22 @@ func TestOpenAPIContractPinsSecurityHeadersAndAsynchronousSemantics(t *testing.T
 	if jobLocation == nil || jobLocation.Value == nil || !strings.HasPrefix(fmt.Sprint(jobLocation.Value.Example), "/api/v1/judge-jobs/") {
 		t.Fatalf("job Location example = %#v", jobLocation)
 	}
+	for name, test := range map[string]struct {
+		header  *openapi3.HeaderRef
+		pattern string
+	}{
+		"bundle": {bundleLocation, `^/api/v1/bundles/[a-z2-7]{26}$`},
+		"job":    {jobLocation, `^/api/v1/judge-jobs/[a-z2-7]{26}$`},
+	} {
+		if test.header.Value.Schema == nil || test.header.Value.Schema.Value == nil || test.header.Value.Schema.Value.Pattern != test.pattern {
+			t.Errorf("%s Location pattern = %#v, want %q", name, test.header.Value.Schema, test.pattern)
+		}
+	}
+	maxSource := document.Components.Schemas["CapabilityLimits"].Value.Properties["maxSourceBytes"].Value.Max
+	const maximumSupportedSourceBytes = int64(1537228672809118378)
+	if maxSource == nil || *maxSource != float64(maximumSupportedSourceBytes) {
+		t.Errorf("CapabilityLimits.maxSourceBytes maximum = %v, want %d", maxSource, maximumSupportedSourceBytes)
+	}
 	if !strings.Contains(document.Info.Description, "v1\\n<event-id-byte-length>\\n<event-id>\\n<timestamp>\\n<raw-body>") ||
 		!strings.Contains(document.Info.Description, "X-CodeRushOJ-Event-Id") ||
 		!strings.Contains(document.Info.Description, "at-least-once") ||
@@ -361,28 +517,94 @@ func TestOpenAPIContractPinsSecurityHeadersAndAsynchronousSemantics(t *testing.T
 
 func TestOpenAPIPublicSchemasAreClosedAndDoNotExposeSensitiveFields(t *testing.T) {
 	document := loadOpenAPIContract(t)
+	audit := func(location string, reference *openapi3.SchemaRef, sensitive bool) {
+		t.Helper()
+		for _, finding := range schemaAuditFindings(location, reference, sensitive, map[*openapi3.Schema]bool{}) {
+			t.Error(finding)
+		}
+	}
 	for name, reference := range document.Components.Schemas {
-		assertClosedObjects(t, "components.schemas."+name, reference, map[*openapi3.Schema]bool{})
+		audit("components.schemas."+name, reference, false)
+	}
+	for name, reference := range document.Components.Parameters {
+		if reference != nil && reference.Value != nil {
+			audit("components.parameters."+name, reference.Value.Schema, false)
+		}
+	}
+	for name, reference := range document.Components.Headers {
+		if reference != nil && reference.Value != nil {
+			audit("components.headers."+name, reference.Value.Schema, true)
+		}
 	}
 
 	for _, path := range document.Paths.Keys() {
-		for method, operation := range document.Paths.Value(path).Operations() {
-			for status, responseRef := range operation.Responses.Map() {
-				if responseRef.Value == nil {
-					continue
+		pathItem := document.Paths.Value(path)
+		for index, parameterRef := range pathItem.Parameters {
+			if parameterRef != nil && parameterRef.Value != nil {
+				audit(fmt.Sprintf("path %s parameters[%d]", path, index), parameterRef.Value.Schema, false)
+			}
+		}
+		for method, operation := range pathItem.Operations() {
+			prefix := method + " " + path
+			for index, parameterRef := range operation.Parameters {
+				if parameterRef != nil && parameterRef.Value != nil {
+					audit(fmt.Sprintf("%s parameters[%d]", prefix, index), parameterRef.Value.Schema, false)
 				}
-				for contentType, media := range responseRef.Value.Content {
-					if media.Schema != nil {
-						assertNoSensitiveProperties(t, method+" "+path+" "+status+" "+contentType, media.Schema, map[*openapi3.Schema]bool{})
-					}
-					assertSafePublicExample(t, method+" "+path+" "+status+" "+contentType+".example", media.Example)
+			}
+			if operation.RequestBody != nil && operation.RequestBody.Value != nil {
+				for contentType, media := range operation.RequestBody.Value.Content {
+					allowSource := method == http.MethodPost && path == "/api/v1/judge-jobs"
+					audit(prefix+" request "+contentType, media.Schema, !allowSource)
+					auditPublicValue(t, prefix+" request "+contentType+".example", media.Example, !allowSource)
 					for name, exampleRef := range media.Examples {
 						if exampleRef != nil && exampleRef.Value != nil {
-							assertSafePublicExample(t, method+" "+path+" "+status+" "+contentType+".examples."+name, exampleRef.Value.Value)
+							auditPublicValue(t, prefix+" request "+contentType+".examples."+name, exampleRef.Value.Value, !allowSource)
 						}
 					}
 				}
 			}
+			for status, responseRef := range operation.Responses.Map() {
+				if responseRef.Value == nil {
+					continue
+				}
+				for name, headerRef := range responseRef.Value.Headers {
+					if headerRef != nil && headerRef.Value != nil {
+						audit(prefix+" "+status+" header "+name, headerRef.Value.Schema, true)
+						auditPublicValue(t, prefix+" "+status+" header "+name+".example", headerRef.Value.Example, true)
+						for exampleName, exampleRef := range headerRef.Value.Examples {
+							if exampleRef != nil && exampleRef.Value != nil {
+								auditPublicValue(t, prefix+" "+status+" header "+name+".examples."+exampleName, exampleRef.Value.Value, true)
+							}
+						}
+					}
+				}
+				for contentType, media := range responseRef.Value.Content {
+					location := prefix + " " + status + " " + contentType
+					audit(location, media.Schema, true)
+					auditPublicValue(t, location+".example", media.Example, true)
+					for name, exampleRef := range media.Examples {
+						if exampleRef != nil && exampleRef.Value != nil {
+							auditPublicValue(t, location+".examples."+name, exampleRef.Value.Value, true)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestSchemaAuditTraversesOpenAPI31CompositionAndImplicitObjects(t *testing.T) {
+	root := &openapi3.Schema{
+		Properties: openapi3.Schemas{"plain": {Value: &openapi3.Schema{Type: &openapi3.Types{"string"}}}},
+		AllOf:      openapi3.SchemaRefs{{Value: &openapi3.Schema{Properties: openapi3.Schemas{"storageKey": {Value: &openapi3.Schema{Type: &openapi3.Types{"string"}}}}}}},
+		AnyOf:      openapi3.SchemaRefs{{Value: &openapi3.Schema{Example: map[string]any{"secret": "credential-value"}}}},
+		OneOf:      openapi3.SchemaRefs{{Value: &openapi3.Schema{Default: map[string]any{"leaseToken": "worker-claim"}}}},
+		Not:        &openapi3.SchemaRef{Value: &openapi3.Schema{Enum: []any{map[string]any{"objectKey": "private/tests.zip"}}}},
+	}
+	findings := strings.Join(schemaAuditFindings("root", &openapi3.SchemaRef{Value: root}, true, map[*openapi3.Schema]bool{}), "\n")
+	for _, want := range []string{"root object schema", "allOf", "storageKey", "anyOf", "secret", "oneOf", "leaseToken", "not", "objectKey"} {
+		if !strings.Contains(findings, want) {
+			t.Errorf("audit findings do not prove traversal of %q:\n%s", want, findings)
 		}
 	}
 }
@@ -559,6 +781,31 @@ func operation(t *testing.T, document *openapi3.T, path, method string) *openapi
 	return pathItem.GetOperation(method)
 }
 
+func validateLiveHeader(t *testing.T, name, raw string, reference *openapi3.HeaderRef) {
+	t.Helper()
+	if reference.Value == nil || reference.Value.Schema == nil || reference.Value.Schema.Value == nil {
+		t.Fatalf("OpenAPI header %s has no schema", name)
+	}
+	schema := reference.Value.Schema.Value
+	var value any = raw
+	if schema.Type != nil && schema.Type.Includes("integer") {
+		parsed, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			t.Fatalf("live header %s=%q is not an integer: %v", name, raw, err)
+		}
+		value = parsed
+	} else if schema.Type != nil && schema.Type.Includes("boolean") {
+		parsed, err := strconv.ParseBool(raw)
+		if err != nil {
+			t.Fatalf("live header %s=%q is not a boolean: %v", name, raw, err)
+		}
+		value = parsed
+	}
+	if err := schema.VisitJSON(value); err != nil {
+		t.Errorf("live header %s=%q violates OpenAPI schema: %v", name, raw, err)
+	}
+}
+
 func requestExample(t *testing.T, document *openapi3.T, path, method string) any {
 	t.Helper()
 	requestBody := operation(t, document, path, method).RequestBody
@@ -632,45 +879,61 @@ func slicesContains(values []string, want string) bool {
 	return false
 }
 
-func assertClosedObjects(t *testing.T, location string, reference *openapi3.SchemaRef, visited map[*openapi3.Schema]bool) {
-	t.Helper()
+func schemaAuditFindings(location string, reference *openapi3.SchemaRef, sensitive bool, visited map[*openapi3.Schema]bool) []string {
 	if reference == nil || reference.Value == nil || visited[reference.Value] {
-		return
+		return nil
 	}
 	schema := reference.Value
 	visited[schema] = true
-	if schema.Type != nil && schema.Type.Includes("object") && (schema.AdditionalProperties.Has == nil || *schema.AdditionalProperties.Has) {
-		t.Errorf("%s object schema must set additionalProperties: false", location)
+	var findings []string
+	isObject := len(schema.Properties) > 0 || len(schema.PatternProperties) > 0 || (schema.Type != nil && schema.Type.Includes("object"))
+	if isObject && (schema.AdditionalProperties.Has == nil || *schema.AdditionalProperties.Has) {
+		findings = append(findings, location+" object schema must set additionalProperties: false")
 	}
-	for name, property := range schema.Properties {
-		assertClosedObjects(t, location+"."+name, property, visited)
-	}
-	assertClosedObjects(t, location+"[]", schema.Items, visited)
-	for index, child := range schema.OneOf {
-		assertClosedObjects(t, fmt.Sprintf("%s.oneOf[%d]", location, index), child, visited)
-	}
-}
-
-func assertNoSensitiveProperties(t *testing.T, location string, reference *openapi3.SchemaRef, visited map[*openapi3.Schema]bool) {
-	t.Helper()
-	if reference == nil || reference.Value == nil || visited[reference.Value] {
-		return
-	}
-	schema := reference.Value
-	visited[schema] = true
-	for name, property := range schema.Properties {
-		if identifierExposesSensitiveData(name) {
-			t.Errorf("%s response schema exposes forbidden property %q", location, name)
+	if sensitive {
+		findings = append(findings, publicValueFindings(location+".example", schema.Example)...)
+		findings = append(findings, publicValueFindings(location+".default", schema.Default)...)
+		findings = append(findings, publicValueFindings(location+".const", schema.Const)...)
+		for index, value := range schema.Examples {
+			findings = append(findings, publicValueFindings(fmt.Sprintf("%s.examples[%d]", location, index), value)...)
 		}
-		assertNoSensitiveProperties(t, location+"."+name, property, visited)
+		for index, value := range schema.Enum {
+			findings = append(findings, publicValueFindings(fmt.Sprintf("%s.enum[%d]", location, index), value)...)
+		}
 	}
-	for index, example := range schema.Examples {
-		assertSafePublicExample(t, fmt.Sprintf("%s.examples[%d]", location, index), example)
+	for name, property := range schema.Properties {
+		childLocation := location + ".properties." + name
+		if sensitive && identifierExposesSensitiveData(name) {
+			findings = append(findings, fmt.Sprintf("%s exposes forbidden property %q", childLocation, name))
+		}
+		findings = append(findings, schemaAuditFindings(childLocation, property, sensitive, visited)...)
 	}
-	assertNoSensitiveProperties(t, location+"[]", schema.Items, visited)
-	for _, child := range schema.OneOf {
-		assertNoSensitiveProperties(t, location, child, visited)
+	for name, property := range schema.PatternProperties {
+		findings = append(findings, schemaAuditFindings(location+".patternProperties."+name, property, sensitive, visited)...)
 	}
+	for name, property := range schema.DependentSchemas {
+		findings = append(findings, schemaAuditFindings(location+".dependentSchemas."+name, property, sensitive, visited)...)
+	}
+	for name, property := range schema.Defs {
+		findings = append(findings, schemaAuditFindings(location+".$defs."+name, property, sensitive, visited)...)
+	}
+	findings = append(findings, schemaAuditFindings(location+".items", schema.Items, sensitive, visited)...)
+	findings = append(findings, schemaAuditFindings(location+".contains", schema.Contains, sensitive, visited)...)
+	findings = append(findings, schemaAuditFindings(location+".propertyNames", schema.PropertyNames, sensitive, visited)...)
+	findings = append(findings, schemaAuditFindings(location+".additionalProperties", schema.AdditionalProperties.Schema, sensitive, visited)...)
+	findings = append(findings, schemaAuditFindings(location+".contentSchema", schema.ContentSchema, sensitive, visited)...)
+	for index, child := range schema.PrefixItems {
+		findings = append(findings, schemaAuditFindings(fmt.Sprintf("%s.prefixItems[%d]", location, index), child, sensitive, visited)...)
+	}
+	for keyword, children := range map[string]openapi3.SchemaRefs{"allOf": schema.AllOf, "anyOf": schema.AnyOf, "oneOf": schema.OneOf} {
+		for index, child := range children {
+			findings = append(findings, schemaAuditFindings(fmt.Sprintf("%s.%s[%d]", location, keyword, index), child, sensitive, visited)...)
+		}
+	}
+	for keyword, child := range map[string]*openapi3.SchemaRef{"not": schema.Not, "if": schema.If, "then": schema.Then, "else": schema.Else} {
+		findings = append(findings, schemaAuditFindings(location+"."+keyword, child, sensitive, visited)...)
+	}
+	return findings
 }
 
 var (
@@ -707,23 +970,38 @@ func identifierExposesSensitiveData(identifier string) bool {
 
 func assertSafePublicExample(t *testing.T, location string, value any) {
 	t.Helper()
+	for _, finding := range publicValueFindings(location, value) {
+		t.Error(finding)
+	}
+}
+
+func auditPublicValue(t *testing.T, location string, value any, sensitive bool) {
+	t.Helper()
+	if sensitive {
+		assertSafePublicExample(t, location, value)
+	}
+}
+
+func publicValueFindings(location string, value any) []string {
+	var findings []string
 	switch typed := value.(type) {
 	case map[string]any:
 		for key, child := range typed {
 			if identifierExposesSensitiveData(key) {
-				t.Errorf("%s exposes forbidden example field %q", location, key)
+				findings = append(findings, fmt.Sprintf("%s exposes forbidden example field %q", location, key))
 			}
-			assertSafePublicExample(t, location+"."+key, child)
+			findings = append(findings, publicValueFindings(location+"."+key, child)...)
 		}
 	case []any:
 		for index, child := range typed {
-			assertSafePublicExample(t, fmt.Sprintf("%s[%d]", location, index), child)
+			findings = append(findings, publicValueFindings(fmt.Sprintf("%s[%d]", location, index), child)...)
 		}
 	case string:
 		if marker := sensitiveExampleValueMarker(typed); marker != "" {
-			t.Errorf("%s contains forbidden example value marker %q", location, marker)
+			findings = append(findings, fmt.Sprintf("%s contains forbidden example value marker %q", location, marker))
 		}
 	}
+	return findings
 }
 
 func sensitiveExampleValueMarker(value string) string {

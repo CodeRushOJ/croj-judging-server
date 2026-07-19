@@ -475,11 +475,13 @@ components:
       description: Relative metadata URL for the returned bundle.
       schema:
         type: string
+        pattern: '^/api/v1/bundles/[a-z2-7]{26}$'
       example: /api/v1/bundles/aaaaaaaaaaaaaaaaaaaaaaaaaa
     JobLocation:
       description: Relative status URL for the returned judge job.
       schema:
         type: string
+        pattern: '^/api/v1/judge-jobs/[a-z2-7]{26}$'
       example: /api/v1/judge-jobs/ceirceirceirceirceirceirce
     IdempotentReplay:
       description: Present with value `true` only when job submission replayed an existing request.
@@ -883,6 +885,7 @@ components:
           type: integer
           format: int64
           minimum: 1
+          maximum: 1537228672809118378
         maxBundleBytes:
           type: integer
           format: int64
