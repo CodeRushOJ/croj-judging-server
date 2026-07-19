@@ -342,13 +342,14 @@ func (x *ExecuteBatchV1Request) GetCases() []*ExecuteBatchV1Case {
 }
 
 type ExecuteBatchV1Case struct {
-	state          protoimpl.MessageState `protogen:"open.v1"`
-	CaseId         string                 `protobuf:"bytes,1,opt,name=case_id,json=caseId,proto3" json:"case_id,omitempty"`
-	Stdin          string                 `protobuf:"bytes,2,opt,name=stdin,proto3" json:"stdin,omitempty"`
-	ExpectedOutput string                 `protobuf:"bytes,3,opt,name=expected_output,json=expectedOutput,proto3" json:"expected_output,omitempty"`
-	CompareOutput  bool                   `protobuf:"varint,4,opt,name=compare_output,json=compareOutput,proto3" json:"compare_output,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	state               protoimpl.MessageState `protogen:"open.v1"`
+	CaseId              string                 `protobuf:"bytes,1,opt,name=case_id,json=caseId,proto3" json:"case_id,omitempty"`
+	Stdin               string                 `protobuf:"bytes,2,opt,name=stdin,proto3" json:"stdin,omitempty"`
+	ExpectedOutput      string                 `protobuf:"bytes,3,opt,name=expected_output,json=expectedOutput,proto3" json:"expected_output,omitempty"`
+	CompareOutput       bool                   `protobuf:"varint,4,opt,name=compare_output,json=compareOutput,proto3" json:"compare_output,omitempty"`
+	TokenExpectedSha256 string                 `protobuf:"bytes,5,opt,name=token_expected_sha256,json=tokenExpectedSha256,proto3" json:"token_expected_sha256,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *ExecuteBatchV1Case) Reset() {
@@ -407,6 +408,13 @@ func (x *ExecuteBatchV1Case) GetCompareOutput() bool {
 		return x.CompareOutput
 	}
 	return false
+}
+
+func (x *ExecuteBatchV1Case) GetTokenExpectedSha256() string {
+	if x != nil {
+		return x.TokenExpectedSha256
+	}
+	return ""
 }
 
 type ExecuteBatchV1Event struct {
@@ -499,12 +507,13 @@ const file_proto_sandbox_proto_rawDesc = "" +
 	"\atimeout\x18\x03 \x01(\x05R\atimeout\x12!\n" +
 	"\fmemory_limit\x18\x04 \x01(\x05R\vmemoryLimit\x12&\n" +
 	"\x0fstop_on_failure\x18\x05 \x01(\bR\rstopOnFailure\x121\n" +
-	"\x05cases\x18\x06 \x03(\v2\x1b.sandbox.ExecuteBatchV1CaseR\x05cases\"\x93\x01\n" +
+	"\x05cases\x18\x06 \x03(\v2\x1b.sandbox.ExecuteBatchV1CaseR\x05cases\"\xc7\x01\n" +
 	"\x12ExecuteBatchV1Case\x12\x17\n" +
 	"\acase_id\x18\x01 \x01(\tR\x06caseId\x12\x14\n" +
 	"\x05stdin\x18\x02 \x01(\tR\x05stdin\x12'\n" +
 	"\x0fexpected_output\x18\x03 \x01(\tR\x0eexpectedOutput\x12%\n" +
-	"\x0ecompare_output\x18\x04 \x01(\bR\rcompareOutput\"\xe8\x01\n" +
+	"\x0ecompare_output\x18\x04 \x01(\bR\rcompareOutput\x122\n" +
+	"\x15token_expected_sha256\x18\x05 \x01(\tR\x13tokenExpectedSha256\"\xe8\x01\n" +
 	"\x13ExecuteBatchV1Event\x125\n" +
 	"\x04kind\x18\x01 \x01(\x0e2!.sandbox.ExecuteBatchV1Event.KindR\x04kind\x12\x17\n" +
 	"\acase_id\x18\x02 \x01(\tR\x06caseId\x120\n" +

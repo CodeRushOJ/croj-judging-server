@@ -2,6 +2,9 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"strings"
 
@@ -66,14 +69,18 @@ func (pipeline *BatchBundlePipeline) ExecuteArtifact(
 		}
 		expectedOutputs = append(expectedOutputs, expected)
 		expectedForSandbox := ""
+		expectedTokenSHA256 := ""
 		if manifest.Checker == bundle.CheckerExact {
 			expectedForSandbox = expected
+		} else {
+			expectedTokenSHA256 = tokenOutputSHA256(expected)
 		}
 		request.Cases = append(request.Cases, &sandboxpb.ExecuteBatchV1Case{
-			CaseId:         testCase.ID,
-			Stdin:          input,
-			ExpectedOutput: expectedForSandbox,
-			CompareOutput:  manifest.Checker == bundle.CheckerExact,
+			CaseId:              testCase.ID,
+			Stdin:               input,
+			ExpectedOutput:      expectedForSandbox,
+			CompareOutput:       manifest.Checker == bundle.CheckerExact,
+			TokenExpectedSha256: expectedTokenSHA256,
 		})
 	}
 	if proto.Size(request) > maxSandboxBatchRequestBytesV1 {
@@ -94,7 +101,6 @@ func (pipeline *BatchBundlePipeline) executeBatch(
 	request *sandboxpb.ExecuteBatchV1Request,
 ) ([]*sandboxpb.ExecuteBatchV1Event, bool, error) {
 	var lastRetryable error
-	receivedInvalid := false
 	for attempt := 0; attempt < pipeline.maxInfraAttempts; attempt++ {
 		address, err := pipeline.selector.SelectSandbox()
 		if err != nil {
@@ -110,15 +116,25 @@ func (pipeline *BatchBundlePipeline) executeBatch(
 			return nil, false, fmt.Errorf("execute sandbox batch: %w", err)
 		}
 		if err := validateBatchEvents(request, events); err != nil {
-			receivedInvalid = true
-			continue
+			return nil, true, nil
 		}
 		return events, false, nil
 	}
-	if lastRetryable != nil && !receivedInvalid {
+	if lastRetryable != nil {
 		return nil, false, fmt.Errorf("execute sandbox batch after %d endpoint attempts: %w", pipeline.maxInfraAttempts, lastRetryable)
 	}
 	return nil, true, nil
+}
+
+func tokenOutputSHA256(output string) string {
+	hasher := sha256.New()
+	var length [8]byte
+	for _, token := range strings.Fields(output) {
+		binary.BigEndian.PutUint64(length[:], uint64(len(token)))
+		_, _ = hasher.Write(length[:])
+		_, _ = hasher.Write([]byte(token))
+	}
+	return hex.EncodeToString(hasher.Sum(nil))
 }
 
 func validateBatchEvents(request *sandboxpb.ExecuteBatchV1Request, events []*sandboxpb.ExecuteBatchV1Event) error {

@@ -53,9 +53,9 @@ flowchart LR
 }
 ```
 
-仅支持 `ACM` 的 `exact` 与 `token`。SPJ/OI 会明确返回 `SYSTEM_ERROR`，由 Issue #12 跟进。`exact` 与 sandbox 保持相同规则：CRLF/CR 统一为 LF，每行 `TrimSpace` 后再移除整体首尾空白；`token` 在 judging 侧按 Unicode whitespace 分词比较。一个提交把有序 case 作为单个 `ExecuteBatchV1` 请求发送到同一 sandbox，在一个私有执行生命周期中只编译一次；每个 case 仍启动独立受限进程。首个选手错误早停，最终时间/内存取所有已完成 case 的最大值。
+仅支持 `ACM` 的 `exact` 与 `token`。SPJ/OI 会明确返回 `SYSTEM_ERROR`，由 Issue #12 跟进。`exact` 与 sandbox 保持相同规则：CRLF/CR 统一为 LF，每行 `TrimSpace` 后再移除整体首尾空白；`token` 在 judging 侧按 Unicode whitespace 分词比较。token expected 会被规范化为长度前缀 token 序列的 SHA-256 后再发给 sandbox，原始隐藏答案留在 judging 侧，同时 sandbox 可在首个 token WA 时早停；judging 收到结果后仍用原文复核。一个提交把有序 case 作为单个 `ExecuteBatchV1` 请求发送到同一 sandbox，在一个私有执行生命周期中只编译一次；每个 case 仍启动独立受限进程。首个选手错误早停，最终时间/内存取所有已完成 case 的最大值。
 
-批量流严格校验 case ID/顺序、已知状态、编译事件和最终完成事件。v1 每批最多 256 个 case，protobuf 请求最多 64 MiB；超限会在 RPC 前确定性返回 `SYSTEM_ERROR`，不会把不可能成功的载荷投入消息重试。`Unavailable`/`ResourceExhausted` 会丢弃不完整流并在另一个 Ready Endpoint 上有界重试完整 batch；选手终态不重试。sandbox PR 必须先于 judging-server 部署，回滚顺序相反。旧 unary `Execute` 客户端仍保留用于兼容，但隐藏测试主链路不再调用它。
+批量流严格校验 case ID/顺序、已知状态、编译事件和最终完成事件。v1 每批最多 256 个 case，protobuf 请求最多 64 MiB；超限会在 RPC 前确定性返回 `SYSTEM_ERROR`，不会把不可能成功的载荷投入消息重试。只有 `Unavailable`/`ResourceExhausted` 会丢弃不完整流并在另一个 Ready Endpoint 上有界重试完整 batch；正常结束但畸形的事件流直接确定性 `SYSTEM_ERROR`，不重新编译。选手终态不重试。sandbox PR 必须先于 judging-server 部署，回滚顺序相反。旧 unary `Execute` 客户端仍保留用于兼容，但隐藏测试主链路不再调用它。
 
 `SANDBOX_EXECUTE_TIMEOUT` 是单 case/编译与传输的基础预算；batch deadline 在此基础上按额外 case 的题目时间限制线性扩展，同时仍受上游 context 取消约束，避免把旧 unary 的 60 秒总 deadline 错用于整批评测。
 

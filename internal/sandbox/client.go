@@ -120,6 +120,7 @@ func (c *Client) ExecuteBatch(
 		rpcContext,
 		request,
 		grpc.MaxCallSendMsgSize(maxBatchMessageBytesV1),
+		grpc.MaxCallRecvMsgSize(maxBatchMessageBytesV1),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("start batch on sandbox %s: %w", address, err)
