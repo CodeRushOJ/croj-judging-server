@@ -93,6 +93,34 @@ func TestClientBatchDeadlineScalesWithCaseCount(t *testing.T) {
 	}
 }
 
+func TestBatchStreamGuardRejectsMaxPlusOneEvent(t *testing.T) {
+	guard := batchStreamGuard{maxEvents: 1, maxBytes: 1024}
+	if err := guard.observe(&sandboxpb.ExecuteBatchV1Event{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT}); err != nil {
+		t.Fatal(err)
+	}
+	if err := guard.observe(&sandboxpb.ExecuteBatchV1Event{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT}); !errors.Is(err, ErrInvalidBatchStream) {
+		t.Fatalf("second event error = %v, want ErrInvalidBatchStream", err)
+	}
+}
+
+func TestBatchStreamGuardRejectsCumulativeProtoBytes(t *testing.T) {
+	event := &sandboxpb.ExecuteBatchV1Event{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT, Result: &sandboxpb.ExecuteResponse{Stdout: "payload"}}
+	guard := batchStreamGuard{maxEvents: 2, maxBytes: 1}
+	if err := guard.observe(event); !errors.Is(err, ErrInvalidBatchStream) {
+		t.Fatalf("oversize event error = %v, want ErrInvalidBatchStream", err)
+	}
+}
+
+func TestBatchStreamGuardRejectsEOFWithoutTerminalEvent(t *testing.T) {
+	guard := batchStreamGuard{maxEvents: 2, maxBytes: 1024}
+	if err := guard.observe(&sandboxpb.ExecuteBatchV1Event{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT}); err != nil {
+		t.Fatal(err)
+	}
+	if err := guard.finish(); !errors.Is(err, ErrInvalidBatchStream) {
+		t.Fatalf("unterminated stream error = %v, want ErrInvalidBatchStream", err)
+	}
+}
+
 func TestClientExecutesOverGRPCAndReusesConnection(t *testing.T) {
 	var dials atomic.Int32
 	client, stop := newBufconnClient(t, 500*time.Millisecond, &dials, func(_ context.Context, request *sandboxpb.ExecuteRequest) (*sandboxpb.ExecuteResponse, error) {
