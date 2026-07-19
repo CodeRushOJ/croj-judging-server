@@ -2,6 +2,7 @@ package external
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -77,5 +78,25 @@ func TestSourceObjectKeyContainsNoCallerControlledPath(t *testing.T) {
 	}
 	if _, err := SourceObjectKey("../tenant", "bbbbbbbbbbbbbbbbbbbbbbbbbb"); err == nil {
 		t.Fatal("path-like tenant ID accepted")
+	}
+}
+
+func TestWorkerClaimFormattingRedactsSourceMetadataAndLeaseToken(t *testing.T) {
+	claim := WorkerJobClaim{
+		Job: ExternalJobRecord{
+			ExternalID: "aaaaaaaaaaaaaaaaaaaaaaaaaa",
+			Source: SourceObjectMetadata{
+				ObjectKey: "external/private/source.bin", SHA256: []byte("private-digest"),
+				Nonce: []byte("private-nonce"),
+			},
+		},
+		WorkerID: "worker-a", AttemptNo: 2, LeaseToken: []byte("private-lease-token-32-bytes!!!!!"),
+	}
+	for _, formatted := range []string{fmt.Sprint(claim), fmt.Sprintf("%+v", claim), fmt.Sprintf("%#v", claim)} {
+		for _, secret := range []string{"external/private", "private-digest", "private-nonce", "private-lease"} {
+			if strings.Contains(formatted, secret) {
+				t.Fatalf("formatted claim leaked %q: %s", secret, formatted)
+			}
+		}
 	}
 }

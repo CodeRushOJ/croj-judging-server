@@ -100,11 +100,19 @@ func (repository *MySQLJobRepository) claimOne(
 
 	var candidateTenantID uint64
 	err = tx.QueryRowContext(ctx, `
-SELECT tenant_id
-FROM t_external_job FORCE INDEX (idx_external_job_claim)
-WHERE (status = 'QUEUED' AND next_attempt_at <= ?)
-   OR (status = 'RUNNING' AND lease_until <= ?)
-ORDER BY (status = 'RUNNING') DESC, next_attempt_at, created_at, id
+SELECT job.tenant_id
+FROM t_external_job AS job FORCE INDEX (idx_external_job_claim)
+JOIN t_external_tenant AS tenant ON tenant.id = job.tenant_id
+WHERE (job.status = 'RUNNING' AND job.lease_until <= ?)
+   OR (
+       job.status = 'QUEUED' AND job.next_attempt_at <= ? AND tenant.status = 'ACTIVE'
+       AND JSON_TYPE(JSON_EXTRACT(tenant.policy_json, '$.maxRunningJobs')) = 'INTEGER'
+       AND CAST(JSON_UNQUOTE(JSON_EXTRACT(tenant.policy_json, '$.maxRunningJobs')) AS UNSIGNED) > (
+           SELECT COUNT(*) FROM t_external_job AS running_job
+           WHERE running_job.tenant_id = job.tenant_id AND running_job.status = 'RUNNING'
+       )
+   )
+ORDER BY (job.status = 'RUNNING') DESC, job.next_attempt_at, job.created_at, job.id
 LIMIT 1`, now, now).Scan(&candidateTenantID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return WorkerJobClaim{}, false, ErrJobNotClaimable
