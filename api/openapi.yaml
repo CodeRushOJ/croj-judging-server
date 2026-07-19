@@ -116,7 +116,7 @@ paths:
             X-Request-Id:
               $ref: '#/components/headers/XRequestId'
             Location:
-              $ref: '#/components/headers/Location'
+              $ref: '#/components/headers/BundleLocation'
           content:
             application/json:
               schema:
@@ -134,7 +134,7 @@ paths:
             X-Request-Id:
               $ref: '#/components/headers/XRequestId'
             Location:
-              $ref: '#/components/headers/Location'
+              $ref: '#/components/headers/BundleLocation'
           content:
             application/json:
               schema:
@@ -240,7 +240,7 @@ paths:
             X-Request-Id:
               $ref: '#/components/headers/XRequestId'
             Location:
-              $ref: '#/components/headers/Location'
+              $ref: '#/components/headers/JobLocation'
             Idempotent-Replay:
               $ref: '#/components/headers/IdempotentReplay'
           content:
@@ -254,7 +254,7 @@ paths:
                 createdAt: '2026-07-19T08:00:00Z'
                 clientReference: submission-42
         '400':
-          $ref: '#/components/responses/BadRequest'
+          $ref: '#/components/responses/InvalidJobSubmit'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -471,8 +471,13 @@ components:
         type: string
         pattern: '^([0-9a-f]{32}|unavailable)$'
       example: unavailable
-    Location:
-      description: Relative status or metadata URL for the returned resource.
+    BundleLocation:
+      description: Relative metadata URL for the returned bundle.
+      schema:
+        type: string
+      example: /api/v1/bundles/aaaaaaaaaaaaaaaaaaaaaaaaaa
+    JobLocation:
+      description: Relative status URL for the returned judge job.
       schema:
         type: string
       example: /api/v1/judge-jobs/ceirceirceirceirceirceirce
@@ -493,8 +498,8 @@ components:
         type: string
       example: 'Bearer realm="coderushoj-judge"'
   responses:
-    BadRequest:
-      description: Malformed header, query, multipart body, or JSON request.
+    InvalidJobSubmit:
+      description: Invalid Idempotency-Key header or malformed strict JSON body.
       headers:
         X-Request-Id:
           $ref: '#/components/headers/XRequestId'
@@ -502,12 +507,28 @@ components:
         application/problem+json:
           schema:
             $ref: '#/components/schemas/Problem'
-          example:
-            type: https://coderushoj.dev/problems/invalid-json
-            title: Invalid request body
-            status: 400
-            detail: Provide one request containing only documented fields.
-            requestId: unavailable
+          examples:
+            missingOrRepeatedIdempotencyKey:
+              value:
+                type: https://coderushoj.dev/problems/invalid-idempotency-key
+                title: Invalid Idempotency-Key
+                status: 400
+                detail: Provide exactly one Idempotency-Key header.
+                requestId: unavailable
+            invalidIdempotencyKey:
+              value:
+                type: https://coderushoj.dev/problems/invalid-idempotency-key
+                title: Invalid Idempotency-Key
+                status: 400
+                detail: Provide 16 to 128 visible ASCII characters.
+                requestId: unavailable
+            invalidJSON:
+              value:
+                type: https://coderushoj.dev/problems/invalid-json
+                title: Invalid request body
+                status: 400
+                detail: Provide one JSON object containing only documented fields.
+                requestId: unavailable
     InvalidBundle:
       description: Invalid idempotency key, multipart envelope, or immutable bundle ZIP.
       headers:
@@ -849,8 +870,10 @@ components:
           pattern: '^[a-z][a-z0-9._-]{1,31}$'
         displayName:
           type: string
+          minLength: 1
         runtime:
           type: string
+          minLength: 1
     CapabilityLimits:
       type: object
       additionalProperties: false
