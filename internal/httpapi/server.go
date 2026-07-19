@@ -10,6 +10,8 @@ import (
 	"math"
 	"net/http"
 	"strings"
+
+	"github.com/CodeRushOJ/croj-judging-server/internal/external"
 )
 
 type RequestAuthenticator interface {
@@ -20,6 +22,22 @@ type Server struct {
 	authenticator RequestAuthenticator
 	capabilities  Capabilities
 	jobs          JobService
+	jobWriteQuota external.Quota
+	jobWriteLimit external.QuotaLimit
+}
+
+func WithJobWriteQuota(quota external.Quota, jobSubmitLimit external.QuotaLimit) ServerOption {
+	return func(server *Server) error {
+		if quota == nil {
+			return fmt.Errorf("write quota is required")
+		}
+		if err := jobSubmitLimit.Validate(); err != nil {
+			return err
+		}
+		server.jobWriteQuota = quota
+		server.jobWriteLimit = jobSubmitLimit
+		return nil
+	}
 }
 
 type ServerOption func(*Server) error
@@ -50,6 +68,9 @@ func NewServer(authenticator RequestAuthenticator, capabilities Capabilities, op
 		if err := option(server); err != nil {
 			return nil, err
 		}
+	}
+	if server.jobs != nil && server.jobWriteQuota == nil {
+		return nil, fmt.Errorf("write quota is required when the job service is enabled")
 	}
 	return server, nil
 }
