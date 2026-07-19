@@ -27,10 +27,11 @@ func DefaultArchiveLimits() ArchiveLimits {
 }
 
 type Artifact struct {
-	archive  *zip.ReadCloser
-	manifest Manifest
-	files    map[string]*zip.File
-	limits   ArchiveLimits
+	archive      *zip.ReadCloser
+	manifest     Manifest
+	manifestJSON []byte
+	files        map[string]*zip.File
+	limits       ArchiveLimits
 }
 
 func OpenArchive(filename string, databaseManifest []byte, limits ArchiveLimits) (*Artifact, error) {
@@ -44,6 +45,25 @@ func OpenArchive(filename string, databaseManifest []byte, limits ArchiveLimits)
 	if err != nil {
 		return nil, fmt.Errorf("database bundle manifest: %w", err)
 	}
+	return openArchive(filename, limits, &expected)
+}
+
+// InspectArchive validates an untrusted self-describing archive and returns
+// only its canonical manifest. It shares the exact ZIP hardening path used by
+// immutable bundles loaded from the database.
+func InspectArchive(filename string, limits ArchiveLimits) (Manifest, []byte, error) {
+	if err := ValidateArchiveLimits(limits); err != nil {
+		return Manifest{}, nil, err
+	}
+	artifact, err := openArchive(filename, limits, nil)
+	if err != nil {
+		return Manifest{}, nil, err
+	}
+	defer artifact.Close()
+	return artifact.manifest, append([]byte(nil), artifact.manifestJSON...), nil
+}
+
+func openArchive(filename string, limits ArchiveLimits, expected *Manifest) (*Artifact, error) {
 	reader, err := zip.OpenReader(filename)
 	if err != nil {
 		return nil, fmt.Errorf("open bundle ZIP: %w", err)
@@ -72,7 +92,7 @@ func (artifact *Artifact) ReadCase(testCase Case) (string, string, error) {
 	return input, output, nil
 }
 
-func (artifact *Artifact) validate(expected Manifest) error {
+func (artifact *Artifact) validate(expected *Manifest) error {
 	if len(artifact.archive.File) == 0 || len(artifact.archive.File) > artifact.limits.MaxFiles {
 		return fmt.Errorf("bundle file count exceeds limit")
 	}
@@ -111,7 +131,7 @@ func (artifact *Artifact) validate(expected Manifest) error {
 	if err != nil {
 		return fmt.Errorf("artifact manifest.json: %w", err)
 	}
-	if !reflect.DeepEqual(expected, actual) {
+	if expected != nil && !reflect.DeepEqual(*expected, actual) {
 		return fmt.Errorf("artifact manifest.json disagrees with database manifest_json")
 	}
 	referenced := map[string]struct{}{"manifest.json": {}}
@@ -128,6 +148,7 @@ func (artifact *Artifact) validate(expected Manifest) error {
 		}
 	}
 	artifact.manifest = actual
+	artifact.manifestJSON = append([]byte(nil), manifestBytes...)
 	return nil
 }
 
