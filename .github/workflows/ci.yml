@@ -11,6 +11,19 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      redis:
+        image: redis:8.4-alpine@sha256:61ea466e4022f3803b9f019e01f7738aac694f01989aee35a013724921d8e742
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 20
+    env:
+      REDIS_TEST_ADDR: 127.0.0.1:6379
     steps:
       - name: Check out repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6

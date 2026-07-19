@@ -4,7 +4,7 @@ Go 判题编排服务，负责消费 `submission-topic`、读取提交快照、�
 
 > 当前状态：Kubernetes EndpointSlice 发现、版本化消息、认证幂等结果回调和不可变 ACM 隐藏测试包链路已经接通。上线 exact checker 前必须先合入 [`croj-sandbox#10`](https://github.com/CodeRushOJ/croj-sandbox/issues/10) 的日志脱敏修复，否则旧 sandbox 会把 WA 的 expected/actual 写入 Pod 日志。
 
-面向外部 OJ 的版本化异步 REST 适配器正在 Draft PR #17 中实施。已有切片包括 RFC 9457 错误、请求 ID、不透明 API Key 的 peppered HMAC 验证与 scope、`GET /api/v1/capabilities`、Judge 自有 MySQL 迁移、租户/密钥预置，以及 `POST /api/v1/judge-jobs`、任务列表/详情/取消的脱敏 HTTP 合约和 lease/attempt 状态机。Webhook 已具备精确载荷 HMAC 签名、禁止重定向、状态重试矩阵及 DNS rebinding/私网 SSRF 防护；在 MySQL job/outbox repository、worker 和 E2E 门禁完成前，该 HTTP 端口不标记为可发布。
+面向外部 OJ 的版本化异步 REST 适配器正在 Draft PR #17 中实施。已有切片包括 RFC 9457 错误、请求 ID、不透明 API Key 的 peppered HMAC 验证与 scope、`GET /api/v1/capabilities`、Judge 自有 MySQL 迁移、租户/密钥预置，以及 `POST /api/v1/judge-jobs`、任务列表/详情/取消的脱敏 HTTP 合约和 lease/attempt 状态机。Webhook 已具备精确载荷 HMAC 签名、禁止重定向、状态重试矩阵及 DNS rebinding/私网 SSRF 防护；任务提交的 Redis 原子令牌桶使用 Redis 服务端时间，在多副本间统一租户速率，Redis 不可用时新任务写入 fail closed 为 `503`，任务读取继续可用。上传字节配额类型已预留，但必须等 bundle upload 分支接入后才视为生效。在 MySQL job/outbox repository、worker 和 E2E 门禁完成前，该 HTTP 端口不标记为可发布。
 
 ## 架构
 
@@ -68,6 +68,7 @@ flowchart LR
 - RocketMQ Go Client 2.1.2
 - GORM + MySQL（只读兼容查询）
 - MinIO Go SDK（S3-compatible immutable bundle 读取）
+- go-redis v9（Redis 服务端时间 + Lua 原子令牌桶，多副本写入配额）
 - Kubernetes Service、EndpointSlice 与 namespace 级最小权限 RBAC
 
 不再依赖 ZooKeeper。

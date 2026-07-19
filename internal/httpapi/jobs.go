@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/CodeRushOJ/croj-judging-server/internal/external"
@@ -78,8 +80,13 @@ type JobListPage struct {
 	NextCursor string    `json:"nextCursor,omitempty"`
 }
 
+// JobAdmission must be invoked exactly once only after an implementation has
+// serialized the Idempotency-Key and established that the request creates a
+// new job. Replays and conflicts must return without invoking admission.
+type JobAdmission func() error
+
 type JobService interface {
-	Submit(context.Context, string, string, SubmitJobCommand) (JobView, bool, error)
+	Submit(context.Context, string, string, SubmitJobCommand, JobAdmission) (JobView, bool, error)
 	List(context.Context, string, JobListQuery) (JobListPage, error)
 	Get(context.Context, string, string) (JobView, error)
 	Cancel(context.Context, string, string) (JobView, error)
@@ -135,7 +142,31 @@ func (server *Server) handleJobSubmit(response http.ResponseWriter, request *htt
 		writeProblem(response, problemFor(http.StatusBadRequest, "invalid-json", "Invalid request body", "Provide one JSON object containing only documented fields.", requestID))
 		return
 	}
-	view, replayed, err := server.jobs.Submit(request.Context(), principal.TenantID, idempotencyKey, command)
+	var admissionOnce sync.Once
+	var admissionErr error
+	admit := func() error {
+		admissionOnce.Do(func() {
+			decision, err := server.jobWriteQuota.Allow(request.Context(), external.QuotaRequest{
+				TenantID: principal.TenantID,
+				Kind:     external.QuotaJudgeSubmit,
+				Cost:     1,
+				Limit:    server.jobWriteLimit,
+			})
+			if err != nil {
+				if errors.Is(err, external.ErrQuotaUnavailable) {
+					admissionErr = &jobQuotaAdmissionError{unavailable: true}
+					return
+				}
+				admissionErr = err
+				return
+			}
+			if !decision.Allowed {
+				admissionErr = &jobQuotaAdmissionError{retryAfter: decision.RetryAfter}
+			}
+		})
+		return admissionErr
+	}
+	view, replayed, err := server.jobs.Submit(request.Context(), principal.TenantID, idempotencyKey, command, admit)
 	if err != nil {
 		server.writeJobError(response, requestID, err)
 		return
@@ -244,6 +275,21 @@ func (server *Server) handleJobCancel(response http.ResponseWriter, request *htt
 }
 
 func (server *Server) writeJobError(response http.ResponseWriter, requestID string, err error) {
+	var quotaError *jobQuotaAdmissionError
+	if errors.As(err, &quotaError) {
+		if quotaError.unavailable {
+			response.Header().Set("Retry-After", "5")
+			writeProblem(response, problemFor(http.StatusServiceUnavailable, "quota-unavailable", "Quota temporarily unavailable", "Retry the request later.", requestID))
+			return
+		}
+		retrySeconds := int64(math.Ceil(quotaError.retryAfter.Seconds()))
+		if retrySeconds < 1 {
+			retrySeconds = 1
+		}
+		response.Header().Set("Retry-After", strconv.FormatInt(retrySeconds, 10))
+		writeProblem(response, problemFor(http.StatusTooManyRequests, "quota-exceeded", "Quota exceeded", "Retry after the indicated delay.", requestID))
+		return
+	}
 	switch {
 	case errors.Is(err, ErrJobNotFound):
 		writeProblem(response, problemFor(http.StatusNotFound, "job-not-found", "Judge job not found", "The requested judge job does not exist.", requestID))
@@ -257,6 +303,18 @@ func (server *Server) writeJobError(response http.ResponseWriter, requestID stri
 	default:
 		writeProblem(response, problemFor(http.StatusInternalServerError, "internal-error", "Internal server error", "The request could not be completed.", requestID))
 	}
+}
+
+type jobQuotaAdmissionError struct {
+	unavailable bool
+	retryAfter  time.Duration
+}
+
+func (failure *jobQuotaAdmissionError) Error() string {
+	if failure != nil && failure.unavailable {
+		return "job write quota is unavailable"
+	}
+	return "job write quota is exceeded"
 }
 
 func decodeStrictJSON(response http.ResponseWriter, request *http.Request, target any, maximum int64) error {

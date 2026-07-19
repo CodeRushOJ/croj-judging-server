@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/CodeRushOJ/croj-judging-server/internal/external"
 )
 
 type jobServiceStub struct {
@@ -24,10 +26,36 @@ type jobServiceStub struct {
 	listTenant      string
 	listQuery       JobListQuery
 	listPage        JobListPage
+	admissionCalls  int
 }
 
-func (service *jobServiceStub) Submit(_ context.Context, tenantID, idempotencyKey string, command SubmitJobCommand) (JobView, bool, error) {
-	service.submittedTenant, service.idempotencyKey, service.command = tenantID, idempotencyKey, command
+type writeQuotaStub struct {
+	decision external.QuotaDecision
+	err      error
+	request  external.QuotaRequest
+	calls    int
+}
+
+func (quota *writeQuotaStub) Allow(_ context.Context, request external.QuotaRequest) (external.QuotaDecision, error) {
+	quota.calls++
+	quota.request = request
+	return quota.decision, quota.err
+}
+
+func (service *jobServiceStub) Submit(_ context.Context, tenantID, idempotencyKey string, command SubmitJobCommand, admit JobAdmission) (JobView, bool, error) {
+	service.idempotencyKey, service.command = idempotencyKey, command
+	if service.err == nil && !service.replayed {
+		calls := service.admissionCalls
+		if calls == 0 {
+			calls = 1
+		}
+		for index := 0; index < calls; index++ {
+			if err := admit(); err != nil {
+				return JobView{}, false, err
+			}
+		}
+	}
+	service.submittedTenant = tenantID
 	return service.view, service.replayed, service.err
 }
 func (service *jobServiceStub) Get(_ context.Context, tenantID, jobID string) (JobView, error) {
@@ -203,13 +231,111 @@ func TestIdempotencyConflictMapsTo409(t *testing.T) {
 	}
 }
 
+func TestSubmitJudgeJobEnforcesDistributedQuotaBeforeCreatingJob(t *testing.T) {
+	service := &jobServiceStub{}
+	quota := &writeQuotaStub{decision: external.QuotaDecision{Allowed: false, RetryAfter: 1500 * time.Millisecond}}
+	server := newJobQuotaTestServer(t, service, quota)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs", strings.NewReader(`{"sourceCode":"must-not-be-read"}`))
+	request.Header.Set("Authorization", "Bearer valid")
+	request.Header.Set("Idempotency-Key", "submission-00000042")
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusTooManyRequests || response.Header().Get("Retry-After") != "2" {
+		t.Fatalf("status=%d headers=%#v body=%s", response.Code, response.Header(), response.Body.String())
+	}
+	if quota.request.TenantID != "tenant-7" || quota.request.Kind != external.QuotaJudgeSubmit || quota.request.Cost != 1 || service.submittedTenant != "" {
+		t.Fatalf("quota=%+v submitTenant=%q", quota.request, service.submittedTenant)
+	}
+}
+
+func TestSubmitJudgeJobFailsClosedWhenQuotaStateIsUnavailable(t *testing.T) {
+	service := &jobServiceStub{}
+	quota := &writeQuotaStub{err: external.ErrQuotaUnavailable}
+	server := newJobQuotaTestServer(t, service, quota)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs", strings.NewReader(`{}`))
+	request.Header.Set("Authorization", "Bearer valid")
+	request.Header.Set("Idempotency-Key", "submission-00000042")
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable || response.Header().Get("Retry-After") == "" || service.submittedTenant != "" {
+		t.Fatalf("status=%d headers=%#v body=%s", response.Code, response.Header(), response.Body.String())
+	}
+}
+
+func TestIdempotentReplayBypassesUnavailableNewWriteQuota(t *testing.T) {
+	service := &jobServiceStub{replayed: true, view: JobView{JobID: "ceirceirceirceirceirceirce", Status: JobQueued}}
+	quota := &writeQuotaStub{err: external.ErrQuotaUnavailable}
+	server := newJobQuotaTestServer(t, service, quota)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs", strings.NewReader(`{"bundleId":"ceirceirceirceirceirceircf","language":"cpp20","sourceCode":"same source"}`))
+	request.Header.Set("Authorization", "Bearer valid")
+	request.Header.Set("Idempotency-Key", "submission-00000042")
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusAccepted || response.Header().Get("Idempotent-Replay") != "true" || quota.calls != 0 {
+		t.Fatalf("status=%d replay=%q quotaCalls=%d body=%s", response.Code, response.Header().Get("Idempotent-Replay"), quota.calls, response.Body.String())
+	}
+}
+
+func TestJobServiceCannotDoubleChargeOneAdmission(t *testing.T) {
+	service := &jobServiceStub{
+		admissionCalls: 2,
+		view:           JobView{JobID: "ceirceirceirceirceirceirce", Status: JobQueued},
+	}
+	quota := &writeQuotaStub{decision: external.QuotaDecision{Allowed: true}}
+	server := newJobQuotaTestServer(t, service, quota)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs", strings.NewReader(`{"bundleId":"ceirceirceirceirceirceircf","language":"cpp20","sourceCode":"source"}`))
+	request.Header.Set("Authorization", "Bearer valid")
+	request.Header.Set("Idempotency-Key", "submission-00000042")
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusAccepted || quota.calls != 1 {
+		t.Fatalf("status=%d quotaCalls=%d body=%s", response.Code, quota.calls, response.Body.String())
+	}
+}
+
+func TestJudgeJobReadsRemainAvailableWhenWriteQuotaIsDown(t *testing.T) {
+	service := &jobServiceStub{view: JobView{JobID: "ceirceirceirceirceirceirce", Status: JobRunning}}
+	quota := &writeQuotaStub{err: external.ErrQuotaUnavailable}
+	server, err := NewServer(staticAuthenticator{principal: Principal{TenantID: "tenant-7", scopes: map[Scope]struct{}{ScopeJobRead: {}}}}, testCapabilities(),
+		WithJobService(service), WithJobWriteQuota(quota, external.QuotaLimit{Capacity: 20, RefillPeriod: time.Second}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/judge-jobs/ceirceirceirceirceirceirce", nil)
+	request.Header.Set("Authorization", "Bearer valid")
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || quota.request.TenantID != "" {
+		t.Fatalf("status=%d quota=%+v body=%s", response.Code, quota.request, response.Body.String())
+	}
+}
+
+func TestServerRejectsJobServiceWithoutFailClosedQuota(t *testing.T) {
+	_, err := NewServer(staticAuthenticator{principal: Principal{TenantID: "tenant-7"}}, testCapabilities(), WithJobService(&jobServiceStub{}))
+	if err == nil || !strings.Contains(err.Error(), "write quota") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
 func newJobTestServer(t *testing.T, service JobService, scopes ...Scope) *Server {
 	t.Helper()
 	granted := make(map[Scope]struct{}, len(scopes))
 	for _, scope := range scopes {
 		granted[scope] = struct{}{}
 	}
-	server, err := NewServer(staticAuthenticator{principal: Principal{TenantID: "tenant-7", scopes: granted}}, testCapabilities(), WithJobService(service))
+	quota := &writeQuotaStub{decision: external.QuotaDecision{Allowed: true}}
+	server, err := NewServer(staticAuthenticator{principal: Principal{TenantID: "tenant-7", scopes: granted}}, testCapabilities(),
+		WithJobService(service), WithJobWriteQuota(quota, external.QuotaLimit{Capacity: 20, RefillPeriod: time.Second}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return server
+}
+
+func newJobQuotaTestServer(t *testing.T, service JobService, quota external.Quota) *Server {
+	t.Helper()
+	server, err := NewServer(staticAuthenticator{principal: Principal{TenantID: "tenant-7", scopes: map[Scope]struct{}{ScopeJobSubmit: {}}}}, testCapabilities(),
+		WithJobService(service), WithJobWriteQuota(quota, external.QuotaLimit{Capacity: 20, RefillPeriod: time.Second}))
 	if err != nil {
 		t.Fatal(err)
 	}

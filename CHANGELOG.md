@@ -13,6 +13,7 @@
 - 增加持久化任务状态机，覆盖 attempt CAS、lease heartbeat/过期回收、陈旧 worker 拒绝、取消意图、基础设施重试与终态失败。
 - 增加外部 OJ webhook v1 的 HMAC-SHA256 精确载荷签名、2xx/重试/永久失败矩阵及禁止重定向投递。
 - 增加 callback HTTPS authority 固定、逐次 DNS 解析、混合公私网答案拒绝和 IPv4/IPv6/云元数据 SSRF 防护传输层。
+- 增加 Redis 服务端时间驱动的原子令牌桶，跨 HTTP 副本统一限制租户任务提交；配额状态不确定时新任务写入 fail closed，已授权读请求保持可用。上传字节配额将在 bundle upload 分支接线后启用。
 - 增加与 `croj-sandbox` 一致的 `SandboxService.Execute` protobuf/gRPC 客户端。
 - 为 Pod endpoint 建立可复用连接、显式 RPC deadline 与确定性关闭流程。
 - 增加 bufconn、fake scheduler、失败传播和 verdict 映射测试。
