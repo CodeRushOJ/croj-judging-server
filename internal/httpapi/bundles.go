@@ -42,7 +42,8 @@ func (server *Server) serveBundleCollection(response http.ResponseWriter, reques
 	if !ok {
 		return
 	}
-	if request.URL.RawQuery != "" || request.Header.Get("Idempotency-Key") == "" {
+	idempotencyKeys := request.Header.Values("Idempotency-Key")
+	if request.URL.RawQuery != "" || len(idempotencyKeys) != 1 || idempotencyKeys[0] == "" {
 		writeBundleProblem(response, requestID, external.ErrInvalidIdempotency)
 		return
 	}
@@ -67,7 +68,7 @@ func (server *Server) serveBundleCollection(response http.ResponseWriter, reques
 		return
 	}
 	reader := &singleMultipartFile{part: part, multipart: multipartReader}
-	metadata, replay, err := server.bundles.Upload(request.Context(), principal.TenantID, request.Header.Get("Idempotency-Key"), reader)
+	metadata, replay, err := server.bundles.Upload(request.Context(), principal.TenantID, idempotencyKeys[0], reader)
 	_ = part.Close()
 	if err != nil {
 		_ = request.Body.Close()
