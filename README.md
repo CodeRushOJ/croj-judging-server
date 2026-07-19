@@ -175,7 +175,11 @@ Judge 自有 schema v3 为 job 和 attempt 增加 256-bit lease token，并把 a
 
 worker 领取使用 `FOR UPDATE SKIP LOCKED`，并在租户锁内重新确认 running quota；候选租户发生并发竞争时会重新选择，避免错误返回空队列。每次领取创建单独 attempt；lease 的签发、过期判断和 CAS 均以 MySQL 时钟为准，不受副本系统时钟偏差影响；heartbeat、完成和基础设施失败均以 attempt/worker/lease token 做 CAS。进程重启后只会回收过期 attempt，旧 worker 无法覆盖新结果；已请求取消的过期任务直接恢复为 `CANCELLED`，不会再次执行源码。基础设施失败按 tenant policy 有界重试，耗尽后才进入 `FAILED`。
 
-当前分支提供 `httpapi.NewMySQLJobService` 适配器，但不会在未配置持久对象存储、密钥与执行 worker 时伪造运行状态。平台接线完成前 HTTP Service 保持未启用。
+外部 REST 与 durable worker 已接入同一个 compile-once `BatchBundlePipeline`，不会维护第二套判题实现。immutable bundle manifest 的 `limits.timeLimitMillis` / `limits.memoryLimitMiB` 是每题权威值；tenant policy 与 capabilities 只提供租户/平台上限。worker 通过完整 attempt/worker/token/未过期 lease fence 加载源码与 READY bundle，heartbeat、取消和完成仍由 MySQL CAS 最终裁决；旧 lease 不能写入结果。
+
+外部端口默认关闭。只有显式设置 `EXTERNAL_API_ENABLED=true` 才会构造鉴权、Redis quota、MinIO source/bundle store、REST listener、bundle reconciler 与 worker pool。启用时必须通过环境提供 32-byte base64 的 `EXTERNAL_API_AUTH_PEPPER_BASE64`、`EXTERNAL_IDEMPOTENCY_PEPPER_BASE64`、`EXTERNAL_CURSOR_KEY_BASE64`、`EXTERNAL_SOURCE_KEY_BASE64`，并配置 worker identity/intervals。`GET /readyz` 仅在 MySQL ping、Redis ping、MinIO bucket 与 Sandbox headless-Service DNS 全部可用时返回 `204`；任何依赖未知均返回 `503`。关闭时先停止新 claim 并等待 active worker 退出，再关闭 HTTP。
+
+Sandbox 的推荐目标是 `dns:///sandbox-workers.<namespace>.svc.cluster.local:50051`，对应 `deploy/sandbox-headless-service.yaml` 中 `clusterIP: None` 的 Service。gRPC channel 使用 `round_robin` 对 DNS 返回的 Pod endpoint 做每 RPC 分配。直接读取 EndpointSlice 的旧调度路径仅作为未配置 `SANDBOX_GRPC_TARGET` 时的 deprecated fallback。
 
 真实 MySQL 8.4 验证使用一次性容器，不需要启动整套 OJ：
 

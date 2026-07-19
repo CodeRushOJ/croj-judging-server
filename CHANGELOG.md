@@ -6,6 +6,12 @@
 
 ### Added
 
+- 增加 RocketMQ 与 durable REST worker 共用的 canonical compile-once batch execution core，按顺序保留 case 结果并统一 AC/WA/CE/TLE/MLE/RE/SE 映射。
+- immutable bundle manifest 增加必填时间/内存限制；tenant policy 与 capabilities 增加对应上限，上传在平台或租户 ceiling 外 fail closed。
+- 增加 headless Kubernetes Service、`dns:///...` gRPC target 与 `round_robin` Pod endpoint 分配，手工 EndpointSlice 调度降级为 deprecated fallback。
+- 增加完整 lease fence 的 durable execution input、heartbeat/取消控制与 worker runner；取消或 lease ownership 丢失会传播 context cancellation，陈旧 worker 不能提交结果。
+- 增加默认关闭、显式 opt-in 的外部 REST/worker production runtime；readiness 同时依赖 MySQL、Redis、MinIO bucket 和 Sandbox DNS，shutdown 先停 worker 后停 HTTP。
+
 - 增加面向外部 OJ 的异步 REST v1 基础：RFC 9457 错误、request ID、scope 鉴权和 capabilities 端点。
 - 增加 Judge 自有 MySQL schema 的嵌入式迁移、advisory lock、checksum drift 拒绝及租户隔离数据结构。
 - 增加不透明 256-bit API Key 生成、peppered HMAC 存储、严格 scope 加载与 `judge-admin` 租户/密钥预置命令。

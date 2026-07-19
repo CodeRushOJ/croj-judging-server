@@ -34,10 +34,12 @@ jobs:
           cache: true
       - name: Test with race detector
         run: go test -race ./...
+      - name: Exercise headless-Service DNS round robin contract
+        run: go test -race -count=10 -run '^TestClientUsesGRPCRoundRobinAcrossResolvedHeadlessServiceEndpoints$' ./internal/sandbox
       - name: Vet
         run: go vet ./...
       - name: Build binary
-        run: CGO_ENABLED=0 go build -trimpath -o /tmp/judging-server ./cmd
+        run: CGO_ENABLED=0 go build -trimpath ./cmd ./cmd/judge-admin
       - name: Build container image
         run: docker build -t coderushoj/judging-server:ci .
 
@@ -73,5 +75,9 @@ jobs:
         env:
           JUDGE_TEST_MYSQL_DSN: root:@tcp(127.0.0.1:3306)/croj_bundle_ci?parseTime=true&loc=UTC&charset=utf8mb4
         run: go test -race -count=1 ./internal/external
+      - name: Run canonical bundle ceiling integration on MySQL 8.4
+        env:
+          EXTERNAL_JUDGE_MYSQL_TEST_DSN: root:@tcp(127.0.0.1:3306)/croj_bundle_ci?parseTime=true&multiStatements=true
+        run: go test -race -count=1 -run '^TestExternalBundleSQLRepositoryIntegration/tenant_and_platform_execution_ceilings_reject_before_publication$' ./internal/integration
       - name: Verify bundle MySQL CI contract
         run: bash scripts/ci/test-bundle-mysql84-contract.sh
