@@ -2,6 +2,7 @@ package bundle
 
 import (
 	"archive/zip"
+	"bufio"
 	"fmt"
 	"io"
 	"reflect"
@@ -60,6 +61,14 @@ func InspectArchive(filename string, limits ArchiveLimits) (Manifest, []byte, er
 		return Manifest{}, nil, err
 	}
 	defer artifact.Close()
+	for _, testCase := range artifact.manifest.Cases {
+		if err := artifact.validateTextEntry(testCase.Input, limits.MaxCaseBytes); err != nil {
+			return Manifest{}, nil, fmt.Errorf("validate case %q input: %w", testCase.ID, err)
+		}
+		if err := artifact.validateTextEntry(testCase.Output, limits.MaxCaseBytes); err != nil {
+			return Manifest{}, nil, fmt.Errorf("validate case %q output: %w", testCase.ID, err)
+		}
+	}
 	return artifact.manifest, append([]byte(nil), artifact.manifestJSON...), nil
 }
 
@@ -172,6 +181,40 @@ func (artifact *Artifact) readText(name string, limit int64) (string, error) {
 		return "", fmt.Errorf("entry is not valid UTF-8")
 	}
 	return string(data), nil
+}
+
+func (artifact *Artifact) validateTextEntry(name string, limit int64) error {
+	file := artifact.files[name]
+	if file == nil {
+		return fmt.Errorf("entry %q does not exist", name)
+	}
+	reader, err := file.Open()
+	if err != nil {
+		return fmt.Errorf("open ZIP entry: %w", err)
+	}
+	defer reader.Close()
+	buffered := bufio.NewReader(io.LimitReader(reader, limit+1))
+	var size int64
+	for {
+		value, width, err := buffered.ReadRune()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("read ZIP entry: %w", err)
+		}
+		if value == utf8.RuneError && width == 1 {
+			return fmt.Errorf("entry is not valid UTF-8")
+		}
+		size += int64(width)
+		if size > limit {
+			return fmt.Errorf("ZIP entry size mismatch or limit exceeded")
+		}
+	}
+	if uint64(size) != file.UncompressedSize64 {
+		return fmt.Errorf("ZIP entry size mismatch or limit exceeded")
+	}
+	return nil
 }
 
 func (artifact *Artifact) readBytes(name string, limit int64) ([]byte, error) {
