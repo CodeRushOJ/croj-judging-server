@@ -14,7 +14,7 @@ func TestEmbeddedMigrationsDefineTheCompleteJudgeOwnedSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(migrations) != 2 || migrations[0].Version != 1 || migrations[0].Name != "initial_external_judge" || migrations[1].Version != 2 || migrations[1].Name != "external_bundle_ready" {
+	if len(migrations) != 3 || migrations[0].Version != 1 || migrations[0].Name != "initial_external_judge" || migrations[1].Version != 2 || migrations[1].Name != "external_bundle_ready" || migrations[2].Version != 3 || migrations[2].Name != "durable_job_fencing" {
 		t.Fatalf("migrations = %+v", migrations)
 	}
 	if len(migrations[0].Checksum) != 64 {
@@ -74,6 +74,24 @@ func TestEmbeddedMigrationsDefineTheCompleteJudgeOwnedSchema(t *testing.T) {
 	}
 }
 
+func TestDurableJobFencingMigrationAddsTenantBoundLeaseTokens(t *testing.T) {
+	migrations, err := Migrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sql := strings.ToLower(migrations[2].SQL)
+	for _, contract := range []string{
+		"add column lease_token binary(32)",
+		"add column tenant_id bigint unsigned",
+		"unique key uk_external_attempt_id_tenant (id, tenant_id)",
+		"foreign key (job_id, tenant_id) references t_external_job(id, tenant_id)",
+	} {
+		if !strings.Contains(sql, contract) {
+			t.Errorf("migration is missing contract %q", contract)
+		}
+	}
+}
+
 func TestMigrationStatementsAreExplicitAndReplaySafe(t *testing.T) {
 	migrations, err := Migrations()
 	if err != nil {
@@ -119,14 +137,14 @@ func TestApplyMigrationsUsesAnAdvisoryLockAndRecordsChecksums(t *testing.T) {
 	if !connection.locked || !connection.released {
 		t.Fatalf("migration lock lifecycle: locked=%v released=%v", connection.locked, connection.released)
 	}
-	if len(connection.executions) != 13 {
-		t.Fatalf("executions = %d, want history DDL + 9 schema DDL + publication migration DDL + two history inserts", len(connection.executions))
+	if len(connection.executions) < 19 {
+		t.Fatalf("executions = %d, want all three migrations", len(connection.executions))
 	}
 	if !strings.Contains(strings.ToLower(connection.executions[0].query), "create table if not exists t_judge_schema_history") {
 		t.Fatalf("first execution = %s", connection.executions[0].query)
 	}
 	last := connection.executions[len(connection.executions)-1]
-	if !strings.Contains(strings.ToLower(last.query), "insert into t_judge_schema_history") || fmt.Sprint(last.arguments) != fmt.Sprint([]any{2, "external_bundle_ready", migrations[1].Checksum}) {
+	if !strings.Contains(strings.ToLower(last.query), "insert into t_judge_schema_history") || fmt.Sprint(last.arguments) != fmt.Sprint([]any{3, "durable_job_fencing", migrations[2].Checksum}) {
 		t.Fatalf("history execution = %#v", last)
 	}
 }
