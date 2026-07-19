@@ -23,20 +23,20 @@ func TestWebhookDeliverySignsExactBodyAndRequiredHeaders(t *testing.T) {
 	secret := []byte("0123456789abcdef0123456789abcdef")
 	body := []byte(`{"eventId":"ceirceirceirceirceirceirce","type":"judge.job.completed"}`)
 	var captured []byte
-	deliverer, err := NewWebhookDeliverer(webhookDoerFunc(func(request *http.Request) (*http.Response, error) {
+	deliverer, err := newWebhookDelivererForTest(webhookDoerFunc(func(request *http.Request) (*http.Response, error) {
 		captured, _ = io.ReadAll(request.Body)
 		if request.Method != http.MethodPost || request.URL.String() != "https://oj.example.com/hooks/croj" {
 			t.Fatalf("request=%s %s", request.Method, request.URL)
 		}
-		if request.Header.Get("X-CROJ-Event-Id") != "ceirceirceirceirceirceirce" || request.Header.Get("X-CROJ-Timestamp") != "1784464496" {
+		if request.Header.Get("X-CodeRushOJ-Event-Id") != "ceirceirceirceirceirceirce" || request.Header.Get("X-CodeRushOJ-Timestamp") != "1784464496" {
 			t.Fatalf("headers=%#v", request.Header)
 		}
 		mac := hmac.New(sha256.New, secret)
-		_, _ = mac.Write([]byte("1784464496."))
+		_, _ = mac.Write([]byte("v1\n26\nceirceirceirceirceirceirce\n1784464496\n"))
 		_, _ = mac.Write(captured)
 		want := "v1=" + hex.EncodeToString(mac.Sum(nil))
-		if request.Header.Get("X-CROJ-Signature") != want {
-			t.Fatalf("signature=%q want=%q", request.Header.Get("X-CROJ-Signature"), want)
+		if request.Header.Get("X-CodeRushOJ-Signature") != want {
+			t.Fatalf("signature=%q want=%q", request.Header.Get("X-CodeRushOJ-Signature"), want)
 		}
 		return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader(""))}, nil
 	}), 5*time.Second)
@@ -63,7 +63,7 @@ func TestWebhookDeliveryClassifiesHTTPStatusWithoutFollowingRedirects(t *testing
 		{408, WebhookRetry}, {425, WebhookRetry}, {429, WebhookRetry}, {500, WebhookRetry}, {503, WebhookRetry},
 	} {
 		t.Run(http.StatusText(test.status), func(t *testing.T) {
-			deliverer, err := NewWebhookDeliverer(webhookDoerFunc(func(*http.Request) (*http.Response, error) {
+			deliverer, err := newWebhookDelivererForTest(webhookDoerFunc(func(*http.Request) (*http.Response, error) {
 				return &http.Response{StatusCode: test.status, Body: io.NopCloser(strings.NewReader(strings.Repeat("x", 10_000)))}, nil
 			}), time.Second)
 			if err != nil {
@@ -78,7 +78,7 @@ func TestWebhookDeliveryClassifiesHTTPStatusWithoutFollowingRedirects(t *testing
 }
 
 func TestWebhookDeliveryRejectsUnsafeOrSecretLeakingInputs(t *testing.T) {
-	deliverer, err := NewWebhookDeliverer(webhookDoerFunc(func(*http.Request) (*http.Response, error) {
+	deliverer, err := newWebhookDelivererForTest(webhookDoerFunc(func(*http.Request) (*http.Response, error) {
 		t.Fatal("unsafe request reached the network")
 		return nil, nil
 	}), time.Second)
@@ -91,7 +91,13 @@ func TestWebhookDeliveryRejectsUnsafeOrSecretLeakingInputs(t *testing.T) {
 		"fragment":     func(value *WebhookDelivery) { value.DestinationURL = "https://oj.example.com/hook#secret" },
 		"short secret": func(value *WebhookDelivery) { value.Secret = []byte("short") },
 		"bad event":    func(value *WebhookDelivery) { value.EventID = "../event" },
-		"empty body":   func(value *WebhookDelivery) { value.Body = nil },
+		"mismatched event": func(value *WebhookDelivery) {
+			value.Body = []byte(`{"eventId":"aaaaaaaaaaaaaaaaaaaaaaaaaa"}`)
+		},
+		"duplicate event": func(value *WebhookDelivery) {
+			value.Body = []byte(`{"eventId":"ceirceirceirceirceirceirce","eventId":"ceirceirceirceirceirceirce"}`)
+		},
+		"empty body": func(value *WebhookDelivery) { value.Body = nil },
 	} {
 		t.Run(name, func(t *testing.T) {
 			value := validWebhookDelivery()
@@ -103,17 +109,27 @@ func TestWebhookDeliveryRejectsUnsafeOrSecretLeakingInputs(t *testing.T) {
 	}
 }
 
+func TestWebhookSignatureBindsEventIdentity(t *testing.T) {
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	body := []byte(`{"eventId":"ceirceirceirceirceirceirce"}`)
+	first := signWebhook(secret, "ceirceirceirceirceirceirce", "1784464496", body)
+	second := signWebhook(secret, "aaaaaaaaaaaaaaaaaaaaaaaaaa", "1784464496", body)
+	if first == second {
+		t.Fatal("changing the deduplication identity did not invalidate the signature")
+	}
+}
+
 func validWebhookDelivery() WebhookDelivery {
 	return WebhookDelivery{
 		EventID: "ceirceirceirceirceirceirce", DestinationURL: "https://oj.example.com/hook",
-		Secret: []byte("0123456789abcdef0123456789abcdef"), Body: []byte(`{"ok":true}`),
+		Secret: []byte("0123456789abcdef0123456789abcdef"), Body: []byte(`{"eventId":"ceirceirceirceirceirceirce","eventType":"judge.job.completed"}`),
 	}
 }
 
 func TestWebhookRetrySignatureUsesFreshAttemptTimestamp(t *testing.T) {
 	var timestamps []string
-	deliverer, err := NewWebhookDeliverer(webhookDoerFunc(func(request *http.Request) (*http.Response, error) {
-		timestamps = append(timestamps, request.Header.Get("X-CROJ-Timestamp"))
+	deliverer, err := newWebhookDelivererForTest(webhookDoerFunc(func(request *http.Request) (*http.Response, error) {
+		timestamps = append(timestamps, request.Header.Get("X-CodeRushOJ-Timestamp"))
 		return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: io.NopCloser(strings.NewReader(""))}, nil
 	}), time.Second)
 	if err != nil {

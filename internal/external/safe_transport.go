@@ -28,11 +28,17 @@ var prohibitedCallbackPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("203.0.113.0/24"), netip.MustParsePrefix("224.0.0.0/4"),
 	netip.MustParsePrefix("240.0.0.0/4"),
 	netip.MustParsePrefix("::/128"), netip.MustParsePrefix("::1/128"),
-	netip.MustParsePrefix("64:ff9b::/96"), netip.MustParsePrefix("100::/64"),
+	netip.MustParsePrefix("::/96"), netip.MustParsePrefix("64:ff9b::/96"),
+	netip.MustParsePrefix("64:ff9b:1::/48"), netip.MustParsePrefix("100::/64"),
+	netip.MustParsePrefix("100:0:0:1::/64"),
 	netip.MustParsePrefix("2001::/32"), netip.MustParsePrefix("2001:db8::/32"),
-	netip.MustParsePrefix("2002::/16"), netip.MustParsePrefix("fc00::/7"),
+	netip.MustParsePrefix("2001::/23"), netip.MustParsePrefix("2002::/16"),
+	netip.MustParsePrefix("3fff::/20"), netip.MustParsePrefix("fc00::/7"),
+	netip.MustParsePrefix("fec0::/10"),
 	netip.MustParsePrefix("fe80::/10"), netip.MustParsePrefix("ff00::/8"),
 }
+
+var globallyAllocatedIPv6 = netip.MustParsePrefix("2000::/3")
 
 func resolvePublicCallback(ctx context.Context, resolver callbackResolver, host string) ([]netip.Addr, error) {
 	if resolver == nil || !validDNSName(host) {
@@ -65,6 +71,9 @@ func isPublicCallbackAddress(address netip.Addr) bool {
 	if !address.IsValid() || !address.IsGlobalUnicast() || address.IsPrivate() ||
 		address.IsLoopback() || address.IsLinkLocalUnicast() || address.IsLinkLocalMulticast() ||
 		address.IsMulticast() || address.IsUnspecified() {
+		return false
+	}
+	if address.Is6() && !globallyAllocatedIPv6.Contains(address) {
 		return false
 	}
 	for _, prefix := range prohibitedCallbackPrefixes {
@@ -148,12 +157,14 @@ func NewSafeCallbackClient(host string, port uint16, requestTimeout, dialTimeout
 	dialer := &net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}
 	transport := &safeCallbackTransport{host: host, port: port, resolver: resolver}
 	transport.transport = &http.Transport{
-		Proxy:               nil,
-		ForceAttemptHTTP2:   true,
-		MaxIdleConns:        16,
-		MaxIdleConnsPerHost: 4,
-		IdleConnTimeout:     30 * time.Second,
-		TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12, ServerName: host},
+		Proxy:                  nil,
+		ForceAttemptHTTP2:      true,
+		MaxIdleConns:           16,
+		MaxIdleConnsPerHost:    4,
+		MaxConnsPerHost:        8,
+		MaxResponseHeaderBytes: 64 << 10,
+		IdleConnTimeout:        30 * time.Second,
+		TLSClientConfig:        &tls.Config{MinVersion: tls.VersionTLS12, ServerName: host},
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			addresses, err := resolvePublicCallback(ctx, resolver, host)
 			if err != nil {
@@ -182,7 +193,7 @@ func NewSafeWebhookDeliverer(host string, port uint16, requestTimeout, dialTimeo
 	if err != nil {
 		return nil, err
 	}
-	return NewWebhookDeliverer(client.Transport, requestTimeout)
+	return newWebhookDelivererForTest(client.Transport, requestTimeout)
 }
 
 func (transport *safeCallbackTransport) RoundTrip(request *http.Request) (*http.Response, error) {

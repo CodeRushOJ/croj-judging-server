@@ -113,7 +113,7 @@ Terminal event bodies contain `eventId`, `eventType`, `occurredAt`, `tenantId`, 
 - `X-CodeRushOJ-Timestamp`
 - `X-CodeRushOJ-Signature: v1=<hex HMAC-SHA256>`
 
-The signature input is `<timestamp>.<raw-body>`. Secrets are tenant/callback specific and shown once. Delivery is at least once with exponential backoff and jitter; `2xx` acknowledges, `408/425/429/5xx` retries, and other `4xx` terminate delivery with an auditable failure. The outbox retains attempt count, next attempt, last status, and a redacted error. Clients deduplicate by `eventId` and reject timestamps outside their configured replay window.
+The signature input is the unambiguous byte sequence `v1\n<event-id-byte-length>\n<event-id>\n<timestamp>\n<raw-body>`. The sender rejects any mismatch or duplicate between the header and body `eventId`. Secrets are tenant/callback specific and shown once. Delivery is at least once with exponential backoff and jitter; `2xx` acknowledges, `408/425/429/5xx` retries, and other `4xx` terminate delivery with an auditable failure. The outbox retains attempt count, next attempt, last status, and a redacted error. Clients deduplicate by the signed `eventId` and reject timestamps outside their configured replay window.
 
 ## 7. Lifecycle, observability, and retention
 
