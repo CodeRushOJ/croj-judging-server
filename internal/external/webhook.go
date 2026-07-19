@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -67,6 +68,9 @@ func (deliverer *WebhookDeliverer) Deliver(ctx context.Context, delivery Webhook
 	// is classified as permanent and the signed body is never forwarded.
 	response, err := deliverer.transport.RoundTrip(request)
 	if err != nil {
+		if errors.Is(err, ErrUnsafeCallbackDestination) {
+			return WebhookPermanentFailure, fmt.Errorf("deliver webhook: %w", err)
+		}
 		return WebhookRetry, fmt.Errorf("deliver webhook: %w", err)
 	}
 	defer response.Body.Close()
