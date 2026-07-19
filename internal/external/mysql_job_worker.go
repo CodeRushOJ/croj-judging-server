@@ -43,7 +43,7 @@ WHERE job.id = ? AND job.status = 'RUNNING' AND job.attempt_no = ? AND job.worke
 		return nil, repositoryUnavailable("load authoritative source metadata", err)
 	}
 	source.KeyVersion = uint16(keyVersion)
-	ciphertext, err := repository.sourceObjects.Get(ctx, source.ObjectKey)
+	ciphertext, err := repository.sourceObjects.Get(ctx, source.ObjectKey, source.SizeBytes+sourceCiphertextOverheadBytes)
 	if err != nil {
 		return nil, fmt.Errorf("%w: encrypted source object is unavailable", ErrSourceEncryption)
 	}

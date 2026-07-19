@@ -12,6 +12,7 @@ import (
 )
 
 const sourceNonceBytes = 12
+const sourceCiphertextOverheadBytes = 16
 
 var ErrSourceEncryption = errors.New("source encryption failed")
 
