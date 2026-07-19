@@ -3,6 +3,8 @@ package external
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -45,10 +47,10 @@ func TestApplyMigrationsOnMySQL84IsReplaySafe(t *testing.T) {
 		t.Fatalf("migration replay: %v", err)
 	}
 	var versionCount int
-	if err := database.QueryRowContext(ctx, "SELECT COUNT(*) FROM t_judge_schema_history WHERE version IN (1, 2, 3)").Scan(&versionCount); err != nil {
+	if err := database.QueryRowContext(ctx, "SELECT COUNT(*) FROM t_judge_schema_history WHERE version IN (1, 2, 3, 4)").Scan(&versionCount); err != nil {
 		t.Fatal(err)
 	}
-	if versionCount != 3 {
+	if versionCount != 4 {
 		t.Fatalf("migration versions = %d", versionCount)
 	}
 	var columnCount int
@@ -72,6 +74,154 @@ WHERE constraint_schema = DATABASE() AND constraint_type = 'CHECK'
 	if constraintCount != 2 {
 		t.Fatalf("active lease constraints = %d", constraintCount)
 	}
+}
+
+func TestDurableWebhookMigrationUpgradesLegacyRowsWithoutInventingSecrets(t *testing.T) {
+	database := openMySQLIntegration(t)
+	resetMySQLIntegrationSchema(t, database)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	migrations, err := Migrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection, err := database.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := applyMigrations(ctx, sqlMigrationConnection{connection: connection}, migrations[:3]); err != nil {
+		connection.Close()
+		t.Fatal(err)
+	}
+	if err := connection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	jobID := insertLegacyWebhookFixture(t, ctx, database, "aaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbb", "cccccccccccccccccccccccccc")
+	payload := `{"eventId":"dddddddddddddddddddddddddd","eventType":"judge.job.failed"}`
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO t_external_webhook_outbox(
+    event_id, tenant_id, job_id, callback_id, event_type, payload_json,
+    status, next_attempt_at, expires_at
+)
+SELECT 'dddddddddddddddddddddddddd', job.tenant_id, job.id, job.callback_id,
+       'judge.job.failed', ?, 'FAILED', CURRENT_TIMESTAMP(3), DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL 1 DAY)
+FROM t_external_job AS job WHERE job.id = ?`, payload, jobID); err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyMigrations(ctx, database); err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyMigrations(ctx, database); err != nil {
+		t.Fatalf("replay durable webhook migration: %v", err)
+	}
+	var disabledAt sql.NullTime
+	if err := database.QueryRowContext(ctx, `
+SELECT callback.disabled_at
+FROM t_external_callback AS callback
+JOIN t_external_job AS job ON job.callback_id = callback.id
+WHERE job.id = ?`, jobID).Scan(&disabledAt); err != nil {
+		t.Fatal(err)
+	}
+	if !disabledAt.Valid {
+		t.Fatal("legacy callback without nonce remained enabled")
+	}
+	var status string
+	var body []byte
+	if err := database.QueryRowContext(ctx, "SELECT status, payload_body FROM t_external_webhook_outbox WHERE job_id = ?", jobID).Scan(&status, &body); err != nil {
+		t.Fatal(err)
+	}
+	var legacyBody map[string]string
+	if err := json.Unmarshal(body, &legacyBody); err != nil {
+		t.Fatalf("decode migrated legacy payload: %v", err)
+	}
+	if status != "DEAD" || legacyBody["eventId"] != "dddddddddddddddddddddddddd" || legacyBody["eventType"] != "judge.job.failed" {
+		t.Fatalf("legacy outbox status=%q body=%q", status, body)
+	}
+}
+
+func TestDurableWebhookMigrationRejectsDuplicateLegacyJobEventsWithoutDeletingThem(t *testing.T) {
+	database := openMySQLIntegration(t)
+	resetMySQLIntegrationSchema(t, database)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	migrations, err := Migrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection, err := database.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := applyMigrations(ctx, sqlMigrationConnection{connection: connection}, migrations[:3]); err != nil {
+		connection.Close()
+		t.Fatal(err)
+	}
+	if err := connection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	jobID := insertLegacyWebhookFixture(t, ctx, database, "eeeeeeeeeeeeeeeeeeeeeeeeee", "ffffffffffffffffffffffffff", "gggggggggggggggggggggggggg")
+	for _, eventID := range []string{"hhhhhhhhhhhhhhhhhhhhhhhhhh", "iiiiiiiiiiiiiiiiiiiiiiiiii"} {
+		payload := fmt.Sprintf(`{"eventId":%q,"eventType":"judge.job.failed"}`, eventID)
+		if _, err := database.ExecContext(ctx, `
+INSERT INTO t_external_webhook_outbox(
+    event_id, tenant_id, job_id, callback_id, event_type, payload_json,
+    status, next_attempt_at, expires_at
+)
+SELECT ?, job.tenant_id, job.id, job.callback_id, 'judge.job.failed', ?,
+       'FAILED', CURRENT_TIMESTAMP(3), DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL 1 DAY)
+FROM t_external_job AS job WHERE job.id = ?`, eventID, payload, jobID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := ApplyMigrations(ctx, database); err == nil || !strings.Contains(err.Error(), "migration 4") {
+		t.Fatalf("duplicate legacy migration error = %v", err)
+	}
+	var count int
+	if err := database.QueryRowContext(ctx, "SELECT COUNT(*) FROM t_external_webhook_outbox WHERE job_id = ?", jobID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("duplicate legacy events were changed: %d", count)
+	}
+}
+
+func insertLegacyWebhookFixture(t *testing.T, ctx context.Context, database *sql.DB, tenantExternalID, callbackExternalID, jobExternalID string) int64 {
+	t.Helper()
+	policy := `{"maxQueuedJobs":4,"maxRunningJobs":1,"maxSourceBytes":1024,"maxRetainedBundles":4,"dailyExecutionMillis":1000,"maxInfrastructureTries":3}`
+	tenantResult, err := database.ExecContext(ctx, `INSERT INTO t_external_tenant(external_id, name, status, policy_json) VALUES (?, 'legacy webhook tenant', 'ACTIVE', ?)`, tenantExternalID, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tenantID, _ := tenantResult.LastInsertId()
+	callbackResult, err := database.ExecContext(ctx, `
+INSERT INTO t_external_callback(external_id, tenant_id, destination_url, allowed_host, allowed_port, secret_ciphertext, secret_key_version)
+VALUES (?, ?, 'https://oj.example.com/hook', 'oj.example.com', 443, ?, 1)`, callbackExternalID, tenantID, []byte("legacy-ciphertext-longer-than-tag"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	callbackID, _ := callbackResult.LastInsertId()
+	bundleResult, err := database.ExecContext(ctx, `
+INSERT INTO t_external_bundle(external_id, tenant_id, sha256, object_key, size_bytes, case_count, manifest_version, manifest_json, publication_status, ready_at)
+VALUES ('jjjjjjjjjjjjjjjjjjjjjjjjjj', ?, UNHEX(SHA2(?, 256)), ?, 1, 1, 1, JSON_OBJECT('schemaVersion', 1), 'READY', CURRENT_TIMESTAMP(3))`, tenantID, jobExternalID, "external/"+jobExternalID+".zip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundleID, _ := bundleResult.LastInsertId()
+	sourceResult, err := database.ExecContext(ctx, `
+INSERT INTO t_external_source_object(external_id, tenant_id, object_key, source_sha256, source_size_bytes, encryption_key_version, encryption_nonce)
+VALUES ('kkkkkkkkkkkkkkkkkkkkkkkkkk', ?, ?, UNHEX(SHA2(?, 256)), 1, 1, X'000000000000000000000000')`, tenantID, "external/"+jobExternalID+".bin", jobExternalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceID, _ := sourceResult.LastInsertId()
+	jobResult, err := database.ExecContext(ctx, `
+INSERT INTO t_external_job(external_id, tenant_id, bundle_id, source_object_id, callback_id, status, language_id, request_hash, next_attempt_at, completed_at)
+VALUES (?, ?, ?, ?, ?, 'FAILED', 'cpp20', UNHEX(SHA2(?, 256)), CURRENT_TIMESTAMP(3), CURRENT_TIMESTAMP(3))`, jobExternalID, tenantID, bundleID, sourceID, callbackID, jobExternalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobID, _ := jobResult.LastInsertId()
+	return jobID
 }
 
 func TestDurableFencingMigrationResumesAfterCommittedStatementPrefix(t *testing.T) {
