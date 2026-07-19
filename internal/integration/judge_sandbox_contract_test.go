@@ -323,6 +323,7 @@ func immutableBundle(t *testing.T, input, output string) (*model.TestBundle, *bu
 		SchemaVersion: 1,
 		JudgeMode:     bundle.JudgeModeACM,
 		Checker:       bundle.CheckerExact,
+		Limits:        bundle.Limits{TimeLimitMillis: 1000, MemoryLimitMiB: 64},
 		Cases:         []bundle.Case{{ID: "case-01", Input: "cases/01.in", Output: "cases/01.out", Weight: 1}},
 	}
 	var archive bytes.Buffer

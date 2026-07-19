@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/CodeRushOJ/croj-judging-server/internal/bundle"
 )
 
 var (
@@ -88,6 +90,21 @@ type WorkerJobClaim struct {
 	AttemptNo  uint32
 	LeaseToken []byte
 	LeaseUntil time.Time
+}
+
+type WorkerBundleInput struct {
+	ObjectKey    string
+	SHA256       string
+	SizeBytes    int64
+	ManifestJSON []byte
+	Manifest     bundle.Manifest
+}
+
+type WorkerExecutionInput struct {
+	Language      string
+	SourceCode    []byte
+	StopOnFailure bool
+	Bundle        WorkerBundleInput
 }
 
 func (claim WorkerJobClaim) String() string {

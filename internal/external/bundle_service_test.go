@@ -287,8 +287,31 @@ func TestBundleServiceNeverPublishesUnownedFinalObject(t *testing.T) {
 	service := newTestBundleService(t, repository, store, t.TempDir(), 1<<20, bundle.DefaultArchiveLimits())
 
 	_, _, err := service.Upload(context.Background(), testTenantID, "upload-key-00001", bytes.NewReader(validExternalBundle(t, "input")))
-	if err == nil || len(store.objects) != 0 || store.publishes != 0 {
-		t.Fatalf("error=%v objects=%d publishes=%d", err, len(store.objects), store.publishes)
+	if err == nil || len(store.staged) != 1 || len(store.objects) != 0 || store.publishes != 0 {
+		t.Fatalf("error=%v staged=%d objects=%d publishes=%d", err, len(store.staged), len(store.objects), store.publishes)
+	}
+}
+
+func TestBundleServiceDiscardsStagingAfterDefinitiveCommitRejection(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{name: "invalid manifest or tenant limit", err: ErrInvalidBundle},
+		{name: "tenant disabled", err: fmt.Errorf("%w: tenant disabled", ErrBundleNotFound)},
+		{name: "tenant or resource not found", err: ErrBundleNotFound},
+		{name: "idempotency conflict", err: ErrIdempotencyConflict},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			repository := newMemoryBundleRepository()
+			repository.commitErr = test.err
+			store := &atomicMemoryObjectStore{}
+			service := newTestBundleService(t, repository, store, t.TempDir(), 1<<20, bundle.DefaultArchiveLimits())
+			_, _, err := service.Upload(context.Background(), testTenantID, "upload-key-00001", bytes.NewReader(validExternalBundle(t, "input")))
+			if !errors.Is(err, test.err) || len(store.staged) != 0 || len(store.objects) != 0 {
+				t.Fatalf("error=%v staged=%d objects=%d", err, len(store.staged), len(store.objects))
+			}
+		})
 	}
 }
 
@@ -576,7 +599,7 @@ func TestBundleServiceReusesHardenedArchiveValidation(t *testing.T) {
 }
 
 func TestBundleServiceRejectsManifestAboveExternalCaseLimit(t *testing.T) {
-	manifest := bundle.Manifest{SchemaVersion: 1, JudgeMode: bundle.JudgeModeACM, Checker: bundle.CheckerExact}
+	manifest := bundle.Manifest{SchemaVersion: 1, JudgeMode: bundle.JudgeModeACM, Checker: bundle.CheckerExact, Limits: bundle.Limits{TimeLimitMillis: 1000, MemoryLimitMiB: 256}}
 	entries := map[string]zipEntry{}
 	for index := range 257 {
 		id := fmt.Sprintf("case-%03d", index)
@@ -596,6 +619,33 @@ func TestBundleServiceRejectsManifestAboveExternalCaseLimit(t *testing.T) {
 	_, _, err = service.Upload(context.Background(), testTenantID, "upload-key-00001", bytes.NewReader(zipBytes(t, entries)))
 	if !errors.Is(err, ErrInvalidBundle) || repository.logicalCreates != 0 || len(store.objects) != 0 {
 		t.Fatalf("error=%v rows=%d objects=%d", err, repository.logicalCreates, len(store.objects))
+	}
+}
+
+func TestBundleServiceRejectsExecutionLimitsAbovePlatformMaximum(t *testing.T) {
+	repository := newMemoryBundleRepository()
+	store := &atomicMemoryObjectStore{}
+	service, err := NewBundleService(repository, store, BundleServiceConfig{
+		TempDir: t.TempDir(), MaxUploadBytes: 1 << 20, ArchiveLimits: bundle.DefaultArchiveLimits(),
+		MaxTimeLimitMillis: 1000, MaxMemoryLimitMiB: 128,
+		IdempotencyTTL: 24 * time.Hour, IdempotencyPepper: testIdempotencyPepper(), Random: rand.Reader,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, limits := range map[string]bundle.Limits{
+		"time":   {TimeLimitMillis: 1001, MemoryLimitMiB: 128},
+		"memory": {TimeLimitMillis: 1000, MemoryLimitMiB: 129},
+	} {
+		t.Run(name, func(t *testing.T) {
+			body := externalBundleWithLimits(t, "input", limits)
+			if _, _, err := service.Upload(context.Background(), testTenantID, "upload-limit-key-"+name, bytes.NewReader(body)); !errors.Is(err, ErrInvalidBundle) {
+				t.Fatalf("error=%v want ErrInvalidBundle", err)
+			}
+		})
+	}
+	if repository.logicalCreates != 0 || len(store.objects) != 0 {
+		t.Fatalf("over-limit bundle published: rows=%d objects=%d", repository.logicalCreates, len(store.objects))
 	}
 }
 
@@ -697,6 +747,7 @@ func newTestBundleService(t *testing.T, repository BundleRepository, store Bundl
 	t.Helper()
 	service, err := NewBundleService(repository, store, BundleServiceConfig{
 		TempDir: tempDir, MaxUploadBytes: maxUploadBytes, ArchiveLimits: limits,
+		MaxTimeLimitMillis: 60_000, MaxMemoryLimitMiB: 4096,
 		IdempotencyTTL: 24 * time.Hour, IdempotencyPepper: testIdempotencyPepper(), Random: rand.Reader,
 	})
 	if err != nil {
@@ -716,16 +767,24 @@ type zipEntry struct {
 }
 
 func validExternalBundle(t *testing.T, input string) []byte {
+	return externalBundleWithLimits(t, input, bundle.Limits{TimeLimitMillis: 1000, MemoryLimitMiB: 256})
+}
+
+func externalBundleWithLimits(t *testing.T, input string, limits bundle.Limits) []byte {
 	t.Helper()
-	manifest := manifestJSON(t, "cases/1.in", "cases/1.out")
+	manifest := manifestJSONWithLimits(t, "cases/1.in", "cases/1.out", limits)
 	return zipBytes(t, map[string]zipEntry{
 		"manifest.json": {body: manifest}, "cases/1.in": {body: []byte(input)}, "cases/1.out": {body: []byte("answer")},
 	})
 }
 
 func manifestJSON(t *testing.T, input, output string) []byte {
+	return manifestJSONWithLimits(t, input, output, bundle.Limits{TimeLimitMillis: 1000, MemoryLimitMiB: 256})
+}
+
+func manifestJSONWithLimits(t *testing.T, input, output string, limits bundle.Limits) []byte {
 	t.Helper()
-	data, err := json.Marshal(bundle.Manifest{SchemaVersion: 1, JudgeMode: bundle.JudgeModeACM, Checker: bundle.CheckerExact, Cases: []bundle.Case{{ID: "case-1", Input: input, Output: output, Weight: 1}}})
+	data, err := json.Marshal(bundle.Manifest{SchemaVersion: 1, JudgeMode: bundle.JudgeModeACM, Checker: bundle.CheckerExact, Limits: limits, Cases: []bundle.Case{{ID: "case-1", Input: input, Output: output, Weight: 1}}})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -23,6 +23,8 @@ type TenantPolicy struct {
 	MaxRetainedBundles     int   `json:"maxRetainedBundles"`
 	DailyExecutionMillis   int64 `json:"dailyExecutionMillis"`
 	MaxInfrastructureTries int   `json:"maxInfrastructureTries"`
+	MaxTimeLimitMillis     int   `json:"maxTimeLimitMillis"`
+	MaxMemoryLimitMiB      int   `json:"maxMemoryLimitMiB"`
 }
 
 func (policy TenantPolicy) validate() error {
@@ -34,6 +36,9 @@ func (policy TenantPolicy) validate() error {
 	}
 	if policy.MaxInfrastructureTries <= 0 || policy.MaxInfrastructureTries > 10 {
 		return fmt.Errorf("infrastructure attempt limit must be between 1 and 10")
+	}
+	if policy.MaxTimeLimitMillis <= 0 || policy.MaxMemoryLimitMiB <= 0 {
+		return fmt.Errorf("maximum execution time and memory limits must be positive")
 	}
 	return nil
 }

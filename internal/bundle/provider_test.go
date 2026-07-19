@@ -47,6 +47,27 @@ func TestProviderClassifiesBadBundleAsInvalid(t *testing.T) {
 	}
 }
 
+func TestProviderOpensExternalMetadataWithoutProblemVersionModel(t *testing.T) {
+	zipPath := writeZIP(t, []zipEntry{{name: "manifest.json", body: validManifest}, {name: "cases/01.in", body: "in"}, {name: "cases/01.out", body: "out"}})
+	data, err := os.ReadFile(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &fakeObjectStore{objects: map[string][]byte{"external.zip": data}}
+	cache, err := NewCache(t.TempDir(), 1<<20, 1<<20, time.Hour, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := NewProvider(cache, DefaultArchiveLimits()).OpenMetadata(context.Background(), cacheMetadata("external.zip", data), []byte(validManifest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer artifact.Close()
+	if artifact.Manifest().Limits.TimeLimitMillis != 1500 || artifact.Manifest().Limits.MemoryLimitMiB != 256 {
+		t.Fatalf("manifest limits = %+v", artifact.Manifest().Limits)
+	}
+}
+
 func modelMetadata(key string, data []byte, manifest string) *model.TestBundle {
 	metadata := cacheMetadata(key, data)
 	return &model.TestBundle{

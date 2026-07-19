@@ -262,7 +262,7 @@ func TestBundlePipelineKeepsExhaustedTransportFailuresRetryable(t *testing.T) {
 }
 
 func exactArtifact(count int) *memoryArtifact {
-	manifest := bundle.Manifest{SchemaVersion: 1, JudgeMode: bundle.JudgeModeACM, Checker: bundle.CheckerExact}
+	manifest := bundle.Manifest{SchemaVersion: 1, JudgeMode: bundle.JudgeModeACM, Checker: bundle.CheckerExact, Limits: bundle.Limits{TimeLimitMillis: 1000, MemoryLimitMiB: 64}}
 	contents := make(map[string]string)
 	for index := 1; index <= count; index++ {
 		id := string(rune('0' + index))

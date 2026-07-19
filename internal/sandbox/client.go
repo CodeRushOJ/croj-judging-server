@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
 	sandboxpb "github.com/CodeRushOJ/croj-judging-server/proto"
 	"google.golang.org/grpc"
+	_ "google.golang.org/grpc/balancer/roundrobin"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/proto"
 )
@@ -203,9 +205,16 @@ func (c *Client) acquire(address string) (*connectionEntry, error) {
 	if len(c.conns) >= c.maxConns {
 		return nil, fmt.Errorf("sandbox connection cache is full")
 	}
-	// EndpointSlice returns an already-resolved Pod address. Passthrough avoids
-	// sending that address through gRPC's default DNS resolver a second time.
-	connection, err := grpc.NewClient("passthrough:///"+address, c.dialOptions...)
+	// URI targets (the production default is dns:/// for a headless Service)
+	// must reach gRPC's resolver and round_robin balancer unchanged. Deprecated
+	// direct EndpointSlice addresses retain passthrough compatibility.
+	target := address
+	if !strings.Contains(address, ":///") {
+		target = "passthrough:///" + address
+	}
+	options := append([]grpc.DialOption(nil), c.dialOptions...)
+	options = append(options, grpc.WithDefaultServiceConfig(`{"loadBalancingConfig":[{"round_robin":{}}]}`))
+	connection, err := grpc.NewClient(target, options...)
 	if err != nil {
 		return nil, fmt.Errorf("create gRPC client for sandbox %s: %w", address, err)
 	}

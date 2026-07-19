@@ -38,8 +38,12 @@ test-bundles:
   max-uncompressed-bytes: 536870912
   max-compression-ratio: 200
   max-infra-attempts: 3
+  max-time-limit-millis: 10000
+  max-memory-limit-mib: 1024
 
 sandbox-discovery:
+  target: "dns:///sandbox-workers.coderushoj.svc.cluster.local:50051"
+  allow-legacy-endpoint-slice: false
   namespace: "coderushoj"
   service: "croj-sandbox"
   port-name: "grpc"
@@ -48,3 +52,31 @@ sandbox-discovery:
   max-connections: 128
   connection-idle-ttl: "5m"
   kubeconfig: ""
+
+# Disabled by default. Enabling this listener also enables durable REST workers
+# and requires MySQL schema v3, Redis, MinIO, source encryption keys, and DNS.
+external-api:
+  enabled: false
+  listen-address: "127.0.0.1:8081"
+  worker-id: "judge-external"
+  worker-concurrency: 2
+  lease-duration: "30s"
+  heartbeat-interval: "10s"
+  control-poll-interval: "1s"
+  idle-backoff: "250ms"
+  retry-delay: "5s"
+  shutdown-timeout: "20s"
+  readiness-timeout: "2s"
+  redis-address: "coderushoj-infra-redis.coderushoj.svc:6379"
+  redis-password: ""
+  redis-db: 0
+  redis-quota-prefix: "coderushoj"
+  auth-pepper-base64: ""
+  idempotency-pepper-base64: ""
+  cursor-key-base64: ""
+  source-key-base64: ""
+  source-key-version: 1
+  idempotency-ttl: "24h"
+  quota-refill-period: "1m"
+  job-submit-capacity: 1000
+  bundle-byte-capacity: 536870912

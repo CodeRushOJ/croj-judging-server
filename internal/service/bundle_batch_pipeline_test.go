@@ -52,7 +52,7 @@ func (executor *sequenceBatchExecutor) ExecuteBatch(_ context.Context, address s
 
 func TestBatchBundlePipelineRejectsOversizedBatchBeforeSandbox(t *testing.T) {
 	artifact := &memoryArtifact{
-		manifest: bundle.Manifest{SchemaVersion: 1, JudgeMode: bundle.JudgeModeACM, Checker: bundle.CheckerExact},
+		manifest: bundle.Manifest{SchemaVersion: 1, JudgeMode: bundle.JudgeModeACM, Checker: bundle.CheckerExact, Limits: bundle.Limits{TimeLimitMillis: 1000, MemoryLimitMiB: 64}},
 		contents: map[string]string{},
 	}
 	for index := 0; index < 257; index++ {
@@ -97,7 +97,7 @@ func TestBatchBundlePipelineStopsReadingCasesWhenWireLimitIsCrossed(t *testing.T
 func TestBatchBundlePipelineRetainsOnlyHashesForLargeTokenOutputs(t *testing.T) {
 	const caseCount = 64
 	artifact := &countingArtifact{memoryArtifact: &memoryArtifact{
-		manifest: bundle.Manifest{SchemaVersion: 1, JudgeMode: bundle.JudgeModeACM, Checker: bundle.CheckerToken},
+		manifest: bundle.Manifest{SchemaVersion: 1, JudgeMode: bundle.JudgeModeACM, Checker: bundle.CheckerToken, Limits: bundle.Limits{TimeLimitMillis: 1000, MemoryLimitMiB: 64}},
 		contents: make(map[string]string, caseCount*2),
 	}}
 	largeToken := strings.Repeat("x", 256<<10)
@@ -184,6 +184,26 @@ func TestBatchBundlePipelineSendsAllCasesInOneCompileOnceRequest(t *testing.T) {
 	}
 	if !executor.requests[0].Cases[0].CompareOutput || executor.requests[0].Cases[0].ExpectedOutput != "one\n" {
 		t.Fatalf("exact case contract = %+v", executor.requests[0].Cases[0])
+	}
+}
+
+func TestBatchBundlePipelineCanonicalRequestUsesBundleLimitsAndStopPolicy(t *testing.T) {
+	artifact := exactArtifact(1)
+	artifact.manifest.Limits = bundle.Limits{TimeLimitMillis: 1500, MemoryLimitMiB: 512}
+	executor := &batchExecutorStub{events: []*sandboxpb.ExecuteBatchV1Event{
+		{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT, CaseId: "case-1", Result: &sandboxpb.ExecuteResponse{Status: "Accepted", Stdout: "one"}},
+		{Kind: sandboxpb.ExecuteBatchV1Event_COMPLETED},
+	}}
+	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"dns:///sandbox-workers.coderushoj.svc.cluster.local:50051"}}, executor, 1)
+	result, err := pipeline.ExecuteCanonical(context.Background(), CanonicalExecutionRequest{
+		Language: "cpp20", SourceCode: "int main(){}", StopOnFailure: false,
+	}, artifact)
+	if err != nil || result.Status != callback.StatusAccepted || len(result.Cases) != 1 || result.Cases[0].CaseID != "case-1" || result.Cases[0].Status != callback.StatusAccepted {
+		t.Fatalf("result=%+v error=%v", result, err)
+	}
+	request := executor.requests[0]
+	if request.Language != "cpp20" || request.SourceCode != "int main(){}" || request.Timeout != 2 || request.MemoryLimit != 512 || request.StopOnFailure {
+		t.Fatalf("canonical sandbox request = %+v", request)
 	}
 }
 

@@ -439,6 +439,76 @@ func TestMySQLWorkerLoadsAuthenticatedSourceForItsClaim(t *testing.T) {
 	}
 }
 
+func TestMySQLWorkerLoadsCanonicalInputOnlyForActiveClaim(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	tenantID := strings.Repeat("i", 26)
+	bundleID := strings.Repeat("j", 26)
+	secondBundleID := strings.Repeat("l", 26)
+	insertTenantBundleAndCallback(t, database, tenantID, bundleID, "", 2)
+	insertBundleForTenant(t, database, tenantID, secondBundleID, 2750, 640)
+	repository := newTestMySQLJobRepository(t, database, newMemorySourceStore())
+	plaintext := []byte("package main")
+	if _, err := repository.Submit(context.Background(), tenantID, "canonical-input-key", JudgeJobRequest{
+		BundleID: bundleID, Language: "go126", SourceCode: plaintext, StopOnFailure: false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := repository.ClaimNext(context.Background(), "canonical-worker", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input, err := repository.LoadClaimInput(context.Background(), claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(input.SourceCode, plaintext) || input.Language != "go126" || input.StopOnFailure ||
+		input.Bundle.ObjectKey == "" || input.Bundle.Manifest.Limits.TimeLimitMillis != 1000 || input.Bundle.Manifest.Limits.MemoryLimitMiB != 256 {
+		t.Fatalf("canonical input = %+v", input)
+	}
+	stale := claim
+	stale.AttemptNo++
+	if _, err := repository.LoadClaimInput(context.Background(), stale); !errors.Is(err, ErrStaleJobClaim) {
+		t.Fatalf("stale input error = %v", err)
+	}
+	if cancelled, err := repository.ClaimCancelled(context.Background(), claim); err != nil || cancelled {
+		t.Fatalf("initial cancellation=%v error=%v", cancelled, err)
+	}
+	if _, err := repository.Cancel(context.Background(), tenantID, claim.Job.ExternalID); err != nil {
+		t.Fatal(err)
+	}
+	if cancelled, err := repository.ClaimCancelled(context.Background(), claim); err != nil || !cancelled {
+		t.Fatalf("requested cancellation=%v error=%v", cancelled, err)
+	}
+	if _, err := repository.ClaimCancelled(context.Background(), stale); !errors.Is(err, ErrStaleJobClaim) {
+		t.Fatalf("stale cancellation control error = %v", err)
+	}
+	if err := repository.Complete(context.Background(), claim, DurableJobResult{Verdict: "ACCEPTED", CompileStatus: "SUCCEEDED"}); err != nil {
+		t.Fatal(err)
+	}
+	cancelledJob, err := repository.Get(context.Background(), tenantID, claim.Job.ExternalID)
+	if err != nil || cancelledJob.Status != JobStatusCancelled || cancelledJob.Result != nil {
+		t.Fatalf("cancelled completion persisted stale result: job=%+v error=%v", cancelledJob, err)
+	}
+
+	if _, err := repository.Submit(context.Background(), tenantID, "second-canonical-input", JudgeJobRequest{
+		BundleID: secondBundleID, Language: "go126", SourceCode: plaintext, StopOnFailure: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	secondClaim, err := repository.ClaimNext(context.Background(), "canonical-worker-2", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondInput, err := repository.LoadClaimInput(context.Background(), secondClaim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondInput.Bundle.Manifest.Limits.TimeLimitMillis != 2750 || secondInput.Bundle.Manifest.Limits.MemoryLimitMiB != 640 || !secondInput.StopOnFailure {
+		t.Fatalf("second bundle canonical input = %+v", secondInput)
+	}
+}
+
 func TestMySQLWorkerInfrastructureRetryAndCancellationRecovery(t *testing.T) {
 	database := openMySQLIntegration(t)
 	prepareExternalJobDatabase(t, database)
