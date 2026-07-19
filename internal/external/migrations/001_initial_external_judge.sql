@@ -1,0 +1,182 @@
+CREATE TABLE IF NOT EXISTS t_external_tenant (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    external_id CHAR(26) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    name VARCHAR(128) NOT NULL,
+    status VARCHAR(16) NOT NULL DEFAULT 'ACTIVE',
+    policy_json JSON NOT NULL,
+    created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_external_tenant_external_id (external_id),
+    CONSTRAINT chk_external_tenant_status CHECK (status IN ('ACTIVE','DISABLED'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+-- migrate:split
+CREATE TABLE IF NOT EXISTS t_external_api_key (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    tenant_id BIGINT UNSIGNED NOT NULL,
+    lookup_prefix VARCHAR(24) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    key_digest BINARY(32) NOT NULL,
+    scopes_json JSON NOT NULL,
+    expires_at DATETIME(3) NULL,
+    revoked_at DATETIME(3) NULL,
+    last_used_at DATETIME(3) NULL,
+    created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_external_api_key_prefix (lookup_prefix),
+    KEY idx_external_api_key_tenant (tenant_id),
+    CONSTRAINT fk_external_api_key_tenant FOREIGN KEY (tenant_id) REFERENCES t_external_tenant(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+-- migrate:split
+CREATE TABLE IF NOT EXISTS t_external_callback (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    external_id CHAR(26) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    tenant_id BIGINT UNSIGNED NOT NULL,
+    destination_url VARCHAR(2048) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    allowed_host VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    allowed_port SMALLINT UNSIGNED NOT NULL DEFAULT 443,
+    secret_ciphertext VARBINARY(2048) NOT NULL,
+    secret_key_version SMALLINT UNSIGNED NOT NULL,
+    disabled_at DATETIME(3) NULL,
+    created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_external_callback_external_id (external_id),
+    KEY idx_external_callback_tenant (tenant_id),
+    CONSTRAINT fk_external_callback_tenant FOREIGN KEY (tenant_id) REFERENCES t_external_tenant(id),
+    CONSTRAINT chk_external_callback_port CHECK (allowed_port > 0)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+-- migrate:split
+CREATE TABLE IF NOT EXISTS t_external_bundle (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    external_id CHAR(26) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    tenant_id BIGINT UNSIGNED NOT NULL,
+    sha256 BINARY(32) NOT NULL,
+    object_key VARCHAR(1024) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    size_bytes BIGINT UNSIGNED NOT NULL,
+    case_count SMALLINT UNSIGNED NOT NULL,
+    manifest_version SMALLINT UNSIGNED NOT NULL,
+    manifest_json JSON NOT NULL,
+    created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    delete_marked_at DATETIME(3) NULL,
+    deleted_at DATETIME(3) NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_external_bundle_external_id (external_id),
+    UNIQUE KEY uk_external_bundle_tenant_digest (tenant_id, sha256),
+    CONSTRAINT fk_external_bundle_tenant FOREIGN KEY (tenant_id) REFERENCES t_external_tenant(id),
+    CONSTRAINT chk_external_bundle_size CHECK (size_bytes > 0),
+    CONSTRAINT chk_external_bundle_cases CHECK (case_count > 0)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+-- migrate:split
+CREATE TABLE IF NOT EXISTS t_external_source_object (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    external_id CHAR(26) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    tenant_id BIGINT UNSIGNED NOT NULL,
+    object_key VARCHAR(1024) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    source_sha256 BINARY(32) NOT NULL,
+    source_size_bytes BIGINT UNSIGNED NOT NULL,
+    encryption_key_version SMALLINT UNSIGNED NOT NULL,
+    encryption_nonce BINARY(12) NOT NULL,
+    created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    delete_marked_at DATETIME(3) NULL,
+    deleted_at DATETIME(3) NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_external_source_external_id (external_id),
+    UNIQUE KEY uk_external_source_object_key (object_key),
+    KEY idx_external_source_tenant (tenant_id),
+    CONSTRAINT fk_external_source_tenant FOREIGN KEY (tenant_id) REFERENCES t_external_tenant(id),
+    CONSTRAINT chk_external_source_size CHECK (source_size_bytes > 0)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+-- migrate:split
+CREATE TABLE IF NOT EXISTS t_external_job (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    external_id CHAR(26) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    tenant_id BIGINT UNSIGNED NOT NULL,
+    bundle_id BIGINT UNSIGNED NOT NULL,
+    source_object_id BIGINT UNSIGNED NOT NULL,
+    callback_id BIGINT UNSIGNED NULL,
+    status VARCHAR(16) NOT NULL,
+    language_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    stop_on_failure BOOLEAN NOT NULL DEFAULT TRUE,
+    client_reference VARCHAR(255) NULL,
+    request_hash BINARY(32) NOT NULL,
+    attempt_no INT UNSIGNED NOT NULL DEFAULT 0,
+    worker_id VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NULL,
+    lease_until DATETIME(3) NULL,
+    next_attempt_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    cancel_requested_at DATETIME(3) NULL,
+    result_json JSON NULL,
+    failure_code VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL,
+    created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    started_at DATETIME(3) NULL,
+    completed_at DATETIME(3) NULL,
+    updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_external_job_external_id (external_id),
+    KEY idx_external_job_claim (status, next_attempt_at, lease_until, created_at, id),
+    KEY idx_external_job_tenant_list (tenant_id, created_at, id),
+    CONSTRAINT fk_external_job_tenant FOREIGN KEY (tenant_id) REFERENCES t_external_tenant(id),
+    CONSTRAINT fk_external_job_bundle FOREIGN KEY (bundle_id) REFERENCES t_external_bundle(id),
+    CONSTRAINT fk_external_job_source FOREIGN KEY (source_object_id) REFERENCES t_external_source_object(id),
+    CONSTRAINT fk_external_job_callback FOREIGN KEY (callback_id) REFERENCES t_external_callback(id),
+    CONSTRAINT chk_external_job_status CHECK (status IN ('QUEUED','RUNNING','SUCCEEDED','FAILED','CANCELLED'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+-- migrate:split
+CREATE TABLE IF NOT EXISTS t_external_job_attempt (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    job_id BIGINT UNSIGNED NOT NULL,
+    attempt_no INT UNSIGNED NOT NULL,
+    worker_id VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    lease_until DATETIME(3) NOT NULL,
+    started_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    finished_at DATETIME(3) NULL,
+    failure_code VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_external_job_attempt (job_id, attempt_no),
+    KEY idx_external_attempt_lease (status, lease_until),
+    CONSTRAINT fk_external_attempt_job FOREIGN KEY (job_id) REFERENCES t_external_job(id),
+    CONSTRAINT chk_external_attempt_number CHECK (attempt_no > 0),
+    CONSTRAINT chk_external_attempt_status CHECK (status IN ('RUNNING','SUCCEEDED','FAILED','CANCELLED','EXPIRED'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+-- migrate:split
+CREATE TABLE IF NOT EXISTS t_external_idempotency (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    tenant_id BIGINT UNSIGNED NOT NULL,
+    operation_scope VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    key_digest BINARY(32) NOT NULL,
+    request_hash BINARY(32) NOT NULL,
+    resource_type VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    resource_external_id CHAR(26) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    response_status SMALLINT UNSIGNED NOT NULL,
+    response_json JSON NOT NULL,
+    created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    expires_at DATETIME(3) NOT NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_external_idempotency_tenant_scope_key (tenant_id, operation_scope, key_digest),
+    KEY idx_external_idempotency_expiry (expires_at),
+    CONSTRAINT fk_external_idempotency_tenant FOREIGN KEY (tenant_id) REFERENCES t_external_tenant(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+-- migrate:split
+CREATE TABLE IF NOT EXISTS t_external_webhook_outbox (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    event_id CHAR(26) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    tenant_id BIGINT UNSIGNED NOT NULL,
+    job_id BIGINT UNSIGNED NOT NULL,
+    callback_id BIGINT UNSIGNED NOT NULL,
+    event_type VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    payload_json JSON NOT NULL,
+    status VARCHAR(16) NOT NULL DEFAULT 'PENDING',
+    attempt_count INT UNSIGNED NOT NULL DEFAULT 0,
+    next_attempt_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    last_http_status SMALLINT UNSIGNED NULL,
+    last_error_code VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL,
+    created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    delivered_at DATETIME(3) NULL,
+    expires_at DATETIME(3) NOT NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_external_webhook_event (event_id),
+    KEY idx_external_webhook_delivery (status, next_attempt_at, id),
+    CONSTRAINT fk_external_webhook_tenant FOREIGN KEY (tenant_id) REFERENCES t_external_tenant(id),
+    CONSTRAINT fk_external_webhook_job FOREIGN KEY (job_id) REFERENCES t_external_job(id),
+    CONSTRAINT fk_external_webhook_callback FOREIGN KEY (callback_id) REFERENCES t_external_callback(id),
+    CONSTRAINT chk_external_webhook_status CHECK (status IN ('PENDING','DELIVERED','FAILED'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
