@@ -14,7 +14,7 @@ func TestEmbeddedMigrationsDefineTheCompleteJudgeOwnedSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(migrations) != 3 || migrations[0].Version != 1 || migrations[0].Name != "initial_external_judge" || migrations[1].Version != 2 || migrations[1].Name != "external_bundle_ready" || migrations[2].Version != 3 || migrations[2].Name != "durable_job_fencing" {
+	if len(migrations) != 4 || migrations[0].Version != 1 || migrations[0].Name != "initial_external_judge" || migrations[1].Version != 2 || migrations[1].Name != "external_bundle_ready" || migrations[2].Version != 3 || migrations[2].Name != "durable_job_fencing" || migrations[3].Version != 4 || migrations[3].Name != "durable_webhook_outbox" {
 		t.Fatalf("migrations = %+v", migrations)
 	}
 	if len(migrations[0].Checksum) != 64 {
@@ -101,6 +101,32 @@ func TestDurableJobFencingMigrationAddsTenantBoundLeaseTokens(t *testing.T) {
 	}
 }
 
+func TestDurableWebhookMigrationDefinesFencedOutboxAndDisablesLegacyCallbacks(t *testing.T) {
+	migrations, err := Migrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(migrations) != 4 || migrations[3].Version != 4 || migrations[3].Name != "durable_webhook_outbox" {
+		t.Fatalf("migrations = %+v", migrations)
+	}
+	sql := strings.ToLower(migrations[3].SQL)
+	for _, contract := range []string{
+		"add column secret_nonce binary(12)",
+		"set disabled_at = coalesce(disabled_at, current_timestamp(3))",
+		"add column payload_body mediumblob",
+		"add column worker_id varchar(128)",
+		"add column lease_token binary(32)",
+		"add column lease_until datetime(3)",
+		"add column dead_at datetime(3)",
+		"unique key uk_external_webhook_job (job_id)",
+		"check (status in ('pending','delivering','delivered','dead'))",
+	} {
+		if !strings.Contains(sql, contract) {
+			t.Errorf("migration is missing contract %q", contract)
+		}
+	}
+}
+
 func TestMigrationStatementsAreExplicitAndReplaySafe(t *testing.T) {
 	migrations, err := Migrations()
 	if err != nil {
@@ -161,7 +187,7 @@ func TestApplyMigrationsUsesAnAdvisoryLockAndRecordsChecksums(t *testing.T) {
 		t.Fatalf("first execution = %s", connection.executions[0].query)
 	}
 	last := connection.executions[len(connection.executions)-1]
-	if !strings.Contains(strings.ToLower(last.query), "insert into t_judge_schema_history") || fmt.Sprint(last.arguments) != fmt.Sprint([]any{3, "durable_job_fencing", migrations[2].Checksum}) {
+	if !strings.Contains(strings.ToLower(last.query), "insert into t_judge_schema_history") || fmt.Sprint(last.arguments) != fmt.Sprint([]any{4, "durable_webhook_outbox", migrations[3].Checksum}) {
 		t.Fatalf("history execution = %#v", last)
 	}
 }
