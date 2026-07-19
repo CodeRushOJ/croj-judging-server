@@ -317,8 +317,15 @@ func (store *integrationFileObjectStore) Discard(_ context.Context, key string) 
 
 func TestExternalBundleUploadHTTPIntegration(t *testing.T) {
 	tenantID := "aaaaaaaaaaaaaaaaaaaaaaaaaa"
-	pepper := []byte("0123456789abcdef0123456789abcdef")
-	secret := base64.RawURLEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
+	pepper := make([]byte, sha256.Size)
+	secretBytes := make([]byte, sha256.Size)
+	if _, err := rand.Read(pepper); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rand.Read(secretBytes); err != nil {
+		t.Fatal(err)
+	}
+	secret := base64.RawURLEncoding.EncodeToString(secretBytes)
 	key := "croj_public12_" + secret
 	digest := hmac.New(sha256.New, pepper)
 	_, _ = digest.Write([]byte(key))

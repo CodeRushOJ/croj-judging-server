@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -47,6 +48,23 @@ func TestAuthenticatorAcceptsOnlyAValidActivePepperedOpaqueKey(t *testing.T) {
 	}
 	if store.prefix != "public12" {
 		t.Fatalf("lookup prefix = %q", store.prefix)
+	}
+}
+
+func TestAuthenticatorAcceptsGeneratedBase64URLSecretContainingUnderscore(t *testing.T) {
+	pepper := bytes.Repeat([]byte{0x41}, sha256.Size)
+	secret := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0xff}, sha256.Size))
+	key := "croj_public12_" + secret
+	store := &credentialStoreStub{credential: &Credential{
+		TenantID: "tenant-7", Digest: keyDigest(pepper, key), Scopes: []Scope{ScopeBundleWrite},
+	}}
+	authenticator, err := NewAuthenticator(store, pepper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal, err := authenticator.Authenticate(context.Background(), "Bearer "+key)
+	if err != nil || principal.TenantID != "tenant-7" || !principal.Has(ScopeBundleWrite) {
+		t.Fatalf("principal=%+v error=%v", principal, err)
 	}
 }
 
