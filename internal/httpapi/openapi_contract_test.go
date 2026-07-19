@@ -430,6 +430,23 @@ func TestLiveResponseHeaderValidationRejectsSensitiveValues(t *testing.T) {
 	}
 }
 
+func TestLiveResponseHeaderValidationRequiresExactlyOneNoStoreCacheControl(t *testing.T) {
+	document := loadOpenAPIContract(t)
+	documented := operation(t, document, "/api/v1/capabilities", http.MethodGet).Responses.Status(http.StatusOK)
+	for name, actual := range map[string]http.Header{
+		"missing":  {},
+		"wrong":    {"Cache-Control": {"public"}},
+		"repeated": {"Cache-Control": {"no-store", "no-store"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			findings := strings.Join(liveResponseHeaderFindings(actual, documented.Value), "\n")
+			if !strings.Contains(findings, `live response must contain exactly one Cache-Control value "no-store"`) {
+				t.Fatalf("invalid Cache-Control was not rejected:\n%s", findings)
+			}
+		})
+	}
+}
+
 type emptyCredentialStore struct{}
 
 func (emptyCredentialStore) FindCredentialByPrefix(context.Context, string) (*Credential, error) {
@@ -838,6 +855,10 @@ func liveResponseHeaderFindings(actual http.Header, documented *openapi3.Respons
 		return []string{"OpenAPI response is missing"}
 	}
 	var findings []string
+	cacheControl := responseHeaderValues(actual, "Cache-Control")
+	if len(cacheControl) != 1 || cacheControl[0] != "no-store" {
+		findings = append(findings, `live response must contain exactly one Cache-Control value "no-store"`)
+	}
 	names := make([]string, 0, len(actual))
 	for name := range actual {
 		names = append(names, name)
@@ -867,6 +888,16 @@ func liveResponseHeaderFindings(actual http.Header, documented *openapi3.Respons
 		}
 	}
 	return findings
+}
+
+func responseHeaderValues(actual http.Header, name string) []string {
+	var values []string
+	for actualName, actualValues := range actual {
+		if strings.EqualFold(actualName, name) {
+			values = append(values, actualValues...)
+		}
+	}
+	return values
 }
 
 func implicitHTTPResponseHeader(name string) bool {
