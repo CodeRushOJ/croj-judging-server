@@ -63,7 +63,7 @@ func (job *DurableJob) Claim(workerID string, now time.Time, leaseDuration time.
 	}
 	claimable := job.Status == JobStatusQueued && !job.NextAttemptAt.After(now)
 	claimable = claimable || job.Status == JobStatusRunning && !job.LeaseUntil.After(now)
-	if !claimable || job.CancelRequestedAt != nil || job.AttemptNo == ^uint32(0) {
+	if !claimable || job.Status == JobStatusQueued && job.CancelRequestedAt != nil || job.AttemptNo == ^uint32(0) {
 		return JobClaim{}, ErrJobNotClaimable
 	}
 	job.AttemptNo++
