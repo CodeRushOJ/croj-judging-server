@@ -207,6 +207,27 @@ func TestBatchBundlePipelineCanonicalRequestUsesBundleLimitsAndStopPolicy(t *tes
 	}
 }
 
+func TestBatchBundlePipelineKeepsOrderedResultsWhenStopOnFailureIsDisabled(t *testing.T) {
+	executor := &batchExecutorStub{events: []*sandboxpb.ExecuteBatchV1Event{
+		{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT, CaseId: "case-1", Result: &sandboxpb.ExecuteResponse{Status: "Accepted", Stdout: "wrong", TimeUsed: 8, MemoryUsed: 100}},
+		{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT, CaseId: "case-2", Result: &sandboxpb.ExecuteResponse{Status: "Accepted", Stdout: "two", TimeUsed: 11, MemoryUsed: 120}},
+		{Kind: sandboxpb.ExecuteBatchV1Event_COMPLETED},
+	}}
+	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a"}}, executor, 1)
+	result, err := pipeline.ExecuteCanonical(context.Background(), CanonicalExecutionRequest{
+		Language: "cpp20", SourceCode: "int main(){}", StopOnFailure: false,
+	}, exactArtifact(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != callback.StatusWrongAnswer || len(result.Cases) != 2 ||
+		result.Cases[0].CaseID != "case-1" || result.Cases[0].Status != callback.StatusWrongAnswer ||
+		result.Cases[1].CaseID != "case-2" || result.Cases[1].Status != callback.StatusAccepted ||
+		result.TimeUsedMillis != 11 || result.MemoryUsedKB != 120 {
+		t.Fatalf("canonical result = %+v", result)
+	}
+}
+
 func TestBatchBundlePipelineRetriesWholeBatchOnCapacityFailure(t *testing.T) {
 	executor := &sequenceBatchExecutor{
 		errors: []error{status.Error(codes.ResourceExhausted, "busy"), nil},
