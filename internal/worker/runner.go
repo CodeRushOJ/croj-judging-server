@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/CodeRushOJ/croj-judging-server/internal/bundle"
@@ -71,7 +72,7 @@ func (runner *Runner) ExecuteClaim(ctx context.Context, claim external.WorkerJob
 	cancel()
 
 	if errors.Is(controlErr, errCancellationRequested) {
-		return runner.complete(ctx, claim, service.CanonicalResult{Status: callback.StatusSystemError})
+		return runner.completeCancellation(ctx, claim)
 	}
 	if controlErr != nil {
 		if ctx.Err() != nil {
@@ -105,7 +106,7 @@ func (runner *Runner) executeControlled(ctx context.Context, claim external.Work
 	}, input.Bundle.ManifestJSON)
 	if err != nil {
 		if bundle.IsInvalid(err) {
-			return service.CanonicalResult{Status: callback.StatusSystemError}, "", nil
+			return service.CanonicalResult{}, "LOAD_BUNDLE_INVALID", err
 		}
 		return service.CanonicalResult{}, "LOAD_BUNDLE_FAILED", err
 	}
@@ -114,6 +115,16 @@ func (runner *Runner) executeControlled(ctx context.Context, claim external.Work
 		Language: input.Language, SourceCode: string(input.SourceCode), StopOnFailure: input.StopOnFailure,
 	}, artifact)
 	return result, "SANDBOX_EXECUTION_FAILED", err
+}
+
+func (runner *Runner) completeCancellation(ctx context.Context, claim external.WorkerJobClaim) error {
+	// Complete rechecks cancel_requested_at under the lease fence and discards this
+	// valid placeholder instead of persisting a contestant result.
+	err := runner.repository.Complete(ctx, claim, external.DurableJobResult{Verdict: string(callback.StatusAccepted), CompileStatus: "SUCCEEDED"})
+	if errors.Is(err, external.ErrStaleJobClaim) {
+		return nil
+	}
+	return err
 }
 
 func (runner *Runner) Run(ctx context.Context, workerID string, idleBackoff time.Duration) error {
@@ -148,42 +159,61 @@ func (runner *Runner) Run(ctx context.Context, workerID string, idleBackoff time
 }
 
 func (runner *Runner) monitorClaim(ctx context.Context, cancel context.CancelFunc, claim external.WorkerJobClaim, done <-chan struct{}, result chan<- error) {
-	heartbeat := time.NewTicker(runner.config.HeartbeatInterval)
-	control := time.NewTicker(runner.config.ControlPollInterval)
-	defer heartbeat.Stop()
-	defer control.Stop()
-	checkCancellation := func() error {
-		cancelled, err := runner.repository.ClaimCancelled(ctx, claim)
-		if err != nil {
-			return err
-		}
-		if cancelled {
-			cancel()
-			return errCancellationRequested
-		}
-		return nil
+	monitorContext, stopMonitor := context.WithCancel(ctx)
+	events := make(chan error, 2)
+	var loops sync.WaitGroup
+	loops.Add(2)
+	go func() { defer loops.Done(); runner.heartbeatLoop(monitorContext, claim, events) }()
+	go func() { defer loops.Done(); runner.controlLoop(monitorContext, claim, events) }()
+	var monitorErr error
+	select {
+	case <-done:
+	case <-ctx.Done():
+		monitorErr = ctx.Err()
+	case monitorErr = <-events:
+		cancel()
 	}
-	if err := checkCancellation(); err != nil {
-		result <- err
-		return
-	}
+	stopMonitor()
+	loops.Wait()
+	result <- monitorErr
+}
+
+func (runner *Runner) heartbeatLoop(ctx context.Context, claim external.WorkerJobClaim, events chan<- error) {
+	ticker := time.NewTicker(runner.config.HeartbeatInterval)
+	defer ticker.Stop()
 	for {
 		select {
-		case <-done:
-			result <- nil
-			return
 		case <-ctx.Done():
-			result <- ctx.Err()
 			return
-		case <-heartbeat.C:
-			if err := runner.repository.Heartbeat(ctx, claim, runner.config.LeaseDuration); err != nil {
-				cancel()
-				result <- err
+		case <-ticker.C:
+			callContext, cancel := context.WithTimeout(ctx, runner.config.HeartbeatInterval)
+			err := runner.repository.Heartbeat(callContext, claim, runner.config.LeaseDuration)
+			cancel()
+			if err != nil {
+				events <- err
 				return
 			}
-		case <-control.C:
-			if err := checkCancellation(); err != nil {
-				result <- err
+		}
+	}
+}
+
+func (runner *Runner) controlLoop(ctx context.Context, claim external.WorkerJobClaim, events chan<- error) {
+	ticker := time.NewTicker(runner.config.ControlPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			callContext, cancel := context.WithTimeout(ctx, runner.config.ControlPollInterval)
+			cancelled, err := runner.repository.ClaimCancelled(callContext, claim)
+			cancel()
+			if err != nil {
+				events <- err
+				return
+			}
+			if cancelled {
+				events <- errCancellationRequested
 				return
 			}
 		}
@@ -239,7 +269,7 @@ func durableVerdict(status callback.Status) bool {
 	switch status {
 	case callback.StatusAccepted, callback.StatusWrongAnswer, callback.StatusCompileError,
 		callback.StatusTimeLimitExceeded, callback.StatusMemoryLimitExceeded,
-		callback.StatusRuntimeError, callback.StatusSystemError:
+		callback.StatusRuntimeError:
 		return true
 	default:
 		return false

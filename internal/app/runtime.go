@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -58,6 +59,7 @@ type Runtime struct {
 	started           chan struct{}
 	runOnce           sync.Once
 	afterHTTPShutdown func()
+	shuttingDown      atomic.Bool
 }
 
 func NewRuntime(config Config, api http.Handler, workers []Worker, probes map[string]Probe) (*Runtime, error) {
@@ -93,6 +95,10 @@ func (runtime *Runtime) Started() <-chan struct{} { return runtime.started }
 
 func (runtime *Runtime) Handler() http.Handler {
 	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if runtime.shuttingDown.Load() {
+			response.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		if request.URL.Path == "/readyz" {
 			runtime.serveReadiness(response, request)
 			return
@@ -150,16 +156,33 @@ func (runtime *Runtime) Run(ctx context.Context) error {
 	case runErr = <-errorsChannel:
 	case runErr = <-serverDone:
 	}
+	runtime.shuttingDown.Store(true)
 	stopWorkers()
-	workers.Wait()
 	shutdownContext, cancelShutdown := context.WithTimeout(context.Background(), runtime.config.ShutdownTimeout)
+	workersDone := make(chan struct{})
+	go func() {
+		workers.Wait()
+		close(workersDone)
+	}()
+	var workerShutdownErr error
+	select {
+	case <-workersDone:
+	case <-shutdownContext.Done():
+		workerShutdownErr = fmt.Errorf("shutdown external workers: %w", shutdownContext.Err())
+	}
 	shutdownErr := server.Shutdown(shutdownContext)
+	if shutdownErr != nil {
+		_ = server.Close()
+	}
 	cancelShutdown()
 	if runtime.afterHTTPShutdown != nil {
 		runtime.afterHTTPShutdown()
 	}
 	if runErr != nil {
 		return runErr
+	}
+	if workerShutdownErr != nil {
+		return workerShutdownErr
 	}
 	if shutdownErr != nil {
 		return fmt.Errorf("shutdown external REST: %w", shutdownErr)

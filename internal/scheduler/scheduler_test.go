@@ -140,6 +140,18 @@ func TestTargetSelectorReturnsConfiguredGRPCTarget(t *testing.T) {
 	}
 }
 
+func TestTargetSelectorRejectsInvalidPorts(t *testing.T) {
+	for _, target := range []string{
+		"dns:///sandbox-workers.coderushoj.svc.cluster.local:bogus",
+		"dns:///sandbox-workers.coderushoj.svc.cluster.local:0",
+		"dns:///sandbox-workers.coderushoj.svc.cluster.local:65536",
+	} {
+		if _, err := NewTarget(target); err == nil {
+			t.Fatalf("accepted target %q", target)
+		}
+	}
+}
+
 func TestRefreshKeepsLastKnownGoodEndpointsOnDiscoveryFailure(t *testing.T) {
 	provider := &fakeDiscovery{endpoints: []string{"sandbox-a:8080"}}
 	scheduler := New(provider)

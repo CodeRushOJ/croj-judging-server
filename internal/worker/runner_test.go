@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -33,6 +34,12 @@ func TestDurableResultPreservesCanonicalVerdictCasesAndUnits(t *testing.T) {
 	compile, err := durableResult(service.CanonicalResult{Status: callback.StatusCompileError, CompileError: "redacted"})
 	if err != nil || compile.CompileStatus != "FAILED" || compile.Verdict != "COMPILE_ERROR" {
 		t.Fatalf("compile result=%+v error=%v", compile, err)
+	}
+}
+
+func TestDurableResultRejectsInfrastructureSystemError(t *testing.T) {
+	if _, err := durableResult(service.CanonicalResult{Status: callback.StatusSystemError}); err == nil {
+		t.Fatal("SYSTEM_ERROR must be routed through infrastructure failure")
 	}
 }
 
@@ -130,6 +137,49 @@ func TestRunnerHeartbeatsWhileBundleProviderIsBlocked(t *testing.T) {
 	}
 }
 
+func TestRunnerHeartbeatsWhileSlowControlReadTimesOutAndCancelsBundleIO(t *testing.T) {
+	claim := external.WorkerJobClaim{Job: external.ExternalJobRecord{InternalID: 12}, WorkerID: "control-worker", AttemptNo: 1, LeaseToken: make([]byte, 32), LeaseUntil: time.Now().Add(time.Second)}
+	heartbeat := make(chan struct{}, 1)
+	repository := &runnerRepository{controlBlock: true, heartbeatSignal: heartbeat, input: external.WorkerExecutionInput{
+		Language: "go126", SourceCode: []byte("package main"), Bundle: external.WorkerBundleInput{ObjectKey: "bundle.zip", SHA256: strings.Repeat("a", 64), SizeBytes: 1},
+	}}
+	provider := &blockingProvider{started: make(chan struct{}), release: make(chan struct{}), artifact: &runnerArtifact{}}
+	runner, err := NewRunner(repository, provider, acceptedCore{}, Config{LeaseDuration: time.Second, HeartbeatInterval: 5 * time.Millisecond, ControlPollInterval: 20 * time.Millisecond, RetryDelay: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.ExecuteClaim(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-heartbeat:
+	default:
+		t.Fatal("slow control read suppressed lease heartbeats")
+	}
+	if repository.infrastructureFailures != 1 || repository.completions != 0 {
+		t.Fatalf("infrastructure=%d completions=%d", repository.infrastructureFailures, repository.completions)
+	}
+}
+
+func TestRunnerTreatsInvalidBundleAsInfrastructureFailure(t *testing.T) {
+	claim := external.WorkerJobClaim{Job: external.ExternalJobRecord{InternalID: 13}, WorkerID: "invalid-bundle-worker", AttemptNo: 1, LeaseToken: make([]byte, 32), LeaseUntil: time.Now().Add(time.Second)}
+	repository := &runnerRepository{input: external.WorkerExecutionInput{
+		Language: "go126", SourceCode: []byte("package main"), Bundle: external.WorkerBundleInput{ObjectKey: "bundle.zip", SHA256: strings.Repeat("a", 64), SizeBytes: 1},
+	}}
+	runner, err := NewRunner(repository, staticProvider{err: bundle.Invalid(errors.New("bad manifest"))}, acceptedCore{}, Config{
+		LeaseDuration: time.Second, HeartbeatInterval: 20 * time.Millisecond, ControlPollInterval: 10 * time.Millisecond, RetryDelay: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.ExecuteClaim(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	if repository.infrastructureFailures != 1 || repository.completions != 0 {
+		t.Fatalf("infrastructure=%d completions=%d", repository.infrastructureFailures, repository.completions)
+	}
+}
+
 type runnerRepository struct {
 	input                  external.WorkerExecutionInput
 	cancelled              bool
@@ -138,6 +188,8 @@ type runnerRepository struct {
 	claim                  *external.WorkerJobClaim
 	completionSignal       chan struct{}
 	heartbeatSignal        chan struct{}
+	controlErr             error
+	controlBlock           bool
 }
 
 func (repository *runnerRepository) ClaimNext(context.Context, string, time.Duration) (external.WorkerJobClaim, error) {
@@ -161,8 +213,12 @@ func (repository *runnerRepository) Heartbeat(context.Context, external.WorkerJo
 	}
 	return nil
 }
-func (repository *runnerRepository) ClaimCancelled(context.Context, external.WorkerJobClaim) (bool, error) {
-	return repository.cancelled, nil
+func (repository *runnerRepository) ClaimCancelled(ctx context.Context, _ external.WorkerJobClaim) (bool, error) {
+	if repository.controlBlock {
+		<-ctx.Done()
+		return false, ctx.Err()
+	}
+	return repository.cancelled, repository.controlErr
 }
 func (repository *runnerRepository) Complete(_ context.Context, _ external.WorkerJobClaim, _ external.DurableJobResult) error {
 	repository.completions++
@@ -176,10 +232,13 @@ func (repository *runnerRepository) FailInfrastructure(context.Context, external
 	return external.FailureRequeued, nil
 }
 
-type staticProvider struct{ artifact bundle.ArtifactReader }
+type staticProvider struct {
+	artifact bundle.ArtifactReader
+	err      error
+}
 
 func (provider staticProvider) OpenMetadata(context.Context, bundle.Metadata, []byte) (bundle.ArtifactReader, error) {
-	return provider.artifact, nil
+	return provider.artifact, provider.err
 }
 
 type blockingProvider struct {

@@ -201,3 +201,44 @@ Head "https://registry-1.docker.io/v2/docker/dockerfile/manifests/1.7": EOF
 No gate image or service container was left behind. The native static builds above validate both Go entrypoints; CI retains the exact Dockerfile build gate for a runner with registry access.
 
 Independent spec review of `970a080..7ac2829` concluded `Critical 0 / Important 0 / Minor 0` after the lifecycle fixes.
+
+## Final quality-review remediation
+
+The subsequent independent quality review was the RED gate: `Critical 0 / Important 6 / Minor 2`. It identified coupled heartbeat/control polling, unbounded worker shutdown, unrecoverable expired work for disabled tenants, quadratic protobuf sizing, infrastructure failures represented as successful `SYSTEM_ERROR` results, invalid-policy staging retention, weak target/readiness validation, and missing policy-ceiling backfill.
+
+Focused regression tests were added for each executable behavior. The MySQL 8.4.10 gate validates migration replay/backfill, recovery of an expired disabled-tenant claim, and definitive staging cleanup for malformed tenant policy:
+
+```text
+$ go test ./internal/worker ./internal/app ./internal/service ./internal/scheduler ./internal/external ./cmd -count=1
+ok github.com/CodeRushOJ/croj-judging-server/internal/worker
+ok github.com/CodeRushOJ/croj-judging-server/internal/app
+ok github.com/CodeRushOJ/croj-judging-server/internal/service
+ok github.com/CodeRushOJ/croj-judging-server/internal/scheduler
+ok github.com/CodeRushOJ/croj-judging-server/internal/external
+ok github.com/CodeRushOJ/croj-judging-server/cmd
+
+$ JUDGE_TEST_MYSQL_DSN=... go test ./internal/external -run '^(TestTenantPolicyExecutionCeilingsMigrationBackfillsMissingValuesAndReplays|TestMySQLWorkerSkipsDisabledTenantWithoutStarvingOthers)$' -count=1
+ok github.com/CodeRushOJ/croj-judging-server/internal/external 2.165s
+
+$ EXTERNAL_JUDGE_MYSQL_TEST_DSN=... go test ./internal/integration -run '^TestExternalBundleSQLRepositoryIntegration$/invalid_tenant_policy_rejects_and_discards_staging$' -count=1
+ok github.com/CodeRushOJ/croj-judging-server/internal/integration 0.219s
+```
+
+The disposable database container and network were removed by a shell trap. The final post-remediation gate passed:
+
+```text
+$ go test -race ./...
+ok github.com/CodeRushOJ/croj-judging-server/cmd 7.281s
+ok github.com/CodeRushOJ/croj-judging-server/internal/app 3.886s
+ok github.com/CodeRushOJ/croj-judging-server/internal/external 10.230s
+ok github.com/CodeRushOJ/croj-judging-server/internal/integration 7.947s
+ok github.com/CodeRushOJ/croj-judging-server/internal/scheduler 3.872s
+ok github.com/CodeRushOJ/croj-judging-server/internal/service 8.864s
+ok github.com/CodeRushOJ/croj-judging-server/internal/worker 3.123s
+
+$ go vet ./...
+(no output; exit 0)
+
+$ CGO_ENABLED=0 go build -trimpath ./cmd ./cmd/judge-admin
+(no output; exit 0)
+```

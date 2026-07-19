@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -18,7 +19,8 @@ func NewTarget(target string) (*Target, error) {
 		return nil, fmt.Errorf("sandbox gRPC target must use dns:///service.namespace.svc.cluster.local:port")
 	}
 	host, port, err := net.SplitHostPort(strings.TrimPrefix(parsed.Path, "/"))
-	if err != nil || port == "" || !strings.HasSuffix(host, ".svc.cluster.local") {
+	portNumber, portErr := strconv.Atoi(port)
+	if err != nil || portErr != nil || portNumber < 1 || portNumber > 65535 || !strings.HasSuffix(host, ".svc.cluster.local") {
 		return nil, fmt.Errorf("sandbox gRPC target must name a Kubernetes headless Service and port")
 	}
 	return &Target{target: target}, nil
