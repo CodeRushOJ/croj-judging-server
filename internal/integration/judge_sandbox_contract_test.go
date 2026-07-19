@@ -98,7 +98,7 @@ func TestImmutableBundleUsesEndpointSliceFailoverGRPCAndRedactedCallback(t *test
 	sandboxClient := judgesandbox.NewClientWithCache(2*time.Second, 4, time.Minute)
 	defer sandboxClient.Close()
 	metadata, provider := immutableBundle(t, hiddenInput, hiddenOutput)
-	executor := service.NewHiddenTestExecutor(provider, service.NewBundlePipeline(sandboxScheduler, sandboxClient, 2))
+	executor := service.NewHiddenTestExecutor(provider, service.NewBatchBundlePipeline(sandboxScheduler, sandboxClient, 2))
 
 	var callbackResults []callback.Result
 	callbackServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -158,7 +158,7 @@ func TestBundleDigestMismatchFailsClosedBeforeSandboxExecution(t *testing.T) {
 	metadata, provider := immutableBundle(t, "hidden-in", "hidden-out")
 	metadata.SHA256 = strings.Repeat("0", sha256.Size*2)
 	recorder := &resultRecorder{}
-	executor := service.NewHiddenTestExecutor(provider, service.NewBundlePipeline(nil, nil, 1))
+	executor := service.NewHiddenTestExecutor(provider, service.NewBatchBundlePipeline(nil, nil, 1))
 	judge := service.NewJudgeService(immutableStore(metadata, "source"), executor, recorder, service.NewTaskRegistry(8, time.Hour))
 	if err := judge.ProcessEvent(context.Background(), submissionEvent()); err != nil {
 		t.Fatalf("ProcessEvent: %v", err)
@@ -239,6 +239,36 @@ type grpcSandbox struct {
 
 func (server *grpcSandbox) Execute(ctx context.Context, request *sandboxpb.ExecuteRequest) (*sandboxpb.ExecuteResponse, error) {
 	return server.execute(ctx, request)
+}
+
+func (server *grpcSandbox) ExecuteBatchV1(request *sandboxpb.ExecuteBatchV1Request, stream grpc.ServerStreamingServer[sandboxpb.ExecuteBatchV1Event]) error {
+	for _, testCase := range request.Cases {
+		response, err := server.execute(stream.Context(), &sandboxpb.ExecuteRequest{
+			Language:       request.Language,
+			SourceCode:     request.SourceCode,
+			Stdin:          testCase.Stdin,
+			Timeout:        request.Timeout,
+			MemoryLimit:    request.MemoryLimit,
+			ExpectedOutput: testCase.ExpectedOutput,
+		})
+		if err != nil {
+			return err
+		}
+		if response.Status == "Compile Error" {
+			return stream.Send(&sandboxpb.ExecuteBatchV1Event{Kind: sandboxpb.ExecuteBatchV1Event_COMPILE_ERROR, Result: response})
+		}
+		if err := stream.Send(&sandboxpb.ExecuteBatchV1Event{
+			Kind:   sandboxpb.ExecuteBatchV1Event_CASE_RESULT,
+			CaseId: testCase.CaseId,
+			Result: response,
+		}); err != nil {
+			return err
+		}
+		if request.StopOnFailure && response.Status != "Accepted" {
+			break
+		}
+	}
+	return stream.Send(&sandboxpb.ExecuteBatchV1Event{Kind: sandboxpb.ExecuteBatchV1Event_COMPLETED})
 }
 
 func startGRPCSandbox(t *testing.T, execute func(context.Context, *sandboxpb.ExecuteRequest) (*sandboxpb.ExecuteResponse, error)) (string, func()) {

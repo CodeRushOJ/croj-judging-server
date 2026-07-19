@@ -15,10 +15,14 @@ type ArtifactProvider interface {
 
 type HiddenTestExecutor struct {
 	provider ArtifactProvider
-	pipeline *BundlePipeline
+	pipeline ArtifactExecutionPipeline
 }
 
-func NewHiddenTestExecutor(provider ArtifactProvider, pipeline *BundlePipeline) *HiddenTestExecutor {
+type ArtifactExecutionPipeline interface {
+	ExecuteArtifact(context.Context, *model.Task, ExecutionConfig, CaseArtifact) (callback.Result, error)
+}
+
+func NewHiddenTestExecutor(provider ArtifactProvider, pipeline ArtifactExecutionPipeline) *HiddenTestExecutor {
 	return &HiddenTestExecutor{provider: provider, pipeline: pipeline}
 }
 
