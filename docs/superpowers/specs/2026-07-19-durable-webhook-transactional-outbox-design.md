@@ -1,7 +1,7 @@
 # Durable Webhook Transactional Outbox Design
 
 Date: 2026-07-19  
-Status: proposed for approval
+Status: approved
 
 ## 1. Scope and completion definition
 
@@ -35,9 +35,11 @@ The upgraded row contains:
 - fencing: `worker_id`, 256-bit `lease_token`, `lease_until`, and monotonically increasing `attempt_count`;
 - schedule and audit: `next_attempt_at`, `last_http_status`, stable redacted `last_error_code`, `created_at`, `delivered_at`, `dead_at`, and `expires_at`. Here `expires_at` is the delivery deadline, not the retention deadline.
 
+The database retains the existing unique constraint on `event_id` and adds `UNIQUE(job_id)`, enforcing at most one terminal event for each job independently of application retries. Migration first detects duplicate legacy job rows and fails with an actionable error rather than deleting or silently choosing an event; only a duplicate-free table receives the unique constraint. New event insertion treats a duplicate job key as evidence of an authoritative existing event and reads that row under the same transaction.
+
 Legacy `FAILED` rows become `DEAD`. Existing JSON payloads are copied once into `payload_body` before the new non-null constraint is applied. Non-delivering rows have no worker or lease fields; `DELIVERING` rows require all three. The claim index includes status, due/lease time, tenant, and ID. The migration preserves existing event IDs and payloads and is verified by applying all migrations twice against disposable MySQL 8.4.
 
-`t_external_callback` gains a 12-byte AES-GCM nonce. Existing callback rows without a nonce are treated as disabled/unusable until reprovisioned; the migration never invents a key or plaintext secret. No secret-bearing column is exposed by the HTTP API.
+`t_external_callback` gains a nullable 12-byte AES-GCM nonce so legacy rows remain representable. In the same replay-safe migration sequence, every legacy row with a missing nonce or incomplete cipher metadata is atomically assigned `disabled_at = COALESCE(disabled_at, CURRENT_TIMESTAMP(3))`; the migration never invents a key or plaintext secret. A check constraint requires every enabled row to have a 12-byte nonce, non-empty ciphertext, and positive key version. Job submission repeats that complete-metadata predicate, so no new job can reference a callback the worker cannot decrypt. No secret-bearing column is exposed by the HTTP API.
 
 ## 4. Terminal event transaction
 
@@ -49,7 +51,7 @@ All terminal paths use the MySQL clock obtained inside their current transaction
 - immediate cancellation of a queued job;
 - cancellation finalized while reclaiming an expired running attempt.
 
-If `callback_id` is null, the transaction writes only the job terminal state. Otherwise it inserts one terminal event before commit. Job-row locking serializes terminal transitions, and terminal idempotence prevents a second event. The insert helper additionally treats an existing event for the same terminal job as the authoritative event during recovery rather than generating a second logical notification.
+If `callback_id` is null, the transaction writes only the job terminal state. Otherwise it inserts one terminal event before commit. Job-row locking serializes terminal transitions, terminal idempotence prevents a second event, and `UNIQUE(job_id)` is the final database invariant. The insert helper treats a duplicate-job-key conflict as recovery, reads the existing row, verifies matching tenant/callback/event type and payload semantics, and returns that authoritative event rather than generating a second logical notification.
 
 The event ID is a cryptographically random 26-character external ID generated before insertion. Its body is encoded once from a versioned concrete struct and stored as exact bytes. Timestamps come from the transaction's MySQL clock and are rendered as UTC RFC3339 with millisecond precision. The v1 body contains only:
 
@@ -93,7 +95,7 @@ judge-admin callback create --tenant <tenant-id> --url https://oj.example.com[:p
 
 The URL must be absolute HTTPS, contain no userinfo or fragment, use an ASCII lowercase DNS name rather than an IP literal, and have a numeric port in `1..65535` (default 443). The normalized hostname and effective port are persisted as the immutable allow-authority used by the safe transport. Provisioning resolves the hostname and rejects empty, mixed public/private, private, loopback, link-local, documentation, multicast, and metadata-class results. Delivery repeats this resolution on every connection, so later DNS rebinding fails closed. Redirect responses are never followed and become terminal delivery failures.
 
-Provisioning generates a callback-specific 256-bit secret rendered as `croj_whsec_<base64url>`. The exact rendered bytes are encrypted with AES-256-GCM under a callback key ring and a versioned active key. Associated data binds tenant ID, callback ID, normalized authority, and key version. The database stores only ciphertext, nonce, and key version. The CLI prints callback ID and plaintext secret once; secret-holding types redact `String`/`GoString`, temporary byte slices are cleared after encryption/decryption, and errors and logs never contain plaintext.
+Provisioning generates a callback-specific 256-bit secret rendered as `croj_whsec_<base64url>`. The exact rendered bytes are encrypted with AES-256-GCM under a callback key ring and a versioned active key. Associated data binds tenant ID, callback ID, key version, and the complete canonical destination URL: lowercase `https` scheme and DNS host, explicit effective port, normalized escaped path, and canonical encoded query. This prevents ciphertext from being transplanted to another path or query on the same authority. The database stores only ciphertext, nonce, and key version. The CLI prints callback ID and plaintext secret once; secret-holding types redact `String`/`GoString`, temporary byte slices are cleared after encryption/decryption, and errors and logs never contain plaintext.
 
 The admin and runtime binaries read `JUDGE_CALLBACK_KEY_VERSION` plus `JUDGE_CALLBACK_KEYS_JSON`, a JSON object mapping decimal versions to base64-encoded 32-byte AES keys, from environment/Kubernetes Secret configuration. These values are independent of the API-key pepper and source-encryption key. Encryption always uses the configured active version; decryption selects the row's stored version. Rotation is add-before-switch: deploy a ring containing old and new keys, switch the active version, recreate callbacks or run a future rewrap operation, and remove an old key only after no callback row references it. This slice deliberately does not perform automatic re-encryption. Missing historical keys fail closed to `DEAD`; key material is never stored in MySQL, output, or logs.
 
@@ -141,7 +143,7 @@ Real MySQL 8.4 integration tests prove:
 - an expired delivery is reclaimed with a new token/attempt and the same event ID/body;
 - stale delivery settlement cannot overwrite a newer attempt;
 - delivered and dead rows are terminal;
-- callback ciphertext decrypts only under the correct tenant/callback/authority/key version.
+- callback ciphertext decrypts only under the correct tenant/callback/complete canonical destination/key version.
 
 Terminal `DELIVERED` and `DEAD` rows are retained for 30 days by default for audit and deduplication. A database-clock sweeper deletes only terminal rows whose `delivered_at`/`dead_at` is older than the configured retention, in bounded `SKIP LOCKED` batches. `PENDING` and `DELIVERING` rows are never deleted by retention; expired active rows are first settled `DEAD`. Retention is therefore independent of the 24-hour default delivery window.
 
