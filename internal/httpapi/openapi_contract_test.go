@@ -438,27 +438,53 @@ func TestOpenAPIJSONExamplesDecodeIntoRealDTOs(t *testing.T) {
 		target  any
 	}{
 		{"capabilities response", responseExample(t, document, "/api/v1/capabilities", http.MethodGet, 200), &Capabilities{}},
-		{"bundle response", responseExample(t, document, "/api/v1/bundles", http.MethodPost, 201), &external.BundleMetadata{}},
+		{"bundle replay response", responseExample(t, document, "/api/v1/bundles", http.MethodPost, 200), &external.BundleMetadata{}},
+		{"bundle created response", responseExample(t, document, "/api/v1/bundles", http.MethodPost, 201), &external.BundleMetadata{}},
+		{"bundle metadata response", responseExample(t, document, "/api/v1/bundles/{bundleId}", http.MethodGet, 200), &external.BundleMetadata{}},
 		{"job submit request", requestExample(t, document, "/api/v1/judge-jobs", http.MethodPost), &SubmitJobCommand{}},
-		{"job response", responseExample(t, document, "/api/v1/judge-jobs", http.MethodPost, 202), &JobView{}},
+		{"job submit response", responseExample(t, document, "/api/v1/judge-jobs", http.MethodPost, 202), &JobView{}},
 		{"job list response", responseExample(t, document, "/api/v1/judge-jobs", http.MethodGet, 200), &JobListPage{}},
-		{"problem response", responseExample(t, document, "/api/v1/judge-jobs", http.MethodPost, 400), &Problem{}},
+		{"job detail response", responseExample(t, document, "/api/v1/judge-jobs/{jobId}", http.MethodGet, 200), &JobView{}},
+		{"job cancel response", responseExample(t, document, "/api/v1/judge-jobs/{jobId}/cancel", http.MethodPost, 200), &JobView{}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			encoded, err := json.Marshal(test.example)
-			if err != nil {
-				t.Fatal(err)
-			}
-			decoder := json.NewDecoder(bytes.NewReader(encoded))
-			decoder.DisallowUnknownFields()
-			if err := decoder.Decode(test.target); err != nil {
-				t.Fatalf("decode %s into %T: %v\n%s", test.name, test.target, err, encoded)
-			}
-			if err := decoder.Decode(&struct{}{}); err != io.EOF {
-				t.Fatalf("%s contains trailing JSON: %v", test.name, err)
-			}
+			decodeStrictExample(t, test.name, test.example, test.target)
 		})
+	}
+
+	for _, path := range document.Paths.Keys() {
+		for method, operation := range document.Paths.Value(path).Operations() {
+			for statusText := range operation.Responses.Map() {
+				var status int
+				if _, err := fmt.Sscanf(statusText, "%d", &status); err != nil || status < 400 {
+					continue
+				}
+				for index, example := range responseExamples(t, document, path, method, status) {
+					var problem Problem
+					decodeStrictExample(t, fmt.Sprintf("%s %s %d problem[%d]", method, path, status, index), example, &problem)
+					if problem.Status != status {
+						t.Errorf("%s %s response %d example status = %d", method, path, status, problem.Status)
+					}
+				}
+			}
+		}
+	}
+}
+
+func decodeStrictExample(t *testing.T, name string, example, target any) {
+	t.Helper()
+	encoded, err := json.Marshal(example)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		t.Fatalf("decode %s into %T: %v\n%s", name, target, err, encoded)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		t.Fatalf("%s contains trailing JSON: %v", name, err)
 	}
 }
 
