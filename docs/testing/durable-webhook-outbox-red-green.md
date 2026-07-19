@@ -151,6 +151,35 @@ The broader webhook and safe-callback compatibility suite also passed, preservin
 ok github.com/CodeRushOJ/croj-judging-server/internal/external 0.025s
 ```
 
+## Task 7: Fenced MySQL outbox repository
+
+### RED
+
+Real MySQL 8.4 tests were written first for claim/reclaim, per-tenant head fairness, `SKIP LOCKED`, stale lease fencing, retry/terminal settlement, disabled/expired events, audit validation, and retention. The package initially failed to compile because `MySQLWebhookOutboxRepository`, `ClaimNextWebhook`, `SettleWebhook`, and `SweepTerminal` did not exist. A later concurrency regression first failed because skipping a locked tenant head incorrectly exposed that tenant's next row instead of another tenant head.
+
+### GREEN
+
+The repository now uses short `READ COMMITTED` transactions, MySQL time, 256-bit lease tokens, monotonically increasing attempts, active-lease CAS settlement, bounded dead-letter maintenance, and terminal-only retention. The focused real-MySQL suite passed:
+
+```text
+ok github.com/CodeRushOJ/croj-judging-server/internal/external 0.243s
+```
+
+Unit race and vet gates also passed:
+
+```text
+ok github.com/CodeRushOJ/croj-judging-server/internal/external 1.387s
+go vet ./internal/external: PASS
+```
+
+Independent review then identified missing default-attempt behavior, settlement matrix contradictions, an expiry-clamped lease shorter than the requested safety window, and JSON serialization of encrypted material. Regression tests first failed for each. The constructor now defaults to 12 attempts, settlement accepts only the documented status/error combinations, a claim receives its full lease when started before expiry (success may settle after expiry; failure becomes `DEAD`), and encrypted secret fields are opaque with copy-returning access. Claims redact JSON as well as formatting. The expanded MySQL 8.4 race suite passed:
+
+```text
+ok github.com/CodeRushOJ/croj-judging-server/internal/external 1.775s
+```
+
+A final cross-boundary review caught informational HTTP responses being terminal in the deliverer but rejected by repository settlement. A RED test reproduced the mismatch; non-final status ranges are now converted to the status-zero `invalid_delivery` terminal outcome, preserving the strict persisted 2xx/retry/3xx/4xx matrix.
+
 Independent review added two regression tests. They failed first because HTTP-date delay used the pre-request signing time (`12m0s` instead of `2m0s`) and a duration-overflowing delta was clamped (`15m0s`) instead of ignored. After sampling the injected clock after `RoundTrip` and rejecting delta values beyond `time.Duration`, the full focused suite passed:
 
 ```text

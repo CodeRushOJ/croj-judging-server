@@ -201,6 +201,24 @@ func TestWebhookOutcomeClassifiesEveryHTTPStatus(t *testing.T) {
 	}
 }
 
+func TestWebhookOutcomeTreatsFinalInformationalResponseAsInvalidTerminalResult(t *testing.T) {
+	deliverer, err := newWebhookDelivererForTest(webhookDoerFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusSwitchingProtocols, Body: io.NopCloser(strings.NewReader("ignored"))}, nil
+	}), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outcome := deliverer.DeliverOutcome(context.Background(), validWebhookDelivery(), 15*time.Minute)
+	if outcome.Disposition != WebhookPermanentFailure || outcome.HTTPStatus != 0 || outcome.ErrorCode != WebhookErrorInvalidDelivery {
+		t.Fatalf("informational outcome=%+v", outcome)
+	}
+	if !validWebhookSettlement(WebhookSettlement{
+		Disposition: outcome.Disposition, HTTPStatus: outcome.HTTPStatus, ErrorCode: outcome.ErrorCode,
+	}) {
+		t.Fatalf("repository rejected deliverer informational outcome=%+v", outcome)
+	}
+}
+
 func TestWebhookOutcomeClassifiesNetworkAndUnsafeFailures(t *testing.T) {
 	for _, test := range []struct {
 		name        string
