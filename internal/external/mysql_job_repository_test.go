@@ -44,12 +44,15 @@ func (store *memorySourceStore) Delete(_ context.Context, key string) error {
 	return nil
 }
 
-func (store *memorySourceStore) Get(_ context.Context, key string) ([]byte, error) {
+func (store *memorySourceStore) Get(_ context.Context, key string, maximumBytes int64) ([]byte, error) {
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
 	value, exists := store.objects[key]
 	if !exists {
 		return nil, errors.New("source object not found")
+	}
+	if int64(len(value)) > maximumBytes {
+		return nil, ErrSourceEncryption
 	}
 	return append([]byte(nil), value...), nil
 }

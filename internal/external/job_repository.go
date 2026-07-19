@@ -26,7 +26,7 @@ type SourceObjectStore interface {
 	// Create must be atomic and must return ErrSourceObjectExists instead of
 	// overwriting an existing key. This makes a random-ID collision harmless.
 	Create(context.Context, string, []byte) error
-	Get(context.Context, string) ([]byte, error)
+	Get(context.Context, string, int64) ([]byte, error)
 	Delete(context.Context, string) error
 }
 
