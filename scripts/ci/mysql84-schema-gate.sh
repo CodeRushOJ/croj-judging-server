@@ -6,6 +6,7 @@ readonly SCRIPT_DIR
 REPOSITORY_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 readonly REPOSITORY_ROOT
 readonly SQL_DIRECTORY="${SCRIPT_DIR}/mysql84"
+readonly MIGRATION_DIRECTORY="${REPOSITORY_ROOT}/internal/external/migrations"
 
 # mysql:8.4.10 and golang:1.26.3 multi-platform indexes.
 readonly MYSQL84_IMAGE='mysql@sha256:c592c15aaf4a1961e15d82eb31ea5987dda862d1c4b1e93424438c0e91dc1f8d'
@@ -135,6 +136,12 @@ main() {
     "${SQL_DIRECTORY}/cross-tenant-outbox.sql"; do
     [[ -r "${sql_file}" ]] || fail "missing SQL fixture: ${sql_file}"
   done
+  local -a migration_files
+  shopt -s nullglob
+  migration_files=("${MIGRATION_DIRECTORY}"/[0-9][0-9][0-9]_*.sql)
+  shopt -u nullglob
+  local migration_count="${#migration_files[@]}"
+  ((migration_count > 0)) || fail "no embedded migrations found in ${MIGRATION_DIRECTORY}"
   mkdir -p "${GO_MOD_CACHE}" "${GO_BUILD_CACHE}"
 
   log "starting isolated MySQL 8.4.10 container ${MYSQL_CONTAINER}"
@@ -173,9 +180,10 @@ main() {
   local history
   history="$(mysql_client -e \
     "SELECT CONCAT_WS('|', COUNT(*), MIN(version), MAX(version), MIN(CHAR_LENGTH(checksum)), MAX(CHAR_LENGTH(checksum))) FROM t_judge_schema_history;")"
-  [[ "${history}" == '1|1|1|64|64' ]] ||
-    fail "unexpected migration history: ${history}"
-  log 'migration replay retained one immutable 64-character checksum'
+  local expected_history="${migration_count}|1|${migration_count}|64|64"
+  [[ "${history}" == "${expected_history}" ]] ||
+    fail "unexpected migration history: ${history}; expected ${expected_history}"
+  log "migration replay retained ${migration_count} immutable 64-character checksums"
 
   local same_tenant
   same_tenant="$(mysql_file "${SQL_DIRECTORY}/same-tenant-fixture.sql")"
