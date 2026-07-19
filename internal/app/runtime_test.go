@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -107,6 +108,30 @@ func TestRuntimeStopsWorkersBeforeHTTP(t *testing.T) {
 	if len(events) != 2 || events[0] != "worker" || events[1] != "http" {
 		t.Fatalf("shutdown events = %v", events)
 	}
+}
+
+func TestRuntimeBoundsAStuckWorkerShutdown(t *testing.T) {
+	release := make(chan struct{})
+	runtime, err := NewRuntime(Config{Enabled: true, ListenAddress: "127.0.0.1:0", ShutdownTimeout: 30 * time.Millisecond}, http.NotFoundHandler(), []Worker{
+		workerFunc(func(context.Context) error { <-release; return nil }),
+	}, healthyProductionProbes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runtime.Run(ctx) }()
+	<-runtime.Started()
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "shutdown external workers") {
+			t.Fatalf("shutdown error=%v", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("stuck worker exceeded shutdown bound")
+	}
+	close(release)
 }
 
 func healthyProductionProbes() map[string]Probe {

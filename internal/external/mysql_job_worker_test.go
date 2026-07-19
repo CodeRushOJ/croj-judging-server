@@ -340,6 +340,17 @@ func TestMySQLWorkerSkipsDisabledTenantWithoutStarvingOthers(t *testing.T) {
 	if err != nil || second.Job.TenantExternalID != tenantB || second.Job.ExternalID == first.Job.ExternalID {
 		t.Fatalf("disabled tenant starved active tenant: claim=%+v error=%v", second, err)
 	}
+	expireClaimLease(t, database, first)
+	if err := repository.Complete(context.Background(), second, DurableJobResult{Verdict: "ACCEPTED", CompileStatus: "SUCCEEDED"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.ClaimNext(context.Background(), "cleanup-worker", time.Minute); !errors.Is(err, ErrJobNotClaimable) {
+		t.Fatalf("disabled tenant cleanup returned claim: %v", err)
+	}
+	settled, err := repository.Get(context.Background(), tenantA, first.Job.ExternalID)
+	if err != nil || settled.Status != JobStatusFailed || settled.FailureCode != "TENANT_DISABLED" {
+		t.Fatalf("disabled tenant job=%+v error=%v", settled, err)
+	}
 }
 
 func TestMySQLWorkerHeartbeatCompletionAndRestartReclaimAreFenced(t *testing.T) {

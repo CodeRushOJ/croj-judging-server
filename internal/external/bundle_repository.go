@@ -98,7 +98,7 @@ FOR UPDATE`, input.TenantID).Scan(&tenantInternalID, &encodedPolicy); err != nil
 	}
 	policy, err := decodeTenantPolicy(encodedPolicy)
 	if err != nil {
-		return BundleCommitResult{}, fmt.Errorf("bundle tenant policy is invalid")
+		return BundleCommitResult{}, fmt.Errorf("%w: bundle tenant policy is invalid", ErrInvalidBundle)
 	}
 	if !bundleWithinTenantPolicy(input, policy) {
 		return BundleCommitResult{}, fmt.Errorf("%w: execution limits exceed tenant maximum", ErrInvalidBundle)

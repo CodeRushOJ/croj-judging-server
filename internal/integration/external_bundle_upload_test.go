@@ -428,6 +428,22 @@ WHERE external_id = ?`, tenantID); err != nil {
 		assertVisibleBundleObjects(t, objectStore.root, 0)
 	})
 
+	t.Run("invalid tenant policy rejects and discards staging", func(t *testing.T) {
+		tenantID, service, objectStore := newSQLBundleFixture(t, database)
+		if _, err := database.Exec(`UPDATE t_external_tenant
+SET policy_json = JSON_OBJECT('maxQueuedJobs', 4)
+WHERE external_id = ?`, tenantID); err != nil {
+			t.Fatal(err)
+		}
+		_, _, err := service.Upload(context.Background(), tenantID, "invalid-policy-01",
+			bytes.NewReader(integrationBundleZIPWithLimits(t, "invalid-policy", 1000, 256)))
+		if !errors.Is(err, external.ErrInvalidBundle) {
+			t.Fatalf("invalid tenant policy error = %v", err)
+		}
+		assertSQLBundleRows(t, database, tenantID, 0, 0)
+		assertVisibleBundleObjects(t, objectStore.root, 0)
+	})
+
 	t.Run("same key and hash replay one row", func(t *testing.T) {
 		tenantID, service, objectStore := newSQLBundleFixture(t, database)
 		body := integrationBundleZIPWithInput(t, "same")

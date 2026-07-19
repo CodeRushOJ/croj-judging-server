@@ -16,8 +16,11 @@ import (
 	sandboxpb "github.com/CodeRushOJ/croj-judging-server/proto"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
+
+var ErrCanonicalInfrastructure = errors.New("canonical execution infrastructure failed")
 
 type SandboxBatchExecutor interface {
 	ExecuteBatch(context.Context, string, *sandboxpb.ExecuteBatchV1Request) ([]*sandboxpb.ExecuteBatchV1Event, error)
@@ -29,6 +32,7 @@ type SandboxExcludingSelector interface {
 
 const maxSandboxBatchCasesV1 = 256
 const maxSandboxBatchRequestBytesV1 = 64 << 20
+const executeBatchCasesFieldNumber = protowire.Number(6)
 
 type BatchBundlePipeline struct {
 	selector              SandboxSelector
@@ -71,10 +75,6 @@ func (result CanonicalResult) CallbackResult() callback.Result {
 	}
 }
 
-func canonicalSystemError(summary string) CanonicalResult {
-	return CanonicalResult{Status: callback.StatusSystemError, Stderr: callback.TruncateUTF16(summary, 65_536)}
-}
-
 func NewBatchBundlePipeline(selector SandboxSelector, executor SandboxBatchExecutor, maxInfraAttempts int) *BatchBundlePipeline {
 	if maxInfraAttempts <= 0 {
 		maxInfraAttempts = 3
@@ -113,10 +113,10 @@ func (pipeline *BatchBundlePipeline) ExecuteCanonical(
 	}
 	manifest := artifact.Manifest()
 	if err := manifest.Validate(); err != nil {
-		return canonicalSystemError("bundle manifest became invalid"), nil
+		return CanonicalResult{}, fmt.Errorf("%w: bundle manifest became invalid", ErrCanonicalInfrastructure)
 	}
 	if len(manifest.Cases) > maxSandboxBatchCasesV1 {
-		return canonicalSystemError("bundle exceeds sandbox batch case limit"), nil
+		return CanonicalResult{}, fmt.Errorf("%w: bundle exceeds sandbox batch case limit", ErrCanonicalInfrastructure)
 	}
 	request := &sandboxpb.ExecuteBatchV1Request{
 		Language:      input.Language,
@@ -131,8 +131,9 @@ func (pipeline *BatchBundlePipeline) ExecuteCanonical(
 		maxRequestBytes = maxSandboxBatchRequestBytesV1
 	}
 	if proto.Size(request) > maxRequestBytes {
-		return canonicalSystemError("submission exceeds sandbox batch byte limit"), nil
+		return CanonicalResult{}, fmt.Errorf("%w: submission exceeds sandbox batch byte limit", ErrCanonicalInfrastructure)
 	}
+	requestBytes := proto.Size(request)
 	expectedChecks := make([]string, 0, len(manifest.Cases))
 	maxExpectedCheckBytes := pipeline.maxExpectedCheckBytes
 	if maxExpectedCheckBytes <= 0 {
@@ -142,7 +143,7 @@ func (pipeline *BatchBundlePipeline) ExecuteCanonical(
 	for _, testCase := range manifest.Cases {
 		input, expected, err := artifact.ReadCase(testCase)
 		if err != nil {
-			return canonicalSystemError("bundle case could not be read"), nil
+			return CanonicalResult{}, fmt.Errorf("%w: bundle case could not be read", ErrCanonicalInfrastructure)
 		}
 		expectedForSandbox := ""
 		expectedTokenSHA256 := ""
@@ -156,27 +157,38 @@ func (pipeline *BatchBundlePipeline) ExecuteCanonical(
 		expectedChecks = append(expectedChecks, expectedCheck)
 		retainedExpectedCheckBytes += len(expectedCheck)
 		if retainedExpectedCheckBytes > maxExpectedCheckBytes {
-			return canonicalSystemError("bundle exceeds local expected-check retention limit"), nil
+			return CanonicalResult{}, fmt.Errorf("%w: bundle exceeds local expected-check retention limit", ErrCanonicalInfrastructure)
 		}
-		request.Cases = append(request.Cases, &sandboxpb.ExecuteBatchV1Case{
+		requestCase := &sandboxpb.ExecuteBatchV1Case{
 			CaseId:              testCase.ID,
 			Stdin:               input,
 			ExpectedOutput:      expectedForSandbox,
 			CompareOutput:       manifest.Checker == bundle.CheckerExact,
 			TokenExpectedSha256: expectedTokenSHA256,
-		})
-		if proto.Size(request) > maxRequestBytes {
-			return canonicalSystemError("bundle exceeds sandbox batch byte limit"), nil
 		}
+		requestBytes += batchCaseWireBytes(requestCase)
+		if requestBytes > maxRequestBytes {
+			return CanonicalResult{}, fmt.Errorf("%w: bundle exceeds sandbox batch byte limit", ErrCanonicalInfrastructure)
+		}
+		request.Cases = append(request.Cases, requestCase)
 	}
 	events, invalidResponse, err := pipeline.executeBatch(ctx, request)
 	if err != nil {
 		return CanonicalResult{}, err
 	}
 	if invalidResponse {
-		return canonicalSystemError("sandbox batch response was invalid"), nil
+		return CanonicalResult{}, fmt.Errorf("%w: sandbox batch response was invalid", ErrCanonicalInfrastructure)
 	}
-	return aggregateBatchResult(manifest, expectedChecks, events), nil
+	result := aggregateBatchResult(manifest, expectedChecks, events)
+	if result.Status == callback.StatusSystemError {
+		return CanonicalResult{}, fmt.Errorf("%w: sandbox returned a system error", ErrCanonicalInfrastructure)
+	}
+	return result, nil
+}
+
+func batchCaseWireBytes(requestCase *sandboxpb.ExecuteBatchV1Case) int {
+	caseBytes := proto.Size(requestCase)
+	return protowire.SizeTag(executeBatchCasesFieldNumber) + protowire.SizeVarint(uint64(caseBytes)) + caseBytes
 }
 
 func (pipeline *BatchBundlePipeline) executeBatch(

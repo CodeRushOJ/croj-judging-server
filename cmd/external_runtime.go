@@ -23,6 +23,9 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/redis/go-redis/v9"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 type externalRuntime struct {
@@ -277,6 +280,20 @@ func sandboxDNSProbe(target string) func(context.Context) error {
 		if len(addresses) == 0 {
 			return fmt.Errorf("sandbox DNS target has no endpoints")
 		}
-		return nil
+		connection, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			return err
+		}
+		defer connection.Close()
+		connection.Connect()
+		for {
+			state := connection.GetState()
+			if state == connectivity.Ready {
+				return nil
+			}
+			if !connection.WaitForStateChange(ctx, state) {
+				return ctx.Err()
+			}
+		}
 	}
 }

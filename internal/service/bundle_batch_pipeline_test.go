@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -13,6 +14,7 @@ import (
 	sandboxpb "github.com/CodeRushOJ/croj-judging-server/proto"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -65,11 +67,25 @@ func TestBatchBundlePipelineRejectsOversizedBatchBeforeSandbox(t *testing.T) {
 	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a"}}, executor, 1)
 
 	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validExecutionConfig(), artifact)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Status != callback.StatusSystemError || len(executor.requests) != 0 {
+	if !errors.Is(err, ErrCanonicalInfrastructure) || result.Status != "" || len(executor.requests) != 0 {
 		t.Fatalf("result=%+v sandbox calls=%d", result, len(executor.requests))
+	}
+}
+
+func TestIncrementalBatchCaseWireSizeMatchesProtobuf(t *testing.T) {
+	request := &sandboxpb.ExecuteBatchV1Request{Language: "cpp20", SourceCode: "int main(){}", Timeout: 2, MemoryLimit: 64}
+	incremental := proto.Size(request)
+	for index := 0; index < 256; index++ {
+		requestCase := &sandboxpb.ExecuteBatchV1Case{CaseId: fmt.Sprintf("case-%03d", index), Stdin: strings.Repeat("x", index*17), ExpectedOutput: "answer", CompareOutput: true}
+		incremental += batchCaseWireBytes(requestCase)
+		request.Cases = append(request.Cases, requestCase)
+		if incremental != proto.Size(request) {
+			t.Fatalf("case %d incremental=%d protobuf=%d", index, incremental, proto.Size(request))
+		}
+	}
+	field := request.ProtoReflect().Descriptor().Fields().ByName("cases")
+	if field == nil || protowire.Number(field.Number()) != executeBatchCasesFieldNumber {
+		t.Fatalf("cases field number=%v want=%d", field, executeBatchCasesFieldNumber)
 	}
 }
 
@@ -86,10 +102,7 @@ func TestBatchBundlePipelineStopsReadingCasesWhenWireLimitIsCrossed(t *testing.T
 	})
 
 	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validExecutionConfig(), artifact)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Status != callback.StatusSystemError || artifact.reads != 1 || len(executor.requests) != 0 {
+	if !errors.Is(err, ErrCanonicalInfrastructure) || result.Status != "" || artifact.reads != 1 || len(executor.requests) != 0 {
 		t.Fatalf("result=%+v reads=%d sandbox calls=%d", result, artifact.reads, len(executor.requests))
 	}
 }
@@ -141,10 +154,7 @@ func TestBatchBundlePipelineDoesNotRetryMalformedCompletedStream(t *testing.T) {
 	executor := &sequenceBatchExecutor{eventSets: [][]*sandboxpb.ExecuteBatchV1Event{nil, nil}}
 	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a", "sandbox-b"}}, executor, 2)
 	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validExecutionConfig(), exactArtifact(1))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Status != callback.StatusSystemError || len(executor.requests) != 1 {
+	if !errors.Is(err, ErrCanonicalInfrastructure) || result.Status != "" || len(executor.requests) != 1 {
 		t.Fatalf("result=%+v sandbox calls=%d, want deterministic failure without retry", result, len(executor.requests))
 	}
 }
@@ -153,11 +163,20 @@ func TestBatchBundlePipelineDoesNotRetryClientRejectedStream(t *testing.T) {
 	executor := &sequenceBatchExecutor{errors: []error{judgesandbox.ErrInvalidBatchStream, nil}}
 	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a", "sandbox-b"}}, executor, 2)
 	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validExecutionConfig(), exactArtifact(1))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Status != callback.StatusSystemError || len(executor.requests) != 1 {
+	if !errors.Is(err, ErrCanonicalInfrastructure) || result.Status != "" || len(executor.requests) != 1 {
 		t.Fatalf("result=%+v sandbox calls=%d, want deterministic failure without retry", result, len(executor.requests))
+	}
+}
+
+func TestBatchBundlePipelineRoutesSandboxSystemErrorToInfrastructureFailure(t *testing.T) {
+	executor := &batchExecutorStub{events: []*sandboxpb.ExecuteBatchV1Event{
+		{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT, CaseId: "case-1", Result: &sandboxpb.ExecuteResponse{Status: "Sandbox Error"}},
+		{Kind: sandboxpb.ExecuteBatchV1Event_COMPLETED},
+	}}
+	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a"}}, executor, 1)
+	result, err := pipeline.ExecuteCanonical(context.Background(), CanonicalExecutionRequest{Language: "cpp20", SourceCode: "int main(){}", StopOnFailure: true}, exactArtifact(1))
+	if !errors.Is(err, ErrCanonicalInfrastructure) || result.Status != "" {
+		t.Fatalf("result=%+v error=%v", result, err)
 	}
 }
 
