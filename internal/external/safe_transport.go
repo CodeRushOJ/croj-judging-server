@@ -59,7 +59,7 @@ func resolvePublicCallback(ctx context.Context, resolver callbackResolver, host 
 	for _, raw := range addresses {
 		address := raw.Unmap()
 		if !isPublicCallbackAddress(address) {
-			return nil, fmt.Errorf("callback host resolved to a prohibited address")
+			return nil, fmt.Errorf("%w: callback host resolved to a prohibited address", ErrUnsafeCallbackDestination)
 		}
 		if _, exists := seen[address]; !exists {
 			seen[address] = struct{}{}

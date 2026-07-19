@@ -12,10 +12,14 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
 
-const maximumWebhookBodyBytes = 1 << 20
+const (
+	maximumWebhookBodyBytes  = 1 << 20
+	maximumWebhookRetryAfter = 15 * time.Minute
+)
 
 type WebhookDisposition string
 
@@ -24,6 +28,23 @@ const (
 	WebhookRetry            WebhookDisposition = "RETRY"
 	WebhookPermanentFailure WebhookDisposition = "PERMANENT_FAILURE"
 )
+
+const (
+	WebhookErrorConfiguration     = "configuration"
+	WebhookErrorHTTPPermanent     = "http_permanent"
+	WebhookErrorHTTPRetryable     = "http_retryable"
+	WebhookErrorInvalidDelivery   = "invalid_delivery"
+	WebhookErrorNetwork           = "network"
+	WebhookErrorUnsafeDestination = "unsafe_destination"
+)
+
+type WebhookOutcome struct {
+	Disposition WebhookDisposition
+	HTTPStatus  int
+	RetryAfter  time.Duration
+	ErrorCode   string
+	err         error
+}
 
 type WebhookDelivery struct {
 	EventID        string
@@ -46,19 +67,28 @@ func newWebhookDelivererForTest(transport http.RoundTripper, timeout time.Durati
 }
 
 func (deliverer *WebhookDeliverer) Deliver(ctx context.Context, delivery WebhookDelivery) (WebhookDisposition, error) {
+	outcome := deliverer.DeliverOutcome(ctx, delivery, maximumWebhookRetryAfter)
+	return outcome.Disposition, outcome.err
+}
+
+func (deliverer *WebhookDeliverer) DeliverOutcome(ctx context.Context, delivery WebhookDelivery, retryAfterMaximum time.Duration) WebhookOutcome {
 	if deliverer == nil || deliverer.transport == nil {
-		return WebhookPermanentFailure, fmt.Errorf("webhook deliverer is not configured")
+		return permanentWebhookOutcome(WebhookErrorConfiguration, fmt.Errorf("webhook deliverer is not configured"))
+	}
+	if deliverer.now == nil || retryAfterMaximum <= 0 || retryAfterMaximum > maximumWebhookRetryAfter {
+		return permanentWebhookOutcome(WebhookErrorConfiguration, fmt.Errorf("webhook delivery configuration is invalid"))
 	}
 	if err := validateWebhookDelivery(delivery); err != nil {
-		return WebhookPermanentFailure, err
+		return permanentWebhookOutcome(WebhookErrorInvalidDelivery, err)
 	}
 	requestContext, cancel := context.WithTimeout(ctx, deliverer.timeout)
 	defer cancel()
 	request, err := http.NewRequestWithContext(requestContext, http.MethodPost, delivery.DestinationURL, bytes.NewReader(delivery.Body))
 	if err != nil {
-		return WebhookPermanentFailure, fmt.Errorf("create webhook request: %w", err)
+		return permanentWebhookOutcome(WebhookErrorInvalidDelivery, fmt.Errorf("create webhook request: %w", err))
 	}
-	timestamp := strconv.FormatInt(deliverer.now().UTC().Unix(), 10)
+	requestTime := deliverer.now().UTC()
+	timestamp := strconv.FormatInt(requestTime.Unix(), 10)
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("User-Agent", "CodeRushOJ-Judge-Webhook/1.0")
 	request.Header.Set("X-CodeRushOJ-Event-Id", delivery.EventID)
@@ -69,24 +99,80 @@ func (deliverer *WebhookDeliverer) Deliver(ctx context.Context, delivery Webhook
 	response, err := deliverer.transport.RoundTrip(request)
 	if err != nil {
 		if errors.Is(err, ErrUnsafeCallbackDestination) {
-			return WebhookPermanentFailure, fmt.Errorf("deliver webhook: %w", err)
+			return permanentWebhookOutcome(WebhookErrorUnsafeDestination, fmt.Errorf("deliver webhook: %w", err))
 		}
-		return WebhookRetry, fmt.Errorf("deliver webhook: %w", err)
+		return WebhookOutcome{
+			Disposition: WebhookRetry,
+			ErrorCode:   WebhookErrorNetwork,
+			err:         fmt.Errorf("deliver webhook: %w", err),
+		}
 	}
+	if response == nil {
+		return WebhookOutcome{
+			Disposition: WebhookRetry,
+			ErrorCode:   WebhookErrorNetwork,
+			err:         fmt.Errorf("deliver webhook: transport returned no response"),
+		}
+	}
+	responseTime := deliverer.now().UTC()
 	defer response.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4<<10))
+	outcome := WebhookOutcome{HTTPStatus: response.StatusCode}
 	if response.StatusCode >= 200 && response.StatusCode < 300 {
-		return WebhookDelivered, nil
+		outcome.Disposition = WebhookDelivered
+		return outcome
 	}
 	switch response.StatusCode {
 	case http.StatusRequestTimeout, http.StatusTooEarly, http.StatusTooManyRequests:
-		return WebhookRetry, nil
+		outcome.Disposition = WebhookRetry
+		outcome.ErrorCode = WebhookErrorHTTPRetryable
 	default:
 		if response.StatusCode >= 500 && response.StatusCode <= 599 {
-			return WebhookRetry, nil
+			outcome.Disposition = WebhookRetry
+			outcome.ErrorCode = WebhookErrorHTTPRetryable
+		} else {
+			outcome.Disposition = WebhookPermanentFailure
+			outcome.ErrorCode = WebhookErrorHTTPPermanent
 		}
-		return WebhookPermanentFailure, nil
 	}
+	if outcome.Disposition == WebhookRetry {
+		outcome.RetryAfter = parseWebhookRetryAfter(response.Header.Get("Retry-After"), responseTime, retryAfterMaximum)
+	}
+	return outcome
+}
+
+func permanentWebhookOutcome(code string, err error) WebhookOutcome {
+	return WebhookOutcome{Disposition: WebhookPermanentFailure, ErrorCode: code, err: err}
+}
+
+func parseWebhookRetryAfter(raw string, now time.Time, maximum time.Duration) time.Duration {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	if seconds, err := strconv.ParseUint(raw, 10, 64); err == nil {
+		maximumDurationSeconds := uint64(time.Duration(1<<63-1) / time.Second)
+		if seconds > maximumDurationSeconds {
+			return 0
+		}
+		maximumSeconds := uint64(maximum / time.Second)
+		if seconds > maximumSeconds {
+			return maximum
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	date, err := http.ParseTime(raw)
+	if err != nil {
+		return 0
+	}
+	delay := date.Sub(now)
+	if delay <= 0 {
+		return 0
+	}
+	if delay > maximum {
+		return maximum
+	}
+	return delay
 }
 
 func validateWebhookDelivery(delivery WebhookDelivery) error {
