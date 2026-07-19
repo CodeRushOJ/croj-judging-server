@@ -109,7 +109,7 @@ func main() {
 		log.Fatalf("Invalid test bundle archive limits: %v", err)
 	}
 	bundleProvider := bundle.NewProvider(bundleCache, archiveLimits)
-	bundlePipeline := service.NewBundlePipeline(
+	bundlePipeline := service.NewBatchBundlePipeline(
 		sandboxScheduler,
 		sandboxClient,
 		cfg.TestBundles.MaxInfraAttempts,

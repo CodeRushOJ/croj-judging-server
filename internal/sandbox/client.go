@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
@@ -13,6 +14,8 @@ import (
 )
 
 var ErrClientClosed = errors.New("sandbox client is closed")
+
+const maxBatchMessageBytesV1 = 64 << 20
 
 // Client owns one reusable gRPC connection per ready sandbox endpoint.
 type Client struct {
@@ -77,6 +80,61 @@ func (c *Client) Execute(ctx context.Context, address string, request *sandboxpb
 		return nil, fmt.Errorf("execute on sandbox %s: %w", address, err)
 	}
 	return response, nil
+}
+
+func batchRPCTimeout(base time.Duration, request *sandboxpb.ExecuteBatchV1Request) time.Duration {
+	if request == nil || len(request.Cases) <= 1 {
+		return base
+	}
+	caseTimeoutSeconds := request.Timeout
+	if caseTimeoutSeconds <= 0 {
+		caseTimeoutSeconds = 1
+	}
+	if caseTimeoutSeconds > 30 {
+		caseTimeoutSeconds = 30
+	}
+	return base + time.Duration(len(request.Cases)-1)*time.Duration(caseTimeoutSeconds)*time.Second
+}
+
+// ExecuteBatch runs one compile-once stream and returns events only after a clean EOF.
+// Partial streams are discarded so callers can safely retry the complete batch.
+func (c *Client) ExecuteBatch(
+	ctx context.Context,
+	address string,
+	request *sandboxpb.ExecuteBatchV1Request,
+) ([]*sandboxpb.ExecuteBatchV1Event, error) {
+	if address == "" {
+		return nil, fmt.Errorf("sandbox address is required")
+	}
+	if request == nil {
+		return nil, fmt.Errorf("sandbox batch request is required")
+	}
+	entry, err := c.acquire(address)
+	if err != nil {
+		return nil, err
+	}
+	defer c.release(address, entry)
+	rpcContext, cancel := context.WithTimeout(ctx, batchRPCTimeout(c.timeout, request))
+	defer cancel()
+	stream, err := sandboxpb.NewSandboxServiceClient(entry.connection).ExecuteBatchV1(
+		rpcContext,
+		request,
+		grpc.MaxCallSendMsgSize(maxBatchMessageBytesV1),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("start batch on sandbox %s: %w", address, err)
+	}
+	events := make([]*sandboxpb.ExecuteBatchV1Event, 0, len(request.Cases)+1)
+	for {
+		event, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			return events, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("receive batch from sandbox %s: %w", address, err)
+		}
+		events = append(events, event)
+	}
 }
 
 func (c *Client) acquire(address string) (*connectionEntry, error) {
