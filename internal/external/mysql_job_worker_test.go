@@ -449,7 +449,7 @@ func newTestMySQLJobRepositoryWithClock(
 	database *sql.DB,
 	store SourceObjectStore,
 	now func() time.Time,
-) *MySQLJobRepository {
+) *testMySQLJobRepository {
 	t.Helper()
 	cipher, err := NewSourceCipher(1, map[uint16][]byte{1: bytes.Repeat([]byte{0x42}, 32)}, rand.Reader)
 	if err != nil {
@@ -465,7 +465,7 @@ func newTestMySQLJobRepositoryWithClock(
 	if err != nil {
 		t.Fatal(err)
 	}
-	return repository
+	return &testMySQLJobRepository{MySQLJobRepository: repository}
 }
 
 func expireClaimLease(t *testing.T, database *sql.DB, claim WorkerJobClaim) {

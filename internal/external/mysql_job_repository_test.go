@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -92,7 +93,9 @@ func TestMySQLJobRepositoryAdmissionIsIdempotentEncryptedAndTenantOwned(t *testi
 	if first.Replayed || first.Job.Status != JobStatusQueued || first.Job.ExternalID == "" || first.Job.TenantExternalID != tenantA {
 		t.Fatalf("first submit = %+v", first)
 	}
-	replay, err := repository.Submit(context.Background(), tenantA, "job-submit-key-0001", request)
+	replay, err := repository.MySQLJobRepository.Submit(context.Background(), tenantA, "job-submit-key-0001", request, func() error {
+		return errors.New("quota unavailable")
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +155,7 @@ func TestMySQLJobRepositoryRejectsPendingBundleOwnership(t *testing.T) {
 	tenantID := strings.Repeat("6", 26)
 	bundleID := strings.Repeat("7", 26)
 	insertTenantBundleAndCallback(t, database, tenantID, bundleID, "", 2)
-	if _, err := database.Exec("UPDATE t_external_bundle SET ready_at = NULL WHERE external_id = ?", bundleID); err != nil {
+	if _, err := database.Exec("UPDATE t_external_bundle SET publication_status = 'PENDING', ready_at = NULL WHERE external_id = ?", bundleID); err != nil {
 		t.Fatal(err)
 	}
 	store := newMemorySourceStore()
@@ -180,6 +183,7 @@ func TestMySQLJobRepositoryConcurrentReplayCreatesOneJobAndOneObject(t *testing.
 	request := JudgeJobRequest{BundleID: bundleID, Language: "go126", SourceCode: []byte("package main\nfunc main(){}")}
 
 	const callers = 12
+	var admissionCalls atomic.Int64
 	results := make(chan SubmitJobResult, callers)
 	errorsChannel := make(chan error, callers)
 	start := make(chan struct{})
@@ -189,7 +193,10 @@ func TestMySQLJobRepositoryConcurrentReplayCreatesOneJobAndOneObject(t *testing.
 		go func() {
 			defer wait.Done()
 			<-start
-			result, err := repository.Submit(context.Background(), tenantID, "concurrent-job-key", request)
+			result, err := repository.MySQLJobRepository.Submit(context.Background(), tenantID, "concurrent-job-key", request, func() error {
+				admissionCalls.Add(1)
+				return nil
+			})
 			results <- result
 			errorsChannel <- err
 		}()
@@ -215,6 +222,9 @@ func TestMySQLJobRepositoryConcurrentReplayCreatesOneJobAndOneObject(t *testing.
 	objects, puts, deletes := store.snapshot()
 	if len(objects) != 1 || puts != 1 || deletes != 0 {
 		t.Fatalf("source lifecycle puts=%d deletes=%d objects=%d", puts, deletes, len(objects))
+	}
+	if admissionCalls.Load() != 1 {
+		t.Fatalf("concurrent idempotent admission calls=%d want=1", admissionCalls.Load())
 	}
 	var jobs int
 	if err := database.QueryRow("SELECT COUNT(*) FROM t_external_job").Scan(&jobs); err != nil || jobs != 1 {
@@ -503,7 +513,13 @@ ADD CONSTRAINT chk_test_reject_source CHECK (external_id <> external_id)`); err 
 	}
 }
 
-func newTestMySQLJobRepository(t *testing.T, database *sql.DB, store SourceObjectStore) *MySQLJobRepository {
+type testMySQLJobRepository struct{ *MySQLJobRepository }
+
+func (repository *testMySQLJobRepository) Submit(ctx context.Context, tenantID, idempotencyKey string, request JudgeJobRequest) (SubmitJobResult, error) {
+	return repository.MySQLJobRepository.Submit(ctx, tenantID, idempotencyKey, request, func() error { return nil })
+}
+
+func newTestMySQLJobRepository(t *testing.T, database *sql.DB, store SourceObjectStore) *testMySQLJobRepository {
 	t.Helper()
 	cipher, err := NewSourceCipher(1, map[uint16][]byte{1: bytes.Repeat([]byte{0x42}, 32)}, rand.Reader)
 	if err != nil {
@@ -519,7 +535,7 @@ func newTestMySQLJobRepository(t *testing.T, database *sql.DB, store SourceObjec
 	if err != nil {
 		t.Fatal(err)
 	}
-	return repository
+	return &testMySQLJobRepository{MySQLJobRepository: repository}
 }
 
 func prepareExternalJobDatabase(t *testing.T, database *sql.DB) {
@@ -559,8 +575,8 @@ func insertTenantBundleAndCallback(t *testing.T, database *sql.DB, tenantID, bun
 		t.Fatal(err)
 	}
 	if _, err := database.Exec(`
-INSERT INTO t_external_bundle(external_id, tenant_id, sha256, object_key, size_bytes, case_count, manifest_version, manifest_json, ready_at)
-VALUES (?, ?, UNHEX(SHA2(?, 256)), ?, 128, 1, 1, JSON_OBJECT('schemaVersion', 1, 'cases', JSON_ARRAY()), NOW(3))`,
+INSERT INTO t_external_bundle(external_id, tenant_id, sha256, object_key, size_bytes, case_count, manifest_version, manifest_json, publication_status, ready_at)
+VALUES (?, ?, UNHEX(SHA2(?, 256)), ?, 128, 1, 1, JSON_OBJECT('schemaVersion', 1, 'cases', JSON_ARRAY()), 'READY', NOW(3))`,
 		bundleID, tenantInternalID, bundleID, "external/"+tenantID+"/sha256/"+bundleID+".zip"); err != nil {
 		t.Fatal(err)
 	}

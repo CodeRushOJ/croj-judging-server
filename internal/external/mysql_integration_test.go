@@ -220,9 +220,9 @@ VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaa', 'legacy tenant', 'ACTIVE', ?)`, policy)
 	bundleResult, err := database.ExecContext(ctx, `
 INSERT INTO t_external_bundle(
     external_id, tenant_id, sha256, object_key, size_bytes, case_count,
-    manifest_version, manifest_json, ready_at
+    manifest_version, manifest_json, publication_status, ready_at
 ) VALUES ('bbbbbbbbbbbbbbbbbbbbbbbbbb', ?, UNHEX(SHA2('legacy-bundle', 256)),
-          'external/legacy.zip', 1, 1, 1, JSON_OBJECT('schemaVersion', 1), NOW(3))`, tenantID)
+          'external/legacy.zip', 1, 1, 1, JSON_OBJECT('schemaVersion', 1), 'READY', NOW(3))`, tenantID)
 	if err != nil {
 		t.Fatal(err)
 	}

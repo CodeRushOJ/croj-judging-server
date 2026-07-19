@@ -9,7 +9,7 @@ import (
 )
 
 type durableJobRepository interface {
-	Submit(context.Context, string, string, external.JudgeJobRequest) (external.SubmitJobResult, error)
+	Submit(context.Context, string, string, external.JudgeJobRequest, func() error) (external.SubmitJobResult, error)
 	List(context.Context, string, external.JobListOptions) (external.JobListResult, error)
 	Get(context.Context, string, string) (external.ExternalJobRecord, error)
 	Cancel(context.Context, string, string) (external.ExternalJobRecord, error)
@@ -29,13 +29,21 @@ func (service *MySQLJobService) Submit(
 	tenantID string,
 	idempotencyKey string,
 	command SubmitJobCommand,
+	admit JobAdmission,
 ) (JobView, bool, error) {
+	var admissionErr error
 	result, err := service.repository.Submit(ctx, tenantID, idempotencyKey, external.JudgeJobRequest{
 		BundleID: command.BundleID, Language: command.Language, SourceCode: []byte(command.SourceCode),
 		StopOnFailure: command.StopOnFailure, CallbackID: command.CallbackID,
 		ClientReference: command.ClientReference,
+	}, func() error {
+		admissionErr = admit()
+		return admissionErr
 	})
 	if err != nil {
+		if admissionErr != nil && errors.Is(err, admissionErr) {
+			return JobView{}, false, admissionErr
+		}
 		return JobView{}, false, mapRepositoryJobError(err)
 	}
 	view, err := publicJobView(result.Job)

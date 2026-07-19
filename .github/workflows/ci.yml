@@ -69,5 +69,9 @@ jobs:
         env:
           EXTERNAL_JUDGE_MYSQL_TEST_DSN: root:@tcp(127.0.0.1:3306)/croj_bundle_ci?parseTime=true&multiStatements=true
         run: go test -race -count=1 -run '^TestExternalBundleSQLRepositoryIntegration$' ./internal/integration
+      - name: Run durable job repository and lease integration on MySQL 8.4
+        env:
+          JUDGE_TEST_MYSQL_DSN: root:@tcp(127.0.0.1:3306)/croj_bundle_ci?parseTime=true&loc=UTC&charset=utf8mb4
+        run: go test -race -count=1 ./internal/external
       - name: Verify bundle MySQL CI contract
         run: bash scripts/ci/test-bundle-mysql84-contract.sh

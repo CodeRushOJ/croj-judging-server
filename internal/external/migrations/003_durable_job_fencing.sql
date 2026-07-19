@@ -65,8 +65,8 @@ ALTER TABLE t_external_job
 -- migrate:split
 CREATE TABLE IF NOT EXISTS t_external_source_reservation (
     object_key VARCHAR(1024) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-	owner_token BINARY(32) NOT NULL,
-	lease_until DATETIME(3) NOT NULL,
+    owner_token BINARY(32) NOT NULL,
+    lease_until DATETIME(3) NOT NULL,
     created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     PRIMARY KEY (object_key),
     KEY idx_external_source_reservation_created (created_at)

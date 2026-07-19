@@ -24,8 +24,13 @@ type durableJobRepositoryStub struct {
 	listOptions  external.JobListOptions
 }
 
-func (repository *durableJobRepositoryStub) Submit(_ context.Context, tenantID, key string, request external.JudgeJobRequest) (external.SubmitJobResult, error) {
+func (repository *durableJobRepositoryStub) Submit(_ context.Context, tenantID, key string, request external.JudgeJobRequest, admit func() error) (external.SubmitJobResult, error) {
 	repository.tenantID, repository.key, repository.request = tenantID, key, request
+	if !repository.submitResult.Replayed && repository.submitError == nil {
+		if err := admit(); err != nil {
+			return external.SubmitJobResult{}, err
+		}
+	}
 	return repository.submitResult, repository.submitError
 }
 
@@ -69,7 +74,7 @@ func TestMySQLJobServiceMapsCommandsAndRedactsRepositoryInternals(t *testing.T) 
 	view, replayed, err := service.Submit(context.Background(), record.TenantExternalID, "idempotency-key", SubmitJobCommand{
 		BundleID: record.BundleExternalID, Language: "cpp20", SourceCode: "int main(){}",
 		StopOnFailure: true, CallbackID: "eeeeeeeeeeeeeeeeeeeeeeeeee", ClientReference: "client-7",
-	})
+	}, func() error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,6 +127,21 @@ func TestMySQLJobServiceMapsListAndPublicErrors(t *testing.T) {
 				t.Fatalf("error = %v", err)
 			}
 		})
+	}
+}
+
+func TestMySQLJobServicePreservesAdmissionError(t *testing.T) {
+	repository := &durableJobRepositoryStub{}
+	service, err := NewMySQLJobService(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	quotaError := errors.New("quota unavailable")
+	_, _, err = service.Submit(context.Background(), "bbbbbbbbbbbbbbbbbbbbbbbbbb", "idempotency-key", SubmitJobCommand{
+		BundleID: "cccccccccccccccccccccccccc", Language: "cpp20", SourceCode: "int main(){}",
+	}, func() error { return quotaError })
+	if !errors.Is(err, quotaError) {
+		t.Fatalf("admission error was remapped: %v", err)
 	}
 }
 

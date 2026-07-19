@@ -2,13 +2,13 @@
 
 ## Scope
 
-This slice makes asynchronous external judge jobs durable. It owns MySQL job admission, tenant isolation, encrypted-source object metadata, stable reads, cancellation, worker leases, attempts, retry, and restart recovery. It does not execute Sandbox work, deliver webhooks, or implement Redis request-rate limiting.
+This slice makes asynchronous external judge jobs durable. It owns MySQL job admission, tenant isolation, encrypted-source object metadata, stable reads, cancellation, worker leases, attempts, retry, and restart recovery. It does not execute Sandbox work or deliver webhooks; the HTTP layer supplies Redis admission as a closure after repository idempotency serialization.
 
 ## Admission transaction
 
 `MySQLJobRepository.Submit` validates the canonical request before side effects. It computes `HMAC-SHA256(idempotency-pepper, Idempotency-Key)` and the canonical request hash, then starts an InnoDB transaction. The transaction locks the active tenant row, decodes and validates its policy, looks up a non-deleted bundle and enabled callback through the same tenant, and counts queued jobs. An unavailable or invalid policy/quota state fails closed.
 
-An existing `(tenant, operation_scope, key_digest)` row with the same request hash returns the original job; a different hash returns an idempotency conflict. For a new job, the service generates source/job IDs, encrypts source with tenant and source ID as AES-GCM associated data, durably reserves the private object key before upload, and persists only object key, digest, length, key version, and nonce. Database commit publishes the job and idempotency response. Definite rollback compensates immediately. Outcome-ambiguous writes keep their reservation so a retention sweeper can compare it with authoritative source metadata and delete only unreferenced ciphertext.
+An existing `(tenant, operation_scope, key_digest)` row with the same request hash returns the original job without consuming Redis quota; a different hash returns an idempotency conflict. A new job invokes the admission closure exactly once after policy/bundle/callback validation. The service encrypts source with tenant and source ID as AES-GCM associated data, precommits an owner-token/lease reservation, locks it in the admission transaction, and persists only object key, digest, length, key version, and nonce. Database commit atomically publishes the job/idempotency response and removes the reservation. Definite rollback compensates immediately. Outcome-ambiguous writes keep their reservation so a sweeper waits for lease expiry, skips transaction-locked rows, and deletes only ciphertext without authoritative source metadata.
 
 ## Reads and cancellation
 
