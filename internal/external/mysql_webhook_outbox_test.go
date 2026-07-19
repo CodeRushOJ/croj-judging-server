@@ -3,15 +3,202 @@ package external
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/netip"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestMySQLWebhookEndToEndHMACAndAtLeastOnceRecovery(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+
+	callbackCipher, err := NewCallbackCipher(1, map[uint16][]byte{
+		1: bytes.Repeat([]byte{0x91}, 32),
+	}, rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provisioner, err := NewProvisioner(database, rand.Reader,
+		WithCallbackCipher(callbackCipher),
+		WithCallbackResolver(callbackResolverStub{addresses: []netip.Addr{netip.MustParseAddr("8.8.8.8")}}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tenantID, err := provisioner.CreateTenant(context.Background(), "Webhook contract", TenantPolicy{
+		MaxQueuedJobs: 8, MaxRunningJobs: 1, MaxSourceBytes: 1 << 20,
+		MaxRetainedBundles: 16, DailyExecutionMillis: 3_600_000, MaxInfrastructureTries: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundleID := strings.Repeat("b", 26)
+	insertWebhookContractBundle(t, database, tenantID, bundleID)
+	callback, err := provisioner.CreateCallback(context.Background(), tenantID, "https://webhook.example.test/judge")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	jobs := newTestMySQLJobRepository(t, database, newMemorySourceStore())
+	outbox := newTestMySQLWebhookOutboxRepository(t, database, 12)
+	complete := func(idempotencyKey, workerID string) {
+		t.Helper()
+		submitted := submitWebhookJob(t, jobs, tenantID, bundleID, callback.CallbackID, idempotencyKey)
+		claim, claimErr := jobs.ClaimNext(context.Background(), workerID, time.Minute)
+		if claimErr != nil {
+			t.Fatal(claimErr)
+		}
+		if claim.Job.ExternalID != submitted.Job.ExternalID {
+			t.Fatalf("claimed job=%s want=%s", claim.Job.ExternalID, submitted.Job.ExternalID)
+		}
+		if completeErr := jobs.Complete(context.Background(), claim, DurableJobResult{
+			Verdict: "ACCEPTED", CompileStatus: "SUCCEEDED", Cases: []DurableCaseResult{},
+		}); completeErr != nil {
+			t.Fatal(completeErr)
+		}
+	}
+
+	type capturedDelivery struct {
+		eventID, timestamp, signature string
+		body                          []byte
+	}
+	var deliveries []capturedDelivery
+	deliverer, err := newWebhookDelivererForTest(webhookContractRoundTripper(func(request *http.Request) (*http.Response, error) {
+		body, readErr := io.ReadAll(request.Body)
+		if readErr != nil {
+			return nil, readErr
+		}
+		deliveries = append(deliveries, capturedDelivery{
+			eventID:   request.Header.Get("X-CodeRushOJ-Event-Id"),
+			timestamp: request.Header.Get("X-CodeRushOJ-Timestamp"),
+			signature: request.Header.Get("X-CodeRushOJ-Signature"),
+			body:      append([]byte(nil), body...),
+		})
+		return &http.Response{StatusCode: http.StatusNoContent, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(""))}, nil
+	}), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliver := func(claim WebhookClaim) {
+		t.Helper()
+		secret, decryptErr := callbackCipher.Decrypt(claim.TenantID, claim.CallbackID, claim.DestinationURL, claim.EncryptedSecret())
+		if decryptErr != nil {
+			t.Fatal(decryptErr)
+		}
+		defer clear(secret)
+		if string(secret) != callback.Secret {
+			t.Fatal("decrypted callback secret differs from one-time provisioning material")
+		}
+		outcome := deliverer.DeliverOutcome(context.Background(), WebhookDelivery{
+			EventID: claim.EventID, DestinationURL: claim.DestinationURL, Secret: secret, Body: claim.Body,
+		}, maximumWebhookRetryAfter)
+		if outcome.Disposition != WebhookDelivered || outcome.HTTPStatus != http.StatusNoContent || outcome.err != nil {
+			t.Fatalf("delivery outcome=%+v", outcome)
+		}
+	}
+	assertSignedDelivery := func(index int, claim WebhookClaim) {
+		t.Helper()
+		got := deliveries[index]
+		if got.eventID != claim.EventID || !bytes.Equal(got.body, claim.Body) {
+			t.Fatalf("delivery[%d] event/body changed", index)
+		}
+		if _, parseErr := strconv.ParseInt(got.timestamp, 10, 64); parseErr != nil {
+			t.Fatalf("delivery[%d] timestamp=%q is not a Unix second", index, got.timestamp)
+		}
+		if got.signature != webhookContractSignature([]byte(callback.Secret), got.eventID, got.timestamp, got.body) {
+			t.Fatalf("delivery[%d] signature=%q is invalid", index, got.signature)
+		}
+	}
+
+	complete("webhook-contract-first", "job-worker-first")
+	first, err := outbox.ClaimNextWebhook(context.Background(), "callback-worker-first", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliver(first)
+	assertSignedDelivery(0, first)
+	if err := outbox.SettleWebhook(context.Background(), first, WebhookSettlement{
+		Disposition: WebhookDelivered, HTTPStatus: http.StatusNoContent,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertWebhookState(t, database, first.OutboxID, "DELIVERED", http.StatusNoContent, "", true, false)
+
+	complete("webhook-contract-retry", "job-worker-retry")
+	second, err := outbox.ClaimNextWebhook(context.Background(), "callback-worker-crashed", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliver(second) // Remote accepted it, but the worker crashes before settlement.
+	assertSignedDelivery(1, second)
+	if _, err := database.Exec(`UPDATE t_external_webhook_outbox
+SET lease_until = CURRENT_TIMESTAMP(3) - INTERVAL 1 SECOND WHERE id = ?`, second.OutboxID); err != nil {
+		t.Fatal(err)
+	}
+	reclaimed, err := outbox.ClaimNextWebhook(context.Background(), "callback-worker-recovery", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reclaimed.EventID != second.EventID || !bytes.Equal(reclaimed.Body, second.Body) || reclaimed.AttemptCount != second.AttemptCount+1 {
+		t.Fatalf("reclaimed delivery changed: first=%s reclaimed=%s", second, reclaimed)
+	}
+	deliver(reclaimed)
+	assertSignedDelivery(2, reclaimed)
+	if err := outbox.SettleWebhook(context.Background(), second, WebhookSettlement{
+		Disposition: WebhookDelivered, HTTPStatus: http.StatusNoContent,
+	}); !errors.Is(err, ErrWebhookLeaseLost) {
+		t.Fatalf("stale settlement error=%v", err)
+	}
+	if err := outbox.SettleWebhook(context.Background(), reclaimed, WebhookSettlement{
+		Disposition: WebhookDelivered, HTTPStatus: http.StatusNoContent,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertWebhookState(t, database, reclaimed.OutboxID, "DELIVERED", http.StatusNoContent, "", true, false)
+	if len(deliveries) != 3 || deliveries[1].eventID != deliveries[2].eventID || !bytes.Equal(deliveries[1].body, deliveries[2].body) {
+		t.Fatalf("at-least-once retry was not byte-stable: %#v", deliveries)
+	}
+}
+
+type webhookContractRoundTripper func(*http.Request) (*http.Response, error)
+
+func (roundTripper webhookContractRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	return roundTripper(request)
+}
+
+func webhookContractSignature(secret []byte, eventID, timestamp string, body []byte) string {
+	digest := hmac.New(sha256.New, secret)
+	_, _ = fmt.Fprintf(digest, "v1\n%d\n%s\n%s\n", len(eventID), eventID, timestamp)
+	_, _ = digest.Write(body)
+	return "v1=" + hex.EncodeToString(digest.Sum(nil))
+}
+
+func insertWebhookContractBundle(t *testing.T, database *sql.DB, tenantID, bundleID string) {
+	t.Helper()
+	if _, err := database.Exec(`
+INSERT INTO t_external_bundle(
+    external_id, tenant_id, sha256, object_key, size_bytes, case_count,
+    manifest_version, manifest_json, publication_status, ready_at
+)
+SELECT ?, tenant.id, UNHEX(SHA2(?, 256)), ?, 128, 1,
+       1, JSON_OBJECT('schemaVersion', 1, 'cases', JSON_ARRAY()), 'READY', CURRENT_TIMESTAMP(3)
+FROM t_external_tenant AS tenant WHERE tenant.external_id = ?`,
+		bundleID, bundleID, "external/"+tenantID+"/sha256/"+bundleID+".zip", tenantID); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestMySQLWebhookRepositoryDefaultsMaximumAttemptsAndRedactsJSON(t *testing.T) {
 	repository, err := NewMySQLWebhookOutboxRepository(MySQLWebhookOutboxRepositoryConfig{
@@ -36,6 +223,9 @@ func TestWebhookSettlementRejectsDispositionMatrixContradictions(t *testing.T) {
 		{Disposition: WebhookRetry, HTTPStatus: 201, ErrorCode: WebhookErrorHTTPRetryable, RetryAt: retryAt},
 		{Disposition: WebhookRetry, HTTPStatus: 400, ErrorCode: WebhookErrorHTTPRetryable, RetryAt: retryAt},
 		{Disposition: WebhookRetry, ErrorCode: WebhookErrorHTTPRetryable, RetryAt: retryAt},
+		{Disposition: WebhookRetry, ErrorCode: WebhookErrorNetwork, RetryAt: retryAt, RetryDelay: time.Second},
+		{Disposition: WebhookRetry, ErrorCode: WebhookErrorNetwork, RetryDelay: -time.Second},
+		{Disposition: WebhookRetry, ErrorCode: WebhookErrorNetwork, RetryDelay: maximumWebhookRetryAfter + time.Millisecond},
 		{Disposition: WebhookPermanentFailure, HTTPStatus: 503, ErrorCode: WebhookErrorHTTPPermanent},
 		{Disposition: WebhookPermanentFailure, HTTPStatus: 400, ErrorCode: WebhookErrorNetwork},
 	}
@@ -46,6 +236,7 @@ func TestWebhookSettlementRejectsDispositionMatrixContradictions(t *testing.T) {
 	}
 	valid := []WebhookSettlement{
 		{Disposition: WebhookRetry, ErrorCode: WebhookErrorNetwork, RetryAt: retryAt},
+		{Disposition: WebhookRetry, ErrorCode: WebhookErrorNetwork, RetryDelay: time.Second},
 		{Disposition: WebhookRetry, HTTPStatus: 429, ErrorCode: WebhookErrorHTTPRetryable, RetryAt: retryAt},
 		{Disposition: WebhookPermanentFailure, HTTPStatus: 301, ErrorCode: WebhookErrorHTTPPermanent},
 		{Disposition: WebhookPermanentFailure, HTTPStatus: 400, ErrorCode: WebhookErrorHTTPPermanent},
