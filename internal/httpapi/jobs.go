@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -119,13 +120,18 @@ func (server *Server) handleJobSubmit(response http.ResponseWriter, request *htt
 	if !authenticated {
 		return
 	}
-	idempotencyKey := request.Header.Get("Idempotency-Key")
+	idempotencyValues := request.Header.Values("Idempotency-Key")
+	if len(idempotencyValues) != 1 {
+		writeProblem(response, problemFor(http.StatusBadRequest, "invalid-idempotency-key", "Invalid Idempotency-Key", "Provide exactly one Idempotency-Key header.", requestID))
+		return
+	}
+	idempotencyKey := idempotencyValues[0]
 	if err := external.ValidateIdempotencyKey(idempotencyKey); err != nil {
 		writeProblem(response, problemFor(http.StatusBadRequest, "invalid-idempotency-key", "Invalid Idempotency-Key", "Provide 16 to 128 visible ASCII characters.", requestID))
 		return
 	}
 	var command SubmitJobCommand
-	if err := decodeStrictJSON(response, request, &command, 2<<20); err != nil {
+	if err := decodeStrictJSON(response, request, &command, maximumJobRequestBytes(server.capabilities.Limits.MaxSourceBytes)); err != nil {
 		writeProblem(response, problemFor(http.StatusBadRequest, "invalid-json", "Invalid request body", "Provide one JSON object containing only documented fields.", requestID))
 		return
 	}
@@ -166,7 +172,10 @@ func (server *Server) handleJobList(response http.ResponseWriter, request *http.
 }
 
 func parseJobListQuery(request *http.Request) (JobListQuery, error) {
-	values := request.URL.Query()
+	values, err := url.ParseQuery(request.URL.RawQuery)
+	if err != nil {
+		return JobListQuery{}, ErrJobInvalid
+	}
 	for key, entries := range values {
 		if key != "cursor" && key != "limit" && key != "status" || len(entries) != 1 {
 			return JobListQuery{}, ErrJobInvalid
@@ -192,6 +201,10 @@ func parseJobListQuery(request *http.Request) (JobListQuery, error) {
 		}
 	}
 	return query, nil
+}
+
+func maximumJobRequestBytes(maxSourceBytes int64) int64 {
+	return maxSourceBytes*6 + (64 << 10)
 }
 
 func (server *Server) handleJobGet(response http.ResponseWriter, request *http.Request, requestID, jobID string) {
