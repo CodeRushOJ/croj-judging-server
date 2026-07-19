@@ -6,6 +6,12 @@ Go 判题编排服务，负责消费 `submission-topic`、读取提交快照、�
 
 面向外部 OJ 的版本化异步 REST 适配器正在 Draft PR #17 中实施。已有切片包括 RFC 9457 错误、请求 ID、不透明 API Key 的 peppered HMAC 验证与 scope、`GET /api/v1/capabilities`、Judge 自有 MySQL 迁移、租户/密钥预置、不可变 hidden bundle 上传/元数据端点，以及 `POST /api/v1/judge-jobs`、任务列表/详情/取消的脱敏 HTTP 合约和 lease/attempt 状态机。Webhook 已具备精确载荷 HMAC 签名、禁止重定向、状态重试矩阵及 DNS rebinding/私网 SSRF 防护；Redis 原子令牌桶使用服务端时间，在多副本间统一限制任务提交和 bundle 实际上传字节，配额不可用时新写入 fail closed 为 `503`，读取继续可用。在 MySQL job/outbox repository、worker 和 E2E 门禁完成前，该 HTTP 端口不标记为可发布。
 
+## 外部 OJ 接入（Draft）
+
+从 [`api/openapi.yaml`](api/openapi.yaml) 获取可被工具直接加载和校验的 OpenAPI 3.1 契约。推荐接入顺序是：读取 capabilities → 上传 immutable bundle → 幂等提交 judge job → 按 `Location`/`statusUrl` 轮询，必要时请求取消。规范内包含可复制的 curl、RFC 9457 错误、租户隔离 `404`、幂等 replay/conflict、状态语义和 webhook v1 签名 framing。
+
+此契约仍处于 Draft/beta；当前分支只交付文档和自动化一致性门禁，不会启动 HTTP listener，也不代表该端口已经开放部署。生产接入必须等待持久 job/outbox worker、进程装配、Kubernetes 私有 Service 与跨组件 E2E 全部完成。
+
 ## 架构
 
 ```mermaid
