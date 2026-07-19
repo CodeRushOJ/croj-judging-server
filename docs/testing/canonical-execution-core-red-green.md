@@ -242,3 +242,23 @@ $ go vet ./...
 $ CGO_ENABLED=0 go build -trimpath ./cmd ./cmd/judge-admin
 (no output; exit 0)
 ```
+
+## Disabled-tenant maintenance budget review regression
+
+Final independent review found that more than 32 expired `RUNNING` jobs for disabled tenants could consume the internal claim-maintenance budget. Despite each iteration making progress, the repository returned a fatal unavailable error before active queued work became visible. A real MySQL 8.4.10 test with 33 expired rows captured the RED:
+
+```text
+$ JUDGE_TEST_MYSQL_DSN=... go test ./internal/external -run '^TestMySQLWorkerBatchesDisabledTenantRecoveryWithoutFatalExhaustion$' -count=1
+--- FAIL: TestMySQLWorkerBatchesDisabledTenantRecoveryWithoutFatalExhaustion (1.23s)
+    productive maintenance budget returned fatal error: external judge job repository is unavailable: worker claim contention budget exhausted: judge job is not claimable
+FAIL
+```
+
+`ClaimNext` now distinguishes productive recovery from pure contention. When useful maintenance exhausts a pass, it returns `ErrJobNotClaimable`; the runner performs its normal bounded backoff, starts another pass, finishes cleanup, and claims the active tenant's job.
+
+```text
+$ JUDGE_TEST_MYSQL_DSN=... go test ./internal/external -run '^TestMySQLWorkerBatchesDisabledTenantRecoveryWithoutFatalExhaustion$' -count=1
+ok github.com/CodeRushOJ/croj-judging-server/internal/external 0.772s
+```
+
+Both disposable RED and GREEN MySQL containers and networks were removed by their shell traps.

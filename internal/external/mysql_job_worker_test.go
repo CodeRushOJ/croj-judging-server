@@ -353,6 +353,58 @@ func TestMySQLWorkerSkipsDisabledTenantWithoutStarvingOthers(t *testing.T) {
 	}
 }
 
+func TestMySQLWorkerBatchesDisabledTenantRecoveryWithoutFatalExhaustion(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	disabledTenant := strings.Repeat("i", 26)
+	activeTenant := strings.Repeat("j", 26)
+	disabledBundle := strings.Repeat("k", 26)
+	activeBundle := strings.Repeat("m", 26)
+	insertTenantBundleAndCallback(t, database, disabledTenant, disabledBundle, "", 40)
+	insertTenantBundleAndCallback(t, database, activeTenant, activeBundle, "", 2)
+	if _, err := database.Exec(`UPDATE t_external_tenant
+SET policy_json = JSON_SET(policy_json, '$.maxRunningJobs', 40)
+WHERE external_id = ?`, disabledTenant); err != nil {
+		t.Fatal(err)
+	}
+	repository := newTestMySQLJobRepository(t, database, newMemorySourceStore())
+	claims := make([]WorkerJobClaim, 0, 33)
+	for index := 0; index < 33; index++ {
+		if _, err := repository.Submit(context.Background(), disabledTenant, fmt.Sprintf("disabled-maint-%03d", index), JudgeJobRequest{
+			BundleID: disabledBundle, Language: "cpp20", SourceCode: []byte("int main(){}"),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		claim, err := repository.ClaimNext(context.Background(), fmt.Sprintf("disabled-worker-%03d", index), time.Minute)
+		if err != nil || claim.Job.TenantExternalID != disabledTenant {
+			t.Fatalf("disabled claim %d=%+v error=%v", index, claim, err)
+		}
+		claims = append(claims, claim)
+	}
+	if _, err := database.Exec("UPDATE t_external_tenant SET status = 'DISABLED' WHERE external_id = ?", disabledTenant); err != nil {
+		t.Fatal(err)
+	}
+	for _, claim := range claims {
+		expireClaimLease(t, database, claim)
+	}
+	active, err := repository.Submit(context.Background(), activeTenant, "active-after-maint", JudgeJobRequest{
+		BundleID: activeBundle, Language: "cpp20", SourceCode: []byte("int main(){}"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.ClaimNext(context.Background(), "maintenance-pass-one", time.Minute); !errors.Is(err, ErrJobNotClaimable) {
+		t.Fatalf("productive maintenance budget returned fatal error: %v", err)
+	}
+	claimed, err := repository.ClaimNext(context.Background(), "maintenance-pass-two", time.Minute)
+	if err != nil || claimed.Job.ExternalID != active.Job.ExternalID || claimed.Job.TenantExternalID != activeTenant {
+		t.Fatalf("active job after maintenance=%+v error=%v", claimed, err)
+	}
+	if failed := mustCount(t, database, "SELECT COUNT(*) FROM t_external_job WHERE status = 'FAILED' AND failure_code = 'TENANT_DISABLED'"); failed != 33 {
+		t.Fatalf("disabled maintenance failures=%d want=33", failed)
+	}
+}
+
 func TestMySQLWorkerHeartbeatCompletionAndRestartReclaimAreFenced(t *testing.T) {
 	database := openMySQLIntegration(t)
 	prepareExternalJobDatabase(t, database)
