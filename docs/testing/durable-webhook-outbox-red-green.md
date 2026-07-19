@@ -180,6 +180,22 @@ ok github.com/CodeRushOJ/croj-judging-server/internal/external 1.775s
 
 A final cross-boundary review caught informational HTTP responses being terminal in the deliverer but rejected by repository settlement. A RED test reproduced the mismatch; non-final status ranges are now converted to the status-zero `invalid_delivery` terminal outcome, preserving the strict persisted 2xx/retry/3xx/4xx matrix.
 
+## Task 8: Delivery worker, jitter, and lifecycle
+
+### RED
+
+Worker tests were written before implementation and failed to compile because `WebhookWorker`, its repository/deliverer boundaries, and `webhookBackoff` did not exist. Tests specified exponential saturation, `[0.5,1.5]` jitter, Retry-After precedence, decrypt/deliver/settle orchestration, secret clearing, cancellation, stale ownership, idle behavior, retention, and authority-cache cleanup.
+
+### GREEN
+
+The worker now decrypts immediately before delivery, clears plaintext and encrypted copies (including partial plaintext returned with an error), reuses only authority-bound safe transports in a bounded LRU, and delegates terminal retry/dead decisions to the DB-fenced repository. Retry scheduling is persisted as a relative delay from a fresh MySQL timestamp, while measured claim round-trip time conservatively reduces the local HTTP lease budget. A later RED regression proved that using the absolute database `LeaseUntil` as a host context deadline breaks under node clock offset; HTTP cancellation now uses the remaining lease duration instead.
+
+```text
+ok github.com/CodeRushOJ/croj-judging-server/internal/external 1.026s
+```
+
+Review regressions also cover concurrent cache misses (both callers receive the same live deliverer), eviction cleanup behavior, and retention backlogs. Terminal rows are drained in bounded batches with a 10,000-row pass budget and promptly revisited when that budget is exhausted, rather than accumulating behind a single hourly 100-row sweep. A wall-clock rollback regression separately verifies that local lease budgeting uses monotonic elapsed time and never allows a POST after its database lease budget is consumed.
+
 Independent review added two regression tests. They failed first because HTTP-date delay used the pre-request signing time (`12m0s` instead of `2m0s`) and a duration-overflowing delta was clamped (`15m0s`) instead of ignored. After sampling the injected clock after `RoundTrip` and rejecting delta values beyond `time.Duration`, the full focused suite passed:
 
 ```text
