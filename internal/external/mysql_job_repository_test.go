@@ -71,8 +71,10 @@ func TestMySQLJobRepositoryAdmissionIsIdempotentEncryptedAndTenantOwned(t *testi
 	tenantB := strings.Repeat("b", 26)
 	bundleA := strings.Repeat("c", 26)
 	callbackA := strings.Repeat("d", 26)
+	bundleB := strings.Repeat("e", 26)
+	callbackB := strings.Repeat("f", 26)
 	insertTenantBundleAndCallback(t, database, tenantA, bundleA, callbackA, 4)
-	insertTenantBundleAndCallback(t, database, tenantB, strings.Repeat("e", 26), strings.Repeat("f", 26), 4)
+	insertTenantBundleAndCallback(t, database, tenantB, bundleB, callbackB, 4)
 	store := newMemorySourceStore()
 	repository := newTestMySQLJobRepository(t, database, store)
 	request := JudgeJobRequest{
@@ -104,6 +106,21 @@ func TestMySQLJobRepositoryAdmissionIsIdempotentEncryptedAndTenantOwned(t *testi
 	crossTenant.CallbackID = ""
 	if _, err := repository.Submit(context.Background(), tenantB, "job-submit-key-0002", crossTenant); !errors.Is(err, ErrExternalJobInvalid) {
 		t.Fatalf("cross-tenant bundle error = %v", err)
+	}
+	crossTenantCallback := request
+	crossTenantCallback.BundleID = bundleB
+	crossTenantCallback.CallbackID = callbackA
+	if _, err := repository.Submit(context.Background(), tenantB, "job-submit-key-0003", crossTenantCallback); !errors.Is(err, ErrExternalJobInvalid) {
+		t.Fatalf("cross-tenant callback error = %v", err)
+	}
+	if _, err := database.Exec("UPDATE t_external_callback SET disabled_at = NOW(3) WHERE external_id = ?", callbackB); err != nil {
+		t.Fatal(err)
+	}
+	disabledCallback := request
+	disabledCallback.BundleID = bundleB
+	disabledCallback.CallbackID = callbackB
+	if _, err := repository.Submit(context.Background(), tenantB, "job-submit-key-0004", disabledCallback); !errors.Is(err, ErrExternalJobInvalid) {
+		t.Fatalf("disabled callback error = %v", err)
 	}
 
 	objects, puts, deletes := store.snapshot()
