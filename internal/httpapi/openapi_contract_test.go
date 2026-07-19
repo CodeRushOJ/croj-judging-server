@@ -96,12 +96,17 @@ func TestOpenAPIContractCoversLiveHandlerResponses(t *testing.T) {
 		status       int
 		headers      []string
 	}
-	jobRequest := func(t *testing.T, service *jobServiceStub) (*Server, *http.Request) {
+	jobRawRequest := func(t *testing.T, service *jobServiceStub, body string, keys ...string) (*Server, *http.Request) {
 		server := newJobTestServer(t, service, ScopeJobSubmit)
-		request := httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs", strings.NewReader(`{"bundleId":"ceirceirceirceirceirceircf","language":"cpp20","sourceCode":"x"}`))
+		request := httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs", strings.NewReader(body))
 		request.Header.Set("Authorization", "Bearer dummy")
-		request.Header.Set("Idempotency-Key", "submission-00000042")
+		for _, key := range keys {
+			request.Header.Add("Idempotency-Key", key)
+		}
 		return server, request
+	}
+	jobRequest := func(t *testing.T, service *jobServiceStub) (*Server, *http.Request) {
+		return jobRawRequest(t, service, `{"bundleId":"ceirceirceirceirceirceircf","language":"cpp20","sourceCode":"x"}`, "submission-00000042")
 	}
 	bundleRequest := func(t *testing.T, application *bundleApplicationStub, quota external.Quota) (*Server, *http.Request) {
 		if quota == nil {
@@ -187,6 +192,18 @@ func TestOpenAPIContractCoversLiveHandlerResponses(t *testing.T) {
 		"job replay": {"/api/v1/judge-jobs", http.MethodPost, func(t *testing.T) (*Server, *http.Request) {
 			return jobRequest(t, &jobServiceStub{view: JobView{JobID: "ceirceirceirceirceirceirce", Status: JobQueued}, replayed: true})
 		}, 202, []string{"X-Request-Id", "Location", "Idempotent-Replay"}},
+		"job missing idempotency": {"/api/v1/judge-jobs", http.MethodPost, func(t *testing.T) (*Server, *http.Request) {
+			return jobRawRequest(t, &jobServiceStub{}, `{"bundleId":"ceirceirceirceirceirceircf","language":"cpp20","sourceCode":"x"}`)
+		}, 400, []string{"X-Request-Id"}},
+		"job repeated idempotency": {"/api/v1/judge-jobs", http.MethodPost, func(t *testing.T) (*Server, *http.Request) {
+			return jobRawRequest(t, &jobServiceStub{}, `{"bundleId":"ceirceirceirceirceirceircf","language":"cpp20","sourceCode":"x"}`, "submission-00000042", "submission-00000043")
+		}, 400, []string{"X-Request-Id"}},
+		"job invalid idempotency": {"/api/v1/judge-jobs", http.MethodPost, func(t *testing.T) (*Server, *http.Request) {
+			return jobRawRequest(t, &jobServiceStub{}, `{"bundleId":"ceirceirceirceirceirceircf","language":"cpp20","sourceCode":"x"}`, "short")
+		}, 400, []string{"X-Request-Id"}},
+		"job invalid JSON": {"/api/v1/judge-jobs", http.MethodPost, func(t *testing.T) (*Server, *http.Request) {
+			return jobRawRequest(t, &jobServiceStub{}, `{"sourceCode":`, "submission-00000042")
+		}, 400, []string{"X-Request-Id"}},
 		"job not found": {"/api/v1/judge-jobs", http.MethodPost, func(t *testing.T) (*Server, *http.Request) {
 			return jobRequest(t, &jobServiceStub{err: ErrJobNotFound})
 		}, 404, []string{"X-Request-Id"}},
@@ -238,6 +255,24 @@ func TestOpenAPIContractCoversLiveHandlerResponses(t *testing.T) {
 			}
 			if contentType := strings.Split(response.Header().Get("Content-Type"), ";")[0]; contentType != "" && documented.Value.Content[contentType] == nil {
 				t.Errorf("OpenAPI response misses live content type %s", contentType)
+			}
+			if response.Code >= 400 {
+				var actual Problem
+				if err := json.Unmarshal(response.Body.Bytes(), &actual); err != nil {
+					t.Fatalf("decode live problem: %v", err)
+				}
+				represented := false
+				for _, example := range responseExamples(t, document, test.path, test.method, response.Code) {
+					var documentedProblem Problem
+					decodeStrictExample(t, "documented live problem", example, &documentedProblem)
+					if actual.Type == documentedProblem.Type && actual.Title == documentedProblem.Title && actual.Status == documentedProblem.Status && actual.Detail == documentedProblem.Detail {
+						represented = true
+						break
+					}
+				}
+				if !represented {
+					t.Errorf("live problem is not represented by OpenAPI examples: %+v", actual)
+				}
 			}
 		})
 	}
@@ -303,6 +338,14 @@ func TestOpenAPIContractPinsSecurityHeadersAndAsynchronousSemantics(t *testing.T
 		if jobSubmit.Responses.Status(status).Value.Headers["Retry-After"] == nil {
 			t.Errorf("job submit %d response misses Retry-After", status)
 		}
+	}
+	bundleLocation := operation(t, document, "/api/v1/bundles", http.MethodPost).Responses.Status(201).Value.Headers["Location"]
+	jobLocation := jobSubmit.Responses.Status(202).Value.Headers["Location"]
+	if bundleLocation == nil || bundleLocation.Value == nil || !strings.HasPrefix(fmt.Sprint(bundleLocation.Value.Example), "/api/v1/bundles/") {
+		t.Fatalf("bundle Location example = %#v", bundleLocation)
+	}
+	if jobLocation == nil || jobLocation.Value == nil || !strings.HasPrefix(fmt.Sprint(jobLocation.Value.Example), "/api/v1/judge-jobs/") {
+		t.Fatalf("job Location example = %#v", jobLocation)
 	}
 	if !strings.Contains(document.Info.Description, "v1\\n<event-id-byte-length>\\n<event-id>\\n<timestamp>\\n<raw-body>") ||
 		!strings.Contains(document.Info.Description, "X-CodeRushOJ-Event-Id") ||

@@ -36,6 +36,7 @@
 
 ### Changed
 
+- `Capabilities` 初始化现在拒绝不符合 v1 公共契约的 language metadata、非正数 bundle/case limits 与超过 256 的 case count，并把未配置的 judge mode/checker 规范化为空 JSON 数组。
 - `JudgeService` 不再模拟 Accepted；它从 EndpointSlice 轮询调度器选择 Ready sandbox，使用题目限制执行真实源码，并通过后端内部 API 发布结果。
 - 移除判题服务的 MySQL 写路径；数据库仅用于只读提交、不可变题目版本与测试包元数据，结果事务、CAS 和计数由后端统一处理。
 - gRPC endpoint 连接缓存增加容量上限、空闲 TTL 和 LRU 空闲连接淘汰，避免 Pod churn 导致连接无界增长。
