@@ -122,6 +122,59 @@ func TestCapabilitiesRejectsUnsupportedMethods(t *testing.T) {
 	}
 }
 
+func TestServerRejectsCapabilitiesOutsideThePublishedV1Contract(t *testing.T) {
+	for name, mutate := range map[string]func(*Capabilities){
+		"invalid language id": func(value *Capabilities) { value.Languages[0].ID = "C++" },
+		"empty display name":  func(value *Capabilities) { value.Languages[0].DisplayName = "" },
+		"empty runtime":       func(value *Capabilities) { value.Languages[0].Runtime = "" },
+		"zero bundle limit":   func(value *Capabilities) { value.Limits.MaxBundleBytes = 0 },
+		"zero case limit":     func(value *Capabilities) { value.Limits.MaxCaseBytes = 0 },
+		"zero case count":     func(value *Capabilities) { value.Limits.MaxCaseCount = 0 },
+		"excess case count":   func(value *Capabilities) { value.Limits.MaxCaseCount = 257 },
+		"zero time limit":     func(value *Capabilities) { value.Limits.MaxTimeLimitMillis = 0 },
+		"zero memory limit":   func(value *Capabilities) { value.Limits.MaxMemoryLimitMiB = 0 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			capabilities := testCapabilities()
+			mutate(&capabilities)
+			if _, err := NewServer(staticAuthenticator{}, capabilities); err == nil {
+				t.Fatal("NewServer accepted capabilities outside the OpenAPI v1 contract")
+			}
+		})
+	}
+}
+
+func TestCapabilitiesEnforceExactMaximumV1SourceBytes(t *testing.T) {
+	capabilities := testCapabilities()
+	capabilities.Limits.MaxSourceBytes = maximumV1SourceBytes
+	if _, err := NewServer(staticAuthenticator{}, capabilities); err != nil {
+		t.Fatalf("NewServer rejected exact maximum source size: %v", err)
+	}
+
+	capabilities.Limits.MaxSourceBytes = maximumV1SourceBytes + 1
+	if _, err := NewServer(staticAuthenticator{}, capabilities); err == nil {
+		t.Fatal("NewServer accepted source size above the v1 maximum")
+	}
+}
+
+func TestServerNormalizesNilCapabilityCollectionsToJSONArrays(t *testing.T) {
+	capabilities := testCapabilities()
+	capabilities.JudgeModes = nil
+	capabilities.Checkers = nil
+	server, err := NewServer(staticAuthenticator{principal: Principal{
+		TenantID: "tenant-7", scopes: map[Scope]struct{}{ScopeCapabilitiesRead: {}},
+	}}, capabilities)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/capabilities", nil)
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"judgeModes":[]`) || !strings.Contains(response.Body.String(), `"checkers":[]`) {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
 func testCapabilities() Capabilities {
 	return Capabilities{
 		APIVersion: "v1",

@@ -34,6 +34,8 @@ jobs:
           cache: true
       - name: Test with race detector
         run: go test -race ./...
+      - name: Validate async REST OpenAPI and live-handler contract
+        run: go test -count=1 -run '^TestOpenAPI' ./internal/httpapi
       - name: Exercise headless-Service DNS round robin contract
         run: go test -race -count=10 -run '^TestClientUsesGRPCRoundRobinAcrossResolvedHeadlessServiceEndpoints$' ./internal/sandbox
       - name: Vet

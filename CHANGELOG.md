@@ -11,7 +11,7 @@
 - 增加 headless Kubernetes Service、`dns:///...` gRPC target 与 `round_robin` Pod endpoint 分配，手工 EndpointSlice 调度降级为 deprecated fallback。
 - 增加完整 lease fence 的 durable execution input、heartbeat/取消控制与 worker runner；取消或 lease ownership 丢失会传播 context cancellation，陈旧 worker 不能提交结果。
 - 增加默认关闭、显式 opt-in 的外部 REST/worker production runtime；readiness 同时依赖 MySQL、Redis、MinIO bucket 和 Sandbox DNS，shutdown 先停 worker 后停 HTTP。
-
+- 增加外部 OJ 异步 REST 的 OpenAPI 3.1 契约、可复制 curl 与 Draft 接入入口；`kin-openapi` 固定版本契约测试会校验规范、真实 handler 路由/状态/header、严格 DTO examples 和公开响应脱敏。
 - 增加面向外部 OJ 的异步 REST v1 基础：RFC 9457 错误、request ID、scope 鉴权和 capabilities 端点。
 - 增加 Judge 自有 MySQL schema 的嵌入式迁移、advisory lock、checksum drift 拒绝及租户隔离数据结构。
 - 增加不透明 256-bit API Key 生成、peppered HMAC 存储、严格 scope 加载与 `judge-admin` 租户/密钥预置命令。
@@ -54,6 +54,7 @@
 
 ### Changed
 
+- `Capabilities` 初始化现在拒绝不符合 v1 公共契约的 language metadata、非正数 bundle/case limits 与超过 256 的 case count，并把未配置的 judge mode/checker 规范化为空 JSON 数组。
 - `JudgeService` 不再模拟 Accepted；它从 EndpointSlice 轮询调度器选择 Ready sandbox，使用题目限制执行真实源码，并通过后端内部 API 发布结果。
 - 移除判题服务的 MySQL 写路径；数据库仅用于只读提交、不可变题目版本与测试包元数据，结果事务、CAS 和计数由后端统一处理。
 - gRPC endpoint 连接缓存增加容量上限、空闲 TTL 和 LRU 空闲连接淘汰，避免 Pod churn 导致连接无界增长。
