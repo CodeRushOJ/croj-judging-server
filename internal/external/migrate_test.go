@@ -14,7 +14,7 @@ func TestEmbeddedMigrationsDefineTheCompleteJudgeOwnedSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(migrations) != 1 || migrations[0].Version != 1 || migrations[0].Name != "initial_external_judge" {
+	if len(migrations) != 2 || migrations[0].Version != 1 || migrations[0].Name != "initial_external_judge" || migrations[1].Version != 2 || migrations[1].Name != "external_bundle_ready" {
 		t.Fatalf("migrations = %+v", migrations)
 	}
 	if len(migrations[0].Checksum) != 64 {
@@ -63,6 +63,9 @@ func TestEmbeddedMigrationsDefineTheCompleteJudgeOwnedSchema(t *testing.T) {
 	if strings.Contains(sql, "source_code") || strings.Contains(sql, "api_key_plaintext") || strings.Contains(sql, "callback_secret_plaintext") {
 		t.Fatal("migration must not persist source or credential plaintext")
 	}
+	if !strings.Contains(strings.ToLower(migrations[1].SQL), "ready_at") {
+		t.Fatal("bundle readiness migration is missing ready_at")
+	}
 }
 
 func TestMigrationStatementsAreExplicitAndReplaySafe(t *testing.T) {
@@ -110,14 +113,14 @@ func TestApplyMigrationsUsesAnAdvisoryLockAndRecordsChecksums(t *testing.T) {
 	if !connection.locked || !connection.released {
 		t.Fatalf("migration lock lifecycle: locked=%v released=%v", connection.locked, connection.released)
 	}
-	if len(connection.executions) != 11 {
-		t.Fatalf("executions = %d, want history DDL + 9 schema DDL + history insert", len(connection.executions))
+	if len(connection.executions) != 14 {
+		t.Fatalf("executions = %d, want history DDL + 9 schema DDL + ready migration DDL/backfill + two history inserts", len(connection.executions))
 	}
 	if !strings.Contains(strings.ToLower(connection.executions[0].query), "create table if not exists t_judge_schema_history") {
 		t.Fatalf("first execution = %s", connection.executions[0].query)
 	}
 	last := connection.executions[len(connection.executions)-1]
-	if !strings.Contains(strings.ToLower(last.query), "insert into t_judge_schema_history") || fmt.Sprint(last.arguments) != fmt.Sprint([]any{1, "initial_external_judge", migrations[0].Checksum}) {
+	if !strings.Contains(strings.ToLower(last.query), "insert into t_judge_schema_history") || fmt.Sprint(last.arguments) != fmt.Sprint([]any{2, "external_bundle_ready", migrations[1].Checksum}) {
 		t.Fatalf("history execution = %#v", last)
 	}
 }

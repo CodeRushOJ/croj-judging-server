@@ -41,6 +41,7 @@ type integrationBundleRepository struct {
 	mu          sync.Mutex
 	idempotency map[string]integrationUploadRecord
 	bundles     map[string]external.BundleMetadata
+	ready       map[string]bool
 }
 
 type integrationUploadRecord struct {
@@ -49,14 +50,15 @@ type integrationUploadRecord struct {
 }
 
 func newIntegrationBundleRepository() *integrationBundleRepository {
-	return &integrationBundleRepository{idempotency: map[string]integrationUploadRecord{}, bundles: map[string]external.BundleMetadata{}}
+	return &integrationBundleRepository{idempotency: map[string]integrationUploadRecord{}, bundles: map[string]external.BundleMetadata{}, ready: map[string]bool{}}
 }
 
 func (repository *integrationBundleRepository) FindBundleUpload(_ context.Context, tenant string, digest [sha256.Size]byte) (external.BundleUploadLookup, error) {
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
 	record, found := repository.idempotency[tenant+hex.EncodeToString(digest[:])]
-	return external.BundleUploadLookup{Found: found, RequestHash: record.hash, Metadata: record.metadata}, nil
+	bundleKey := tenant + record.metadata.SHA256
+	return external.BundleUploadLookup{Found: found, Ready: found && repository.ready[bundleKey], RequestHash: record.hash, Metadata: record.metadata}, nil
 }
 
 func (repository *integrationBundleRepository) CommitBundleUpload(_ context.Context, input external.BundleCommitInput) (external.BundleCommitResult, error) {
@@ -67,7 +69,7 @@ func (repository *integrationBundleRepository) CommitBundleUpload(_ context.Cont
 		if record.hash != input.RequestHash {
 			return external.BundleCommitResult{}, external.ErrIdempotencyConflict
 		}
-		return external.BundleCommitResult{Metadata: record.metadata, Replay: true}, nil
+		return external.BundleCommitResult{Metadata: record.metadata, Replay: true, Ready: repository.ready[input.TenantID+record.metadata.SHA256]}, nil
 	}
 	bundleKey := input.TenantID + hex.EncodeToString(input.RequestHash[:])
 	metadata, existed := repository.bundles[bundleKey]
@@ -76,14 +78,26 @@ func (repository *integrationBundleRepository) CommitBundleUpload(_ context.Cont
 		repository.bundles[bundleKey] = metadata
 	}
 	repository.idempotency[key] = integrationUploadRecord{hash: input.RequestHash, metadata: metadata}
-	return external.BundleCommitResult{Metadata: metadata, Replay: existed}, nil
+	return external.BundleCommitResult{Metadata: metadata, Replay: existed, Ready: repository.ready[bundleKey]}, nil
+}
+
+func (repository *integrationBundleRepository) MarkBundleReady(_ context.Context, tenant, bundleID string, digest [sha256.Size]byte) error {
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	bundleKey := tenant + hex.EncodeToString(digest[:])
+	metadata, found := repository.bundles[bundleKey]
+	if !found || metadata.BundleID != bundleID {
+		return external.ErrBundleNotFound
+	}
+	repository.ready[bundleKey] = true
+	return nil
 }
 
 func (repository *integrationBundleRepository) FindBundle(_ context.Context, tenant, bundleID string) (external.BundleMetadata, error) {
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
 	for key, metadata := range repository.bundles {
-		if strings.HasPrefix(key, tenant) && metadata.BundleID == bundleID {
+		if strings.HasPrefix(key, tenant) && metadata.BundleID == bundleID && repository.ready[key] {
 			return metadata, nil
 		}
 	}
@@ -93,6 +107,23 @@ func (repository *integrationBundleRepository) FindBundle(_ context.Context, ten
 type integrationFileObjectStore struct {
 	root string
 	mu   sync.Mutex
+}
+
+type blockingIntegrationObjectStore struct {
+	inner   external.BundleObjectStore
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (store *blockingIntegrationObjectStore) Publish(ctx context.Context, key, filename string, size int64, digest [sha256.Size]byte) error {
+	store.once.Do(func() { close(store.started) })
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-store.release:
+		return store.inner.Publish(ctx, key, filename, size, digest)
+	}
 }
 
 func (store *integrationFileObjectStore) Publish(ctx context.Context, key, filename string, size int64, digest [sha256.Size]byte) error {
@@ -261,6 +292,46 @@ func TestExternalBundleSQLRepositoryIntegration(t *testing.T) {
 		assertSQLBundleRows(t, database, tenantID, 1, 1)
 		assertVisibleBundleObjects(t, objectRoot, 1)
 	})
+
+	t.Run("pending ownership is invisible until publish completes", func(t *testing.T) {
+		objectRoot := t.TempDir()
+		store := &blockingIntegrationObjectStore{
+			inner: &integrationFileObjectStore{root: objectRoot}, started: make(chan struct{}), release: make(chan struct{}),
+		}
+		tenantID, service := newSQLBundleFixtureWithStore(t, database, store)
+		body := integrationBundleZIPWithInput(t, "pending")
+		result := make(chan sqlUploadResult, 1)
+		go func() {
+			metadata, replay, err := service.Upload(context.Background(), tenantID, "pending-key-0001", bytes.NewReader(body))
+			result <- sqlUploadResult{metadata: metadata, replay: replay, err: err}
+		}()
+		<-store.started
+
+		var pendingID string
+		if err := database.QueryRow(`
+SELECT bundle.external_id
+FROM t_external_bundle AS bundle
+JOIN t_external_tenant AS tenant ON tenant.id = bundle.tenant_id
+WHERE tenant.external_id = ? AND bundle.ready_at IS NULL`, tenantID).Scan(&pendingID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := service.Get(context.Background(), tenantID, pendingID); !errors.Is(err, external.ErrBundleNotFound) {
+			t.Fatalf("pending metadata became visible: %v", err)
+		}
+		close(store.release)
+		select {
+		case upload := <-result:
+			if upload.err != nil || upload.replay || upload.metadata.BundleID != pendingID {
+				t.Fatalf("upload=%+v pendingID=%s", upload, pendingID)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("upload did not complete after object publication")
+		}
+		if _, err := service.Get(context.Background(), tenantID, pendingID); err != nil {
+			t.Fatalf("ready metadata is not visible: %v", err)
+		}
+		assertVisibleBundleObjects(t, objectRoot, 1)
+	})
 }
 
 type sqlUploadRequest struct {
@@ -276,6 +347,13 @@ type sqlUploadResult struct {
 
 func newSQLBundleFixture(t *testing.T, database *sql.DB) (string, *external.BundleService, string) {
 	t.Helper()
+	objectRoot := t.TempDir()
+	tenantID, service := newSQLBundleFixtureWithStore(t, database, &integrationFileObjectStore{root: objectRoot})
+	return tenantID, service, objectRoot
+}
+
+func newSQLBundleFixtureWithStore(t *testing.T, database *sql.DB, store external.BundleObjectStore) (string, *external.BundleService) {
+	t.Helper()
 	tenantID := randomExternalID(t)
 	if _, err := database.Exec(`INSERT INTO t_external_tenant(external_id, name, status, policy_json) VALUES (?, ?, 'ACTIVE', ?)`, tenantID, "bundle-integration", `{"maxQueuedJobs":10}`); err != nil {
 		t.Fatal(err)
@@ -289,15 +367,14 @@ func newSQLBundleFixture(t *testing.T, database *sql.DB) (string, *external.Bund
 	if err != nil {
 		t.Fatal(err)
 	}
-	objectRoot := t.TempDir()
-	service, err := external.NewBundleService(repository, &integrationFileObjectStore{root: objectRoot}, external.BundleServiceConfig{
+	service, err := external.NewBundleService(repository, store, external.BundleServiceConfig{
 		TempDir: t.TempDir(), MaxUploadBytes: 1 << 20, ArchiveLimits: bundle.DefaultArchiveLimits(), IdempotencyTTL: time.Hour,
 		IdempotencyPepper: bytes.Repeat([]byte{0x42}, sha256.Size),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return tenantID, service, objectRoot
+	return tenantID, service
 }
 
 func runConcurrentSQLUploads(service *external.BundleService, tenantID string, requests []sqlUploadRequest) []sqlUploadResult {
