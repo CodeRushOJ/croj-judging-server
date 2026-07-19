@@ -123,6 +123,29 @@ func TestMySQLJobRepositoryAdmissionIsIdempotentEncryptedAndTenantOwned(t *testi
 	}
 }
 
+func TestMySQLJobRepositoryRejectsPendingBundleOwnership(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	tenantID := strings.Repeat("6", 26)
+	bundleID := strings.Repeat("7", 26)
+	insertTenantBundleAndCallback(t, database, tenantID, bundleID, "", 2)
+	if _, err := database.Exec("UPDATE t_external_bundle SET ready_at = NULL WHERE external_id = ?", bundleID); err != nil {
+		t.Fatal(err)
+	}
+	store := newMemorySourceStore()
+	repository := newTestMySQLJobRepository(t, database, store)
+	_, err := repository.Submit(context.Background(), tenantID, "pending-bundle-key", JudgeJobRequest{
+		BundleID: bundleID, Language: "cpp20", SourceCode: []byte("int main(){}"),
+	})
+	if !errors.Is(err, ErrExternalJobInvalid) {
+		t.Fatalf("pending bundle submit error = %v", err)
+	}
+	objects, puts, deletes := store.snapshot()
+	if puts != 0 || deletes != 0 || len(objects) != 0 {
+		t.Fatalf("pending bundle wrote source objects: puts=%d deletes=%d objects=%d", puts, deletes, len(objects))
+	}
+}
+
 func TestMySQLJobRepositoryConcurrentReplayCreatesOneJobAndOneObject(t *testing.T) {
 	database := openMySQLIntegration(t)
 	prepareExternalJobDatabase(t, database)
@@ -384,8 +407,8 @@ func insertTenantBundleAndCallback(t *testing.T, database *sql.DB, tenantID, bun
 		t.Fatal(err)
 	}
 	if _, err := database.Exec(`
-INSERT INTO t_external_bundle(external_id, tenant_id, sha256, object_key, size_bytes, case_count, manifest_version, manifest_json)
-VALUES (?, ?, UNHEX(SHA2(?, 256)), ?, 128, 1, 1, JSON_OBJECT('schemaVersion', 1, 'cases', JSON_ARRAY()))`,
+INSERT INTO t_external_bundle(external_id, tenant_id, sha256, object_key, size_bytes, case_count, manifest_version, manifest_json, ready_at)
+VALUES (?, ?, UNHEX(SHA2(?, 256)), ?, 128, 1, 1, JSON_OBJECT('schemaVersion', 1, 'cases', JSON_ARRAY()), NOW(3))`,
 		bundleID, tenantInternalID, bundleID, "external/"+tenantID+"/sha256/"+bundleID+".zip"); err != nil {
 		t.Fatal(err)
 	}
