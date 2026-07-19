@@ -28,6 +28,12 @@ require_literal "${GATE_SCRIPT}" 'golang@sha256:2d6c80227255c3112a4d08e67ba98e58
 require_literal "${GATE_SCRIPT}" 'ERROR 1452'
 require_literal "${GATE_SCRIPT}" 'fk_external_job_bundle_tenant'
 require_literal "${GATE_SCRIPT}" 'fk_external_webhook_job_tenant'
+require_literal "${GATE_SCRIPT}" $'readonly MIGRATION_DIRECTORY="${REPOSITORY_ROOT}/internal/external/migrations"'
+require_literal "${GATE_SCRIPT}" $'migration_files=("${MIGRATION_DIRECTORY}"/[0-9][0-9][0-9]_*.sql)'
+require_literal "${GATE_SCRIPT}" $'expected_history="${migration_count}|1|${migration_count}|64|64"'
+if grep -Fq -- "'1|1|1|64|64'" "${GATE_SCRIPT}"; then
+  fail 'scripts/ci/mysql84-schema-gate.sh must not hard-code a single migration'
+fi
 
 require_literal "${WORKFLOW}" 'mysql84-schema:'
 require_literal "${WORKFLOW}" 'ci-lint:'
