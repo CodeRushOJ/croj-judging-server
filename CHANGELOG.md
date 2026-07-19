@@ -28,6 +28,8 @@
 - 增加 checksum-keyed 磁盘缓存、并发下载合并、命中校验、损坏修复、TTL/LRU 和 restart orphan 清理。
 - 增加 ACM 多 case 顺序执行、选手错误早停、最大资源聚合与基础设施故障有界换 endpoint。
 - 增加 fake Kubernetes API + 真实 TCP gRPC + HTTP callback 的跨组件契约测试，覆盖 EndpointSlice churn、过载换节点、bundle digest fail-closed 与 hidden payload 脱敏。
+- 增加基于 digest 固定 MySQL 8.4.10 的真实 schema CI 门禁，覆盖 clean migration、幂等 replay、history checksum、同租户写入和跨租户 job/outbox 外键拒绝。
+- 增加容器化 ShellCheck/actionlint CI job，并为 schema gate 的容器化 Go 编译缓存配置固定版本的 GitHub Actions cache。
 
 ### Changed
 

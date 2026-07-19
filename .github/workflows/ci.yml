@@ -40,3 +40,44 @@ jobs:
         run: CGO_ENABLED=0 go build -trimpath -o /tmp/judging-server ./cmd
       - name: Build container image
         run: docker build -t coderushoj/judging-server:ci .
+
+  mysql84-schema:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - name: Restore containerized Go caches
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ${{ runner.temp }}/croj-mysql84-go-mod
+            ${{ runner.temp }}/croj-mysql84-go-build
+          key: ${{ runner.os }}-mysql84-go-${{ hashFiles('go.sum', 'scripts/ci/mysql84-schema-gate.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-mysql84-go-
+      - name: Verify schema on real MySQL 8.4
+        env:
+          MYSQL84_GO_MOD_CACHE: ${{ runner.temp }}/croj-mysql84-go-mod
+          MYSQL84_GO_BUILD_CACHE: ${{ runner.temp }}/croj-mysql84-go-build
+        run: bash scripts/ci/mysql84-schema-gate.sh
+
+  ci-lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - name: ShellCheck CI scripts
+        run: >-
+          docker run --rm --network none
+          -v "$PWD:/repo:ro" -w /repo
+          koalaman/shellcheck@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d
+          scripts/ci/mysql84-schema-gate.sh
+          scripts/ci/test-mysql84-schema-gate-contract.sh
+      - name: Lint GitHub Actions workflows
+        run: >-
+          docker run --rm --network none
+          -v "$PWD:/repo:ro" -w /repo
+          rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+          -color
