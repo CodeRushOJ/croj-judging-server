@@ -127,7 +127,8 @@ WHERE tenant_id = ? AND operation_scope = ? AND key_digest = ?`,
 	var bundleInternalID uint64
 	if err := tx.QueryRowContext(ctx, `
 SELECT id FROM t_external_bundle
-WHERE tenant_id = ? AND external_id = ? AND delete_marked_at IS NULL AND deleted_at IS NULL`,
+WHERE tenant_id = ? AND external_id = ? AND ready_at IS NOT NULL
+  AND delete_marked_at IS NULL AND deleted_at IS NULL`,
 		tenantInternalID, request.BundleID).Scan(&bundleInternalID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return SubmitJobResult{}, fmt.Errorf("%w: bundle is unavailable", ErrExternalJobInvalid)
