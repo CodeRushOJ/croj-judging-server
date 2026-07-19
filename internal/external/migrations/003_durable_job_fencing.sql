@@ -30,6 +30,17 @@ SET status = 'QUEUED',
     failure_code = 'MIGRATION_RECLAIM'
 WHERE status = 'RUNNING';
 -- migrate:split
+UPDATE t_external_job_attempt
+SET lease_token = NULL
+WHERE status <> 'RUNNING' AND lease_token IS NOT NULL;
+-- migrate:split
+UPDATE t_external_job
+SET worker_id = NULL,
+    lease_token = NULL,
+    lease_until = NULL
+WHERE status <> 'RUNNING'
+  AND (worker_id IS NOT NULL OR lease_token IS NOT NULL OR lease_until IS NOT NULL);
+-- migrate:split
 ALTER TABLE t_external_job_attempt
     MODIFY COLUMN tenant_id BIGINT UNSIGNED NOT NULL;
 -- migrate:split
@@ -53,14 +64,22 @@ ALTER TABLE t_external_job_attempt
 -- migrate:replay-errors 3822
 ALTER TABLE t_external_job_attempt
     ADD CONSTRAINT chk_external_attempt_active_lease
-        CHECK (status <> 'RUNNING' OR lease_token IS NOT NULL);
+        CHECK (
+            (status = 'RUNNING' AND lease_token IS NOT NULL) OR
+            (status <> 'RUNNING' AND lease_token IS NULL)
+        );
 -- migrate:split
 -- migrate:replay-errors 3822
 ALTER TABLE t_external_job
     ADD CONSTRAINT chk_external_job_active_lease
         CHECK (
-            status <> 'RUNNING' OR
-            (worker_id IS NOT NULL AND lease_token IS NOT NULL AND lease_until IS NOT NULL)
+            (
+                status = 'RUNNING' AND attempt_no > 0 AND worker_id IS NOT NULL AND
+                lease_token IS NOT NULL AND lease_until IS NOT NULL
+            ) OR (
+                status <> 'RUNNING' AND worker_id IS NULL AND
+                lease_token IS NULL AND lease_until IS NULL
+            )
         );
 -- migrate:split
 CREATE TABLE IF NOT EXISTS t_external_source_reservation (

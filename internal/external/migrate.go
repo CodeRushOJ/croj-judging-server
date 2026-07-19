@@ -254,7 +254,7 @@ const durableFencingSchemaValidationSQL = `SELECT
           AND table_constraint.constraint_name = 'chk_external_attempt_active_lease'
           AND table_constraint.enforced = 'YES'
           AND REPLACE(REPLACE(LOWER(check_constraint.check_clause), CHAR(96), ''), CHAR(92), '') =
-              '((status <> _utf8mb4''running'') or (lease_token is not null))'
+              '(((status = _utf8mb4''running'') and (lease_token is not null)) or ((status <> _utf8mb4''running'') and (lease_token is null)))'
     )
     AND EXISTS (
         SELECT 1
@@ -268,7 +268,7 @@ const durableFencingSchemaValidationSQL = `SELECT
           AND table_constraint.constraint_name = 'chk_external_job_active_lease'
           AND table_constraint.enforced = 'YES'
           AND REPLACE(REPLACE(LOWER(check_constraint.check_clause), CHAR(96), ''), CHAR(92), '') =
-              '((status <> _utf8mb4''running'') or ((worker_id is not null) and (lease_token is not null) and (lease_until is not null)))'
+              '(((status = _utf8mb4''running'') and (attempt_no > 0) and (worker_id is not null) and (lease_token is not null) and (lease_until is not null)) or ((status <> _utf8mb4''running'') and (worker_id is null) and (lease_token is null) and (lease_until is null)))'
     )
     AND EXISTS (
         SELECT 1 FROM information_schema.tables

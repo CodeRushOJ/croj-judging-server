@@ -101,7 +101,6 @@ func (repository *MySQLJobRepository) claimOne(
 	workerID string,
 	leaseDuration time.Duration,
 ) (WorkerJobClaim, bool, error) {
-	scheduleNow := repository.now().UTC()
 	tx, err := repository.database.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return WorkerJobClaim{}, false, repositoryUnavailable("begin worker claim", err)
@@ -132,7 +131,7 @@ WHERE tenant.status = 'ACTIVE'
       )
   )
 ORDER BY (job.status = 'RUNNING') DESC, job.next_attempt_at, job.created_at, job.id
-LIMIT 1`, leaseNow, scheduleNow).Scan(&candidateTenantID)
+LIMIT 1`, leaseNow, leaseNow).Scan(&candidateTenantID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return WorkerJobClaim{}, false, ErrJobNotClaimable
 	}
@@ -168,7 +167,7 @@ WHERE tenant_id = ? AND (
     (status = 'RUNNING' AND lease_until <= ?)
 )
 ORDER BY (status = 'RUNNING') DESC, next_attempt_at, created_at, id
-LIMIT 1 FOR UPDATE SKIP LOCKED`, candidateTenantID, scheduleNow, leaseNow).
+LIMIT 1 FOR UPDATE SKIP LOCKED`, candidateTenantID, leaseNow, leaseNow).
 		Scan(&jobInternalID, &jobExternalID, &status, &attemptNo, &cancelRequested)
 	if errors.Is(err, sql.ErrNoRows) {
 		return WorkerJobClaim{}, true, ErrJobNotClaimable
@@ -265,7 +264,7 @@ INSERT INTO t_external_job_attempt(
 func expireAttempt(ctx context.Context, tx *sql.Tx, tenantID, jobID uint64, attemptNo uint32, now time.Time) error {
 	result, err := tx.ExecContext(ctx, `
 UPDATE t_external_job_attempt
-SET status = 'EXPIRED', finished_at = ?, failure_code = 'LEASE_EXPIRED'
+SET status = 'EXPIRED', lease_token = NULL, finished_at = ?, failure_code = 'LEASE_EXPIRED'
 WHERE tenant_id = ? AND job_id = ? AND attempt_no = ? AND status = 'RUNNING'`,
 		now, tenantID, jobID, attemptNo)
 	if err != nil {
@@ -406,7 +405,7 @@ func (repository *MySQLJobRepository) FailInfrastructure(
 	disposition := FailureTerminal
 	jobStatus := JobStatusFailed
 	completedAt := any(now)
-	nextAttemptAt := any(repository.now().UTC())
+	nextAttemptAt := any(now)
 	if cancelled {
 		disposition = FailureCancelled
 		jobStatus = JobStatusCancelled
@@ -414,7 +413,7 @@ func (repository *MySQLJobRepository) FailInfrastructure(
 		disposition = FailureRequeued
 		jobStatus = JobStatusQueued
 		completedAt = nil
-		nextAttemptAt = repository.now().UTC().Add(failure.RetryDelay)
+		nextAttemptAt = now.Add(failure.RetryDelay)
 	}
 	jobResult, err := tx.ExecContext(ctx, `
 UPDATE t_external_job
@@ -459,16 +458,28 @@ WHERE id = ? AND status = 'RUNNING' AND attempt_no = ? AND worker_id = ?
 }
 
 func lockActiveClaimAndPolicy(ctx context.Context, tx *sql.Tx, claim WorkerJobClaim) (bool, []byte, error) {
-	var cancelRequested sql.NullTime
+	var tenantID uint64
+	if err := tx.QueryRowContext(ctx,
+		"SELECT tenant_id FROM t_external_job WHERE id = ?",
+		claim.Job.InternalID).Scan(&tenantID); errors.Is(err, sql.ErrNoRows) {
+		return false, nil, ErrStaleJobClaim
+	} else if err != nil {
+		return false, nil, repositoryUnavailable("read active claim tenant", err)
+	}
 	var encodedPolicy []byte
+	if err := tx.QueryRowContext(ctx,
+		"SELECT policy_json FROM t_external_tenant WHERE id = ? FOR UPDATE",
+		tenantID).Scan(&encodedPolicy); err != nil {
+		return false, nil, repositoryUnavailable("lock active claim tenant", err)
+	}
+	var cancelRequested sql.NullTime
 	err := tx.QueryRowContext(ctx, `
-SELECT job.cancel_requested_at, tenant.policy_json
-FROM t_external_job AS job
-JOIN t_external_tenant AS tenant ON tenant.id = job.tenant_id
-WHERE job.id = ? AND job.status = 'RUNNING' AND job.attempt_no = ? AND job.worker_id = ?
-  AND job.lease_token = ? AND job.lease_until > CURRENT_TIMESTAMP(3) FOR UPDATE`,
-		claim.Job.InternalID, claim.AttemptNo, claim.WorkerID, claim.LeaseToken).
-		Scan(&cancelRequested, &encodedPolicy)
+SELECT cancel_requested_at
+FROM t_external_job
+WHERE id = ? AND tenant_id = ? AND status = 'RUNNING' AND attempt_no = ? AND worker_id = ?
+  AND lease_token = ? AND lease_until > CURRENT_TIMESTAMP(3) FOR UPDATE`,
+		claim.Job.InternalID, tenantID, claim.AttemptNo, claim.WorkerID, claim.LeaseToken).
+		Scan(&cancelRequested)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil, ErrStaleJobClaim
 	}
@@ -481,7 +492,7 @@ WHERE job.id = ? AND job.status = 'RUNNING' AND job.attempt_no = ? AND job.worke
 func finishAttempt(ctx context.Context, tx *sql.Tx, claim WorkerJobClaim, status, failureCode string, now time.Time) error {
 	result, err := tx.ExecContext(ctx, `
 UPDATE t_external_job_attempt
-SET status = ?, finished_at = ?, failure_code = NULLIF(?, '')
+SET status = ?, lease_token = NULL, finished_at = ?, failure_code = NULLIF(?, '')
 WHERE job_id = ? AND attempt_no = ? AND worker_id = ? AND lease_token = ? AND status = 'RUNNING'`,
 		status, now, failureCode, claim.Job.InternalID, claim.AttemptNo, claim.WorkerID, claim.LeaseToken)
 	if err != nil {

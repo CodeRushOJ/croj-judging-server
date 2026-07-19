@@ -150,11 +150,14 @@ func TestDurableFencingMigrationRejectsWrongSameNameChecks(t *testing.T) {
 		}
 	}
 	if _, err := connection.ExecContext(ctx, `ALTER TABLE t_external_job_attempt
-ADD CONSTRAINT chk_external_attempt_active_lease CHECK (status = 'RUNNING' OR lease_token IS NULL)`); err != nil {
+ADD CONSTRAINT chk_external_attempt_active_lease CHECK (status <> 'RUNNING' OR lease_token IS NOT NULL)`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := connection.ExecContext(ctx, `ALTER TABLE t_external_job
-ADD CONSTRAINT chk_external_job_active_lease CHECK (status = 'RUNNING' OR worker_id IS NULL OR lease_token IS NULL OR lease_until IS NULL)`); err != nil {
+ADD CONSTRAINT chk_external_job_active_lease CHECK (
+    status <> 'RUNNING' OR
+    (worker_id IS NOT NULL AND lease_token IS NOT NULL AND lease_until IS NOT NULL)
+)`); err != nil {
 		t.Fatal(err)
 	}
 	if err := applyMigrations(ctx, sqlMigrationConnection{connection: connection}, migrations); err == nil || !strings.Contains(err.Error(), "validate migration 3") {
@@ -248,6 +251,17 @@ INSERT INTO t_external_job(
 		t.Fatal(err)
 	}
 	jobID, _ := jobResult.LastInsertId()
+	residueJobResult, err := database.ExecContext(ctx, `
+INSERT INTO t_external_job(
+    external_id, tenant_id, bundle_id, source_object_id, status, language_id,
+    request_hash, worker_id, lease_until, next_attempt_at, completed_at
+) VALUES ('eeeeeeeeeeeeeeeeeeeeeeeeee', ?, ?, ?, 'FAILED', 'cpp20',
+          UNHEX(SHA2('legacy-residue-request', 256)), 'stale-worker',
+          DATE_ADD(NOW(3), INTERVAL 1 HOUR), NOW(3), NOW(3))`, tenantID, bundleID, sourceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	residueJobID, _ := residueJobResult.LastInsertId()
 	if _, err := database.ExecContext(ctx, `
 INSERT INTO t_external_job_attempt(job_id, attempt_no, worker_id, status, lease_until)
 VALUES (?, 1, 'legacy-worker', 'RUNNING', DATE_ADD(NOW(3), INTERVAL 1 HOUR))`, jobID); err != nil {
@@ -275,6 +289,30 @@ SELECT status, failure_code, tenant_id FROM t_external_job_attempt WHERE job_id 
 	}
 	if attemptStatus != "EXPIRED" || attemptFailure != "MIGRATION_RECLAIM" || attemptTenantID != uint64(tenantID) {
 		t.Fatalf("migrated attempt status=%s failure=%s tenant=%d", attemptStatus, attemptFailure, attemptTenantID)
+	}
+	var residueWorker, residueLease sql.NullString
+	if err := database.QueryRowContext(ctx, `
+SELECT worker_id, CAST(lease_until AS CHAR) FROM t_external_job WHERE id = ?`, residueJobID).
+		Scan(&residueWorker, &residueLease); err != nil {
+		t.Fatal(err)
+	}
+	if residueWorker.Valid || residueLease.Valid {
+		t.Fatalf("non-running migration residue worker=%v lease=%v", residueWorker, residueLease)
+	}
+	if _, err := database.ExecContext(ctx, `
+UPDATE t_external_job SET worker_id = 'stale-worker' WHERE id = ?`, residueJobID); err == nil {
+		t.Fatal("non-running job accepted worker residue")
+	}
+	if _, err := database.ExecContext(ctx, `
+UPDATE t_external_job
+SET status = 'RUNNING', worker_id = 'worker', lease_token = RANDOM_BYTES(32),
+    lease_until = DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL 1 MINUTE)
+WHERE id = ?`, residueJobID); err == nil {
+		t.Fatal("attempt-zero job accepted a running lease")
+	}
+	if _, err := database.ExecContext(ctx, `
+UPDATE t_external_job_attempt SET lease_token = RANDOM_BYTES(32) WHERE job_id = ?`, jobID); err == nil {
+		t.Fatal("non-running attempt accepted lease token residue")
 	}
 }
 
