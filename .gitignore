@@ -21,5 +21,8 @@
 go.work
 go.work.sum
 
+# Disposable local caches created by containerized CI gates
+/.ci-cache/
+
 # env file
 .env

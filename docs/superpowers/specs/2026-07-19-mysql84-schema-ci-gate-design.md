@@ -20,7 +20,8 @@ network.
 
 GitHub Actions runs the harness in a dedicated `mysql84-schema` job in parallel
 with the existing `test` job. The job has an explicit timeout, uses commit-pinned
-checkout and Go setup actions, and enables the Go module/build cache. A separate
+checkout/cache actions and a digest-pinned Go container, and enables the Go
+module/build cache. A separate
 workflow-lint job runs digest-pinned ShellCheck and actionlint containers so
 neither tool must be installed on the runner.
 
