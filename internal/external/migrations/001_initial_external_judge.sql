@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS t_external_callback (
     created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     PRIMARY KEY (id),
     UNIQUE KEY uk_external_callback_external_id (external_id),
+    UNIQUE KEY uk_external_callback_id_tenant (id, tenant_id),
     KEY idx_external_callback_tenant (tenant_id),
     CONSTRAINT fk_external_callback_tenant FOREIGN KEY (tenant_id) REFERENCES t_external_tenant(id),
     CONSTRAINT chk_external_callback_port CHECK (allowed_port > 0)
@@ -60,6 +61,7 @@ CREATE TABLE IF NOT EXISTS t_external_bundle (
     deleted_at DATETIME(3) NULL,
     PRIMARY KEY (id),
     UNIQUE KEY uk_external_bundle_external_id (external_id),
+    UNIQUE KEY uk_external_bundle_id_tenant (id, tenant_id),
     UNIQUE KEY uk_external_bundle_tenant_digest (tenant_id, sha256),
     CONSTRAINT fk_external_bundle_tenant FOREIGN KEY (tenant_id) REFERENCES t_external_tenant(id),
     CONSTRAINT chk_external_bundle_size CHECK (size_bytes > 0),
@@ -80,6 +82,7 @@ CREATE TABLE IF NOT EXISTS t_external_source_object (
     deleted_at DATETIME(3) NULL,
     PRIMARY KEY (id),
     UNIQUE KEY uk_external_source_external_id (external_id),
+    UNIQUE KEY uk_external_source_id_tenant (id, tenant_id),
     UNIQUE KEY uk_external_source_object_key (object_key),
     KEY idx_external_source_tenant (tenant_id),
     CONSTRAINT fk_external_source_tenant FOREIGN KEY (tenant_id) REFERENCES t_external_tenant(id),
@@ -111,12 +114,13 @@ CREATE TABLE IF NOT EXISTS t_external_job (
     updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
     PRIMARY KEY (id),
     UNIQUE KEY uk_external_job_external_id (external_id),
+    UNIQUE KEY uk_external_job_id_tenant (id, tenant_id),
     KEY idx_external_job_claim (status, next_attempt_at, lease_until, created_at, id),
     KEY idx_external_job_tenant_list (tenant_id, created_at, id),
     CONSTRAINT fk_external_job_tenant FOREIGN KEY (tenant_id) REFERENCES t_external_tenant(id),
-    CONSTRAINT fk_external_job_bundle FOREIGN KEY (bundle_id) REFERENCES t_external_bundle(id),
-    CONSTRAINT fk_external_job_source FOREIGN KEY (source_object_id) REFERENCES t_external_source_object(id),
-    CONSTRAINT fk_external_job_callback FOREIGN KEY (callback_id) REFERENCES t_external_callback(id),
+    CONSTRAINT fk_external_job_bundle_tenant FOREIGN KEY (bundle_id, tenant_id) REFERENCES t_external_bundle(id, tenant_id),
+    CONSTRAINT fk_external_job_source_tenant FOREIGN KEY (source_object_id, tenant_id) REFERENCES t_external_source_object(id, tenant_id),
+    CONSTRAINT fk_external_job_callback_tenant FOREIGN KEY (callback_id, tenant_id) REFERENCES t_external_callback(id, tenant_id),
     CONSTRAINT chk_external_job_status CHECK (status IN ('QUEUED','RUNNING','SUCCEEDED','FAILED','CANCELLED'))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 -- migrate:split
@@ -176,7 +180,7 @@ CREATE TABLE IF NOT EXISTS t_external_webhook_outbox (
     UNIQUE KEY uk_external_webhook_event (event_id),
     KEY idx_external_webhook_delivery (status, next_attempt_at, id),
     CONSTRAINT fk_external_webhook_tenant FOREIGN KEY (tenant_id) REFERENCES t_external_tenant(id),
-    CONSTRAINT fk_external_webhook_job FOREIGN KEY (job_id) REFERENCES t_external_job(id),
-    CONSTRAINT fk_external_webhook_callback FOREIGN KEY (callback_id) REFERENCES t_external_callback(id),
+    CONSTRAINT fk_external_webhook_job_tenant FOREIGN KEY (job_id, tenant_id) REFERENCES t_external_job(id, tenant_id),
+    CONSTRAINT fk_external_webhook_callback_tenant FOREIGN KEY (callback_id, tenant_id) REFERENCES t_external_callback(id, tenant_id),
     CONSTRAINT chk_external_webhook_status CHECK (status IN ('PENDING','DELIVERED','FAILED'))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;

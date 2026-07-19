@@ -27,8 +27,9 @@ const (
 )
 
 var (
-	ErrUnauthenticated = errors.New("request is not authenticated")
-	keyPrefixPattern   = regexp.MustCompile(`^[A-Za-z0-9]{8,24}$`)
+	ErrUnauthenticated           = errors.New("request is not authenticated")
+	ErrAuthenticationUnavailable = errors.New("authentication service is unavailable")
+	keyPrefixPattern             = regexp.MustCompile(`^[A-Za-z0-9]{8,24}$`)
 )
 
 type Credential = external.Credential
@@ -72,7 +73,10 @@ func (authenticator *Authenticator) Authenticate(ctx context.Context, authorizat
 
 	want := authenticator.digest(key)
 	credential, err := authenticator.store.FindCredentialByPrefix(ctx, prefix)
-	if err != nil || credential == nil {
+	if err != nil {
+		return Principal{}, fmt.Errorf("%w: credential repository: %w", ErrAuthenticationUnavailable, err)
+	}
+	if credential == nil {
 		// Keep the unknown-prefix path on the same digest/constant-time comparison shape.
 		_ = subtle.ConstantTimeCompare(want, make([]byte, sha256.Size))
 		return Principal{}, ErrUnauthenticated
@@ -99,10 +103,14 @@ func (authenticator *Authenticator) digest(key string) []byte {
 }
 
 func parseBearerKey(authorization string) (key string, prefix string, ok bool) {
-	if !strings.HasPrefix(authorization, "Bearer ") || strings.Count(authorization, " ") != 1 {
+	separator := strings.IndexByte(authorization, ' ')
+	if separator <= 0 || !strings.EqualFold(authorization[:separator], "Bearer") {
 		return "", "", false
 	}
-	key = strings.TrimPrefix(authorization, "Bearer ")
+	key = strings.TrimLeft(authorization[separator:], " ")
+	if key == "" || strings.ContainsAny(key, " \t\r\n") {
+		return "", "", false
+	}
 	parts := strings.Split(key, "_")
 	if len(parts) != 3 || parts[0] != "croj" || !keyPrefixPattern.MatchString(parts[1]) {
 		return "", "", false

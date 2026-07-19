@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 )
@@ -42,6 +43,11 @@ func (server *Server) ServeHTTP(response http.ResponseWriter, request *http.Requ
 	}
 	principal, err := server.authenticator.Authenticate(request.Context(), request.Header.Get("Authorization"))
 	if err != nil {
+		if errors.Is(err, ErrAuthenticationUnavailable) {
+			response.Header().Set("Retry-After", "5")
+			writeProblem(response, problemFor(http.StatusServiceUnavailable, "authentication-unavailable", "Authentication temporarily unavailable", "Retry the request later.", requestID))
+			return
+		}
 		response.Header().Set("WWW-Authenticate", `Bearer realm="coderushoj-judge"`)
 		writeProblem(response, problemFor(http.StatusUnauthorized, "unauthorized", "Authentication required", "Provide a valid active API key.", requestID))
 		return
