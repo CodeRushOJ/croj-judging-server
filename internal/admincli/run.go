@@ -14,6 +14,7 @@ import (
 type Provisioner interface {
 	CreateTenant(context.Context, string, external.TenantPolicy) (string, error)
 	CreateAPIKey(context.Context, string, []external.Scope, *time.Time, []byte) (external.APIKeyMaterial, error)
+	CreateCallback(context.Context, string, string) (external.CallbackMaterial, error)
 }
 
 func Run(ctx context.Context, arguments []string, provisioner Provisioner, pepper []byte, output io.Writer) error {
@@ -21,16 +22,43 @@ func Run(ctx context.Context, arguments []string, provisioner Provisioner, peppe
 		return fmt.Errorf("provisioner and output are required")
 	}
 	if len(arguments) < 2 {
-		return fmt.Errorf("usage: judge-admin <tenant|api-key> create [flags]")
+		return fmt.Errorf("usage: judge-admin <tenant|api-key|callback> create [flags]")
 	}
 	switch arguments[0] + " " + arguments[1] {
 	case "tenant create":
 		return createTenant(ctx, arguments[2:], provisioner, output)
 	case "api-key create":
 		return createAPIKey(ctx, arguments[2:], provisioner, pepper, output)
+	case "callback create":
+		return createCallback(ctx, arguments[2:], provisioner, output)
 	default:
 		return fmt.Errorf("unsupported command %q", strings.Join(arguments[:2], " "))
 	}
+}
+
+func createCallback(ctx context.Context, arguments []string, provisioner Provisioner, output io.Writer) error {
+	flags := flag.NewFlagSet("callback create", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	tenantID := flags.String("tenant", "", "tenant external ID")
+	destinationURL := flags.String("url", "", "absolute HTTPS callback URL")
+	if err := flags.Parse(arguments); err != nil {
+		return fmt.Errorf("parse callback flags: %w", err)
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("callback create does not accept positional arguments")
+	}
+	if *tenantID == "" || *destinationURL == "" {
+		return fmt.Errorf("callback tenant and URL are required")
+	}
+	material, err := provisioner.CreateCallback(ctx, *tenantID, *destinationURL)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(output, "Callback created: %s\n", material.CallbackID); err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(output, "Callback secret (shown once): %s\n", material.Secret)
+	return err
 }
 
 func createTenant(ctx context.Context, arguments []string, provisioner Provisioner, output io.Writer) error {

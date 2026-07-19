@@ -45,3 +45,23 @@ The identical focused command passed:
 ```text
 ok github.com/CodeRushOJ/croj-judging-server/internal/external 0.012s
 ```
+
+## Task 3: Operator-only callback provisioning
+
+### RED
+
+```bash
+docker run --rm -v "$PWD:/workspace" -v coderushoj-go-cache:/go/pkg/mod -v coderushoj-go-build-cache:/root/.cache/go-build -w /workspace golang:1.26.3 go test ./internal/external ./internal/admincli ./cmd/judge-admin -run 'TestProvisioner.*Callback|TestRun.*Callback|TestCallbackProvisionerOptions' -count=1
+```
+
+Observed failures: `Provisioner` had no callback cipher/resolver or `CreateCallback`; admin CLI rejected `callback create`; judge-admin lacked conditional callback key-ring loading.
+
+### GREEN
+
+The identical focused command passed all three packages:
+
+```text
+ok github.com/CodeRushOJ/croj-judging-server/internal/external 0.011s
+ok github.com/CodeRushOJ/croj-judging-server/internal/admincli 0.009s
+ok github.com/CodeRushOJ/croj-judging-server/cmd/judge-admin 0.008s
+```
