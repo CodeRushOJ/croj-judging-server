@@ -73,5 +73,13 @@ jobs:
         env:
           JUDGE_TEST_MYSQL_DSN: root:@tcp(127.0.0.1:3306)/croj_bundle_ci?parseTime=true&loc=UTC&charset=utf8mb4
         run: go test -race -count=1 ./internal/external
+      - name: Run durable webhook contract on MySQL 8.4
+        env:
+          JUDGE_TEST_MYSQL_DSN: root:@tcp(127.0.0.1:3306)/croj_bundle_ci?parseTime=true&loc=UTC&charset=utf8mb4
+        run: go test -race -count=1 -timeout=10m ./internal/external -run '^TestMySQLWebhook'
       - name: Verify bundle MySQL CI contract
         run: bash scripts/ci/test-bundle-mysql84-contract.sh
+      - name: Verify webhook MySQL CI contract
+        run: |
+          bash scripts/ci/test-webhook-mysql84-contract.sh
+          bash scripts/ci/test-webhook-mysql84-contract-self-test.sh

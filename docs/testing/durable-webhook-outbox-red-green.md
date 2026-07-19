@@ -207,3 +207,19 @@ The complete external package passed under the race detector, and `go vet ./inte
 ```text
 ok github.com/CodeRushOJ/croj-judging-server/internal/external 1.357s
 ```
+
+## Task 9: Real MySQL delivery contract and CI gate
+
+### RED
+
+The executable CI contract check was added before the workflow step and failed because the `mysql84-bundle-integration` job did not run the focused, race-enabled webhook selector. A mutation test also demonstrated that the first global-grep checker could falsely pass when required tokens were split across an unrelated job or sibling step.
+
+### GREEN
+
+The MySQL 8.4.10 end-to-end contract now provisions a real encrypted callback, submits and completes a durable job, decrypts only for delivery, independently verifies the exact HMAC input, and settles the event. It then models a remote `2xx` followed by a worker crash before settlement: the expired lease is reclaimed with the same `eventId` and byte-identical body, the stale settlement is rejected, and the authoritative lease completes.
+
+```text
+ok github.com/CodeRushOJ/croj-judging-server/internal/external 2.038s
+```
+
+CI pins MySQL 8.4.10 by digest and runs `go test -race -count=1 -timeout=10m ./internal/external -run '^TestMySQLWebhook'`. The checker scopes the digest to `services.mysql`, and the exact disposable localhost DSN plus command to the delivery step. Cross-job, named/unnamed sibling-step, decoy-service, and empty-DSN mutation fixtures are rejected. `shellcheck`, both executable contract scripts, and `git diff --check` pass.
