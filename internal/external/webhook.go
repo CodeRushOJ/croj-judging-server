@@ -31,6 +31,7 @@ const (
 
 const (
 	WebhookErrorConfiguration     = "configuration"
+	WebhookErrorCallbackDecrypt   = "callback_decrypt"
 	WebhookErrorHTTPPermanent     = "http_permanent"
 	WebhookErrorHTTPRetryable     = "http_retryable"
 	WebhookErrorInvalidDelivery   = "invalid_delivery"
@@ -117,6 +118,9 @@ func (deliverer *WebhookDeliverer) DeliverOutcome(ctx context.Context, delivery 
 	responseTime := deliverer.now().UTC()
 	defer response.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4<<10))
+	if response.StatusCode < 200 || response.StatusCode > 599 {
+		return permanentWebhookOutcome(WebhookErrorInvalidDelivery, fmt.Errorf("webhook response status is invalid"))
+	}
 	outcome := WebhookOutcome{HTTPStatus: response.StatusCode}
 	if response.StatusCode >= 200 && response.StatusCode < 300 {
 		outcome.Disposition = WebhookDelivered
