@@ -64,6 +64,7 @@ type WebhookSettlement struct {
 	HTTPStatus  int
 	ErrorCode   string
 	RetryAt     time.Time
+	RetryDelay  time.Duration
 }
 
 func NewMySQLWebhookOutboxRepository(config MySQLWebhookOutboxRepositoryConfig) (*MySQLWebhookOutboxRepository, error) {
@@ -166,13 +167,17 @@ LIMIT 1 FOR UPDATE SKIP LOCKED`, now, now, now, now).Scan(
 	if err != nil {
 		return WebhookClaim{}, false, repositoryUnavailable("lock claimable webhook", err)
 	}
+	leaseNow, err := mysqlCurrentTime(ctx, tx)
+	if err != nil {
+		return WebhookClaim{}, false, err
+	}
 
 	deadCode := ""
 	if tenantStatus != "ACTIVE" {
 		deadCode = "tenant_disabled"
 	} else if callbackDisabled.Valid {
 		deadCode = "callback_disabled"
-	} else if !claim.ExpiresAt.After(now) {
+	} else if !claim.ExpiresAt.After(leaseNow) {
 		deadCode = "delivery_expired"
 	} else if claim.AttemptCount >= repository.maximumAttempts {
 		deadCode = "attempts_exhausted"
@@ -185,7 +190,7 @@ LIMIT 1 FOR UPDATE SKIP LOCKED`, now, now, now, now).Scan(
 UPDATE t_external_webhook_outbox
 SET status = 'DEAD', worker_id = NULL, lease_token = NULL, lease_until = NULL,
     last_error_code = ?, dead_at = ?
-WHERE id = ?`, deadCode, now, claim.OutboxID); err != nil {
+WHERE id = ?`, deadCode, leaseNow, claim.OutboxID); err != nil {
 			return WebhookClaim{}, false, repositoryUnavailable("dead-letter undeliverable webhook", err)
 		}
 		if err := tx.Commit(); err != nil {
@@ -198,7 +203,7 @@ WHERE id = ?`, deadCode, now, claim.OutboxID); err != nil {
 	if _, err := io.ReadFull(repository.random, token); err != nil {
 		return WebhookClaim{}, false, repositoryUnavailable("generate webhook lease token", err)
 	}
-	leaseUntil := now.Add(leaseDuration)
+	leaseUntil := leaseNow.Add(leaseDuration)
 	result, err := tx.ExecContext(ctx, `
 UPDATE t_external_webhook_outbox
 SET status = 'DELIVERING', attempt_count = attempt_count + 1,
@@ -273,10 +278,13 @@ SET status = 'DEAD', worker_id = NULL, lease_token = NULL, lease_until = NULL,
     last_http_status = ?, last_error_code = ?, dead_at = ?
 WHERE id = ?`, httpStatus, settlement.ErrorCode, now, claim.OutboxID)
 	case WebhookRetry:
-		if !settlement.RetryAt.After(now) || settlement.RetryAt.Sub(now) > maximumWebhookRetryAfter {
+		retryAt := settlement.RetryAt.UTC()
+		if settlement.RetryDelay > 0 {
+			retryAt = now.Add(settlement.RetryDelay)
+		} else if !retryAt.After(now) || retryAt.Sub(now) > maximumWebhookRetryAfter {
 			return ErrWebhookSettlementInvalid
 		}
-		if attemptCount >= repository.maximumAttempts || !settlement.RetryAt.Before(expiresAt) {
+		if attemptCount >= repository.maximumAttempts || !retryAt.Before(expiresAt) {
 			_, err = tx.ExecContext(ctx, `
 UPDATE t_external_webhook_outbox
 SET status = 'DEAD', worker_id = NULL, lease_token = NULL, lease_until = NULL,
@@ -287,7 +295,7 @@ WHERE id = ?`, httpStatus, settlement.ErrorCode, now, claim.OutboxID)
 UPDATE t_external_webhook_outbox
 SET status = 'PENDING', worker_id = NULL, lease_token = NULL, lease_until = NULL,
     next_attempt_at = ?, last_http_status = ?, last_error_code = ?
-WHERE id = ?`, settlement.RetryAt.UTC(), httpStatus, settlement.ErrorCode, claim.OutboxID)
+WHERE id = ?`, retryAt, httpStatus, settlement.ErrorCode, claim.OutboxID)
 		}
 	}
 	if err != nil {
@@ -369,12 +377,17 @@ func validWebhookSettlement(settlement WebhookSettlement) bool {
 	}
 	switch settlement.Disposition {
 	case WebhookDelivered:
-		return settlement.HTTPStatus >= 200 && settlement.HTTPStatus <= 299 && settlement.ErrorCode == "" && settlement.RetryAt.IsZero()
+		return settlement.HTTPStatus >= 200 && settlement.HTTPStatus <= 299 && settlement.ErrorCode == "" && settlement.RetryAt.IsZero() && settlement.RetryDelay == 0
 	case WebhookRetry:
-		return !settlement.RetryAt.IsZero() && (settlement.ErrorCode == WebhookErrorNetwork && settlement.HTTPStatus == 0 ||
+		if settlement.RetryDelay < 0 {
+			return false
+		}
+		hasAbsolute := !settlement.RetryAt.IsZero()
+		hasDelay := settlement.RetryDelay > 0 && settlement.RetryDelay <= maximumWebhookRetryAfter
+		return hasAbsolute != hasDelay && (settlement.ErrorCode == WebhookErrorNetwork && settlement.HTTPStatus == 0 ||
 			settlement.ErrorCode == WebhookErrorHTTPRetryable && retryableWebhookHTTPStatus(settlement.HTTPStatus))
 	case WebhookPermanentFailure:
-		if !settlement.RetryAt.IsZero() {
+		if !settlement.RetryAt.IsZero() || settlement.RetryDelay != 0 {
 			return false
 		}
 		if settlement.ErrorCode == WebhookErrorHTTPPermanent {
@@ -383,7 +396,8 @@ func validWebhookSettlement(settlement WebhookSettlement) bool {
 		return settlement.HTTPStatus == 0 && (settlement.ErrorCode == WebhookErrorUnsafeDestination ||
 			settlement.ErrorCode == WebhookErrorConfiguration ||
 			settlement.ErrorCode == WebhookErrorInvalidDelivery ||
-			settlement.ErrorCode == WebhookErrorCallbackDecrypt)
+			settlement.ErrorCode == WebhookErrorCallbackDecrypt ||
+			settlement.ErrorCode == WebhookErrorDeliveryExpired)
 	default:
 		return false
 	}
