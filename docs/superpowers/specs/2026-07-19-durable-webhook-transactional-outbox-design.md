@@ -25,7 +25,7 @@ The selected approach writes the terminal job state and immutable event in one I
 
 ## 3. Data model and replay-safe migration
 
-Migration `004_durable_webhook_outbox.sql` upgrades the existing early outbox table rather than replacing it. MySQL DDL can commit statement by statement, so every additive or constraint operation is a separate `-- migrate:split` statement with the existing replay-error annotations for duplicate columns, indexes, or constraints.
+Migration `005_durable_webhook_outbox.sql` follows the canonical tenant-policy v4 migration and upgrades the existing early outbox table rather than replacing it. MySQL DDL can commit statement by statement, so every additive or constraint operation is a separate `-- migrate:split` statement with the existing replay-error annotations for duplicate columns, indexes, or constraints.
 
 The upgraded row contains:
 

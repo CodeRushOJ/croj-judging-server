@@ -22,6 +22,8 @@ func TestProvisionerCreatesTenantWithValidatedPolicy(t *testing.T) {
 		MaxRetainedBundles:     200,
 		DailyExecutionMillis:   3_600_000,
 		MaxInfrastructureTries: 3,
+		MaxTimeLimitMillis:     10_000,
+		MaxMemoryLimitMiB:      1024,
 	}
 	tenantID, err := provisioner.CreateTenant(context.Background(), "Acme OJ", policy)
 	if err != nil {
@@ -131,10 +133,12 @@ func TestProvisionerCreatesAPIKeyOnceForAnActiveTenant(t *testing.T) {
 }
 
 func TestProvisionerRejectsUnsafePolicyScopesAndUnknownTenant(t *testing.T) {
-	validPolicy := TenantPolicy{MaxQueuedJobs: 1, MaxRunningJobs: 1, MaxSourceBytes: 1024, MaxRetainedBundles: 1, DailyExecutionMillis: 1000, MaxInfrastructureTries: 1}
+	validPolicy := TenantPolicy{MaxQueuedJobs: 1, MaxRunningJobs: 1, MaxSourceBytes: 1024, MaxRetainedBundles: 1, DailyExecutionMillis: 1000, MaxInfrastructureTries: 1, MaxTimeLimitMillis: 10_000, MaxMemoryLimitMiB: 1024}
 	for name, policy := range map[string]TenantPolicy{
-		"zero queue":         {MaxRunningJobs: 1, MaxSourceBytes: 1, MaxRetainedBundles: 1, DailyExecutionMillis: 1, MaxInfrastructureTries: 1},
-		"running over queue": {MaxQueuedJobs: 1, MaxRunningJobs: 2, MaxSourceBytes: 1, MaxRetainedBundles: 1, DailyExecutionMillis: 1, MaxInfrastructureTries: 1},
+		"zero queue":         {MaxRunningJobs: 1, MaxSourceBytes: 1, MaxRetainedBundles: 1, DailyExecutionMillis: 1, MaxInfrastructureTries: 1, MaxTimeLimitMillis: 1, MaxMemoryLimitMiB: 1},
+		"running over queue": {MaxQueuedJobs: 1, MaxRunningJobs: 2, MaxSourceBytes: 1, MaxRetainedBundles: 1, DailyExecutionMillis: 1, MaxInfrastructureTries: 1, MaxTimeLimitMillis: 1, MaxMemoryLimitMiB: 1},
+		"zero max time":      {MaxQueuedJobs: 1, MaxRunningJobs: 1, MaxSourceBytes: 1, MaxRetainedBundles: 1, DailyExecutionMillis: 1, MaxInfrastructureTries: 1, MaxMemoryLimitMiB: 1},
+		"zero max memory":    {MaxQueuedJobs: 1, MaxRunningJobs: 1, MaxSourceBytes: 1, MaxRetainedBundles: 1, DailyExecutionMillis: 1, MaxInfrastructureTries: 1, MaxTimeLimitMillis: 1},
 	} {
 		t.Run(name, func(t *testing.T) {
 			provisioner := &Provisioner{executor: &provisionExecutorStub{affected: 1}, random: bytes.NewReader(make([]byte, externalIDRandomBytes))}

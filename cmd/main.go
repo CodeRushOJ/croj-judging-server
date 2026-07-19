@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -19,6 +21,7 @@ import (
 	"github.com/CodeRushOJ/croj-judging-server/internal/scheduler"
 	"github.com/CodeRushOJ/croj-judging-server/internal/service"
 	"github.com/CodeRushOJ/croj-judging-server/pkg/config"
+	_ "github.com/go-sql-driver/mysql"
 )
 
 func main() {
@@ -30,30 +33,45 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 	fmt.Println("Config loaded.")
-
-	// 初始化数据库连接
-	db, err := database.NewDatabase(cfg.Database)
-	if err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
+	if !cfg.LegacyJudge.Enabled && !cfg.ExternalAPI.Enabled {
+		log.Fatal("at least one of legacy Judge or external REST must be enabled")
 	}
-	defer db.Close()
-	fmt.Println("Database connected.")
-
 	refreshInterval, err := time.ParseDuration(cfg.SandboxDiscovery.RefreshInterval)
 	if err != nil {
 		log.Fatalf("Invalid sandbox discovery refresh interval: %v", err)
 	}
-	discoveryClient, err := discovery.NewKubernetesDiscovery(
-		cfg.SandboxDiscovery.Namespace,
-		cfg.SandboxDiscovery.Service,
-		cfg.SandboxDiscovery.PortName,
-		cfg.SandboxDiscovery.Kubeconfig,
-	)
-	if err != nil {
-		log.Fatalf("Failed to initialize Kubernetes sandbox discovery: %v", err)
+	var sandboxSelector service.SandboxSelector
+	var legacyScheduler *scheduler.Scheduler
+	var sandboxReadinessProbe func(context.Context) error
+	if cfg.SandboxDiscovery.Target != "" {
+		targetSelector, err := scheduler.NewTarget(cfg.SandboxDiscovery.Target)
+		if err != nil {
+			log.Fatalf("Invalid sandbox gRPC target: %v", err)
+		}
+		sandboxSelector = targetSelector
+		sandboxReadinessProbe = sandboxDNSProbe(cfg.SandboxDiscovery.Target)
+		fmt.Println("gRPC DNS round_robin sandbox target initialized.")
+	} else {
+		if !cfg.SandboxDiscovery.AllowLegacyEndpointSlice {
+			log.Fatal("SANDBOX_GRPC_TARGET is required; set SANDBOX_ALLOW_LEGACY_ENDPOINT_SLICE=true only for the deprecated fallback")
+		}
+		log.Printf("DEPRECATED: direct EndpointSlice scheduling is enabled explicitly; configure SANDBOX_GRPC_TARGET for a headless Service")
+		discoveryClient, err := discovery.NewKubernetesDiscovery(
+			cfg.SandboxDiscovery.Namespace,
+			cfg.SandboxDiscovery.Service,
+			cfg.SandboxDiscovery.PortName,
+			cfg.SandboxDiscovery.Kubeconfig,
+		)
+		if err != nil {
+			log.Fatalf("Failed to initialize legacy Kubernetes sandbox discovery: %v", err)
+		}
+		legacyScheduler = scheduler.New(discoveryClient)
+		sandboxSelector = legacyScheduler
+		sandboxReadinessProbe = func(context.Context) error {
+			_, err := legacyScheduler.SelectSandbox()
+			return err
+		}
 	}
-	sandboxScheduler := scheduler.New(discoveryClient)
-	fmt.Println("Scheduler initialized.")
 
 	executeTimeout, err := time.ParseDuration(cfg.SandboxDiscovery.ExecuteTimeout)
 	if err != nil || executeTimeout <= 0 {
@@ -109,52 +127,108 @@ func main() {
 		log.Fatalf("Invalid test bundle archive limits: %v", err)
 	}
 	bundleProvider := bundle.NewProvider(bundleCache, archiveLimits)
-	bundlePipeline := service.NewBundlePipeline(
-		sandboxScheduler,
+	bundlePipeline := service.NewBatchBundlePipeline(
+		sandboxSelector,
 		sandboxClient,
 		cfg.TestBundles.MaxInfraAttempts,
 	)
-	executionPipeline := service.NewHiddenTestExecutor(bundleProvider, bundlePipeline)
-	callbackTimeout, err := time.ParseDuration(cfg.JudgeResult.CallbackTimeout)
-	if err != nil || callbackTimeout <= 0 {
-		log.Fatalf("Invalid judge result callback timeout: %q", cfg.JudgeResult.CallbackTimeout)
+	var judgeDatabase *sql.DB
+	if cfg.ExternalAPI.Enabled {
+		if cfg.ExternalAPI.JudgeDatabaseDSN == "" {
+			log.Fatal("JUDGE_DATABASE_DSN is required when external REST is enabled")
+		}
+		judgeDatabase, err = sql.Open("mysql", cfg.ExternalAPI.JudgeDatabaseDSN)
+		if err != nil {
+			log.Fatalf("Failed to open external Judge database: %v", err)
+		}
+		judgeDatabase.SetMaxOpenConns(32)
+		judgeDatabase.SetMaxIdleConns(16)
+		judgeDatabase.SetConnMaxLifetime(5 * time.Minute)
 	}
-	resultClient, err := callback.NewClient(
-		cfg.JudgeResult.BackendURL,
-		cfg.JudgeResult.ServiceToken,
-		callbackTimeout,
-		http.DefaultClient,
-	)
+	external, err := newExternalRuntime(cfg, judgeDatabase, bundleProvider, bundlePipeline, archiveLimits, sandboxReadinessProbe)
 	if err != nil {
-		log.Fatalf("Failed to initialize judge result callback: %v", err)
+		if judgeDatabase != nil {
+			_ = judgeDatabase.Close()
+		}
+		log.Fatalf("Failed to initialize external runtime: %v", err)
 	}
-	cacheTTL, err := time.ParseDuration(cfg.JudgeResult.CacheTTL)
-	if err != nil || cacheTTL <= 0 {
-		log.Fatalf("Invalid judge task cache TTL: %q", cfg.JudgeResult.CacheTTL)
-	}
-	registry := service.NewTaskRegistry(cfg.JudgeResult.CacheCapacity, cacheTTL)
-	judgeService := service.NewJudgeService(db, executionPipeline, resultClient, registry)
-	fmt.Println("Judge service initialized.")
-
-	// 启动 RocketMQ 消费者
-	rocketmqConsumer, err := consumer.NewRocketMQConsumer(cfg.RocketMQ, judgeService)
+	defer func() {
+		if err := external.Close(); err != nil {
+			log.Printf("Failed to close external runtime: %v", err)
+		}
+	}()
+	legacy, err := initializeLegacyRuntime(cfg.LegacyJudge.Enabled, func() (*legacyRuntime, error) {
+		legacyDatabase, openErr := database.NewDatabase(cfg.Database)
+		if openErr != nil {
+			return nil, fmt.Errorf("connect to legacy backend database: %w", openErr)
+		}
+		keepDatabase := false
+		defer func() {
+			if !keepDatabase {
+				_ = legacyDatabase.Close()
+			}
+		}()
+		executionPipeline := service.NewHiddenTestExecutor(bundleProvider, bundlePipeline)
+		callbackTimeout, err := time.ParseDuration(cfg.JudgeResult.CallbackTimeout)
+		if err != nil || callbackTimeout <= 0 {
+			return nil, fmt.Errorf("invalid judge result callback timeout %q", cfg.JudgeResult.CallbackTimeout)
+		}
+		resultClient, err := callback.NewClient(
+			cfg.JudgeResult.BackendURL,
+			cfg.JudgeResult.ServiceToken,
+			callbackTimeout,
+			http.DefaultClient,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("initialize judge result callback: %w", err)
+		}
+		cacheTTL, err := time.ParseDuration(cfg.JudgeResult.CacheTTL)
+		if err != nil || cacheTTL <= 0 {
+			return nil, fmt.Errorf("invalid judge task cache TTL %q", cfg.JudgeResult.CacheTTL)
+		}
+		registry := service.NewTaskRegistry(cfg.JudgeResult.CacheCapacity, cacheTTL)
+		judgeService := service.NewJudgeService(legacyDatabase, executionPipeline, resultClient, registry)
+		rocketmqConsumer, err := consumer.NewRocketMQConsumer(cfg.RocketMQ, judgeService)
+		if err != nil {
+			return nil, fmt.Errorf("create RocketMQ consumer: %w", err)
+		}
+		keepDatabase = true
+		return &legacyRuntime{database: legacyDatabase, consumer: rocketmqConsumer}, nil
+	})
 	if err != nil {
-		log.Fatalf("Failed to create RocketMQ consumer: %v", err)
+		log.Fatalf("Failed to initialize legacy judge adapter: %v", err)
+	}
+	defer func() {
+		if err := legacy.Close(); err != nil {
+			log.Printf("Failed to close legacy backend database: %v", err)
+		}
+	}()
+	rocketmqConsumer := legacy.consumer
+	if rocketmqConsumer != nil {
+		fmt.Println("Legacy backend database and RocketMQ judge adapter initialized.")
 	}
 
 	// 使用 context 来管理 consumer 的生命周期
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go sandboxScheduler.Run(ctx, refreshInterval)
+	if legacyScheduler != nil {
+		go legacyScheduler.Run(ctx, refreshInterval)
+	}
+	var externalDone <-chan error
+	if cfg.ExternalAPI.Enabled {
+		fmt.Printf("Starting external REST API on %s...\n", cfg.ExternalAPI.ListenAddress)
+		externalDone = startExternalRuntime(ctx, external.runtime, cancel)
+	}
 
-	go func() {
-		fmt.Println("Starting RocketMQ consumer...")
-		if err := rocketmqConsumer.Start(); err != nil {
-			log.Printf("RocketMQ consumer error: %v", err)
-			// 这里应该有更健壮的错误处理和重启逻辑
-			cancel() // 如果消费者启动失败，则取消 context
-		}
-	}()
+	if rocketmqConsumer != nil {
+		go func() {
+			fmt.Println("Starting legacy RocketMQ consumer...")
+			if err := rocketmqConsumer.Start(); err != nil {
+				log.Printf("RocketMQ consumer error: %v", err)
+				cancel()
+			}
+		}()
+	}
 
 	// 等待退出信号
 	quit := make(chan os.Signal, 1)
@@ -170,12 +244,44 @@ func main() {
 	}
 
 	fmt.Println("Shutting down server...")
-
-	// 关闭消费者
-	if err := rocketmqConsumer.Shutdown(); err != nil {
-		log.Printf("Failed to shutdown RocketMQ consumer: %v", err)
+	if externalDone != nil {
+		if err := <-externalDone; err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("External runtime error: %v", err)
+		}
+		fmt.Println("External durable workers and REST API stopped.")
 	}
-	fmt.Println("RocketMQ consumer stopped.")
+
+	if rocketmqConsumer != nil {
+		if err := rocketmqConsumer.Shutdown(); err != nil {
+			log.Printf("Failed to shutdown RocketMQ consumer: %v", err)
+		}
+		fmt.Println("Legacy RocketMQ consumer stopped.")
+	}
 
 	fmt.Println("Server gracefully stopped.")
+}
+
+type legacyRuntime struct {
+	database *database.Database
+	consumer *consumer.RocketMQConsumer
+}
+
+// initializeLegacyRuntime is the process boundary for every Backend DB,
+// Backend callback, and RocketMQ dependency. External-only deployments never
+// invoke the initializer, so absent legacy configuration remains inert.
+func initializeLegacyRuntime(enabled bool, initializer func() (*legacyRuntime, error)) (*legacyRuntime, error) {
+	if !enabled {
+		return &legacyRuntime{}, nil
+	}
+	if initializer == nil {
+		return nil, fmt.Errorf("legacy runtime initializer is required")
+	}
+	return initializer()
+}
+
+func (runtime *legacyRuntime) Close() error {
+	if runtime == nil || runtime.database == nil {
+		return nil
+	}
+	return runtime.database.Close()
 }

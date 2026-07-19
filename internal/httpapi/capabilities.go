@@ -7,10 +7,12 @@ type LanguageCapability struct {
 }
 
 type CapabilityLimits struct {
-	MaxSourceBytes int64 `json:"maxSourceBytes"`
-	MaxBundleBytes int64 `json:"maxBundleBytes"`
-	MaxCaseBytes   int64 `json:"maxCaseBytes"`
-	MaxCaseCount   int   `json:"maxCaseCount"`
+	MaxSourceBytes     int64 `json:"maxSourceBytes"`
+	MaxBundleBytes     int64 `json:"maxBundleBytes"`
+	MaxCaseBytes       int64 `json:"maxCaseBytes"`
+	MaxCaseCount       int   `json:"maxCaseCount"`
+	MaxTimeLimitMillis int   `json:"maxTimeLimitMillis"`
+	MaxMemoryLimitMiB  int   `json:"maxMemoryLimitMiB"`
 }
 
 type Capabilities struct {

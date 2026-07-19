@@ -161,6 +161,96 @@ WHERE external_id = ?`, tenantID); err != nil {
 	assertPendingTerminalEvent(t, database, failed.Job.ExternalID, "judge.job.failed", JobStatusFailed)
 }
 
+func TestMySQLDisabledTenantExpiredRunningClaimAtomicallyCreatesFailureWebhook(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	tenantID := strings.Repeat("a", 26)
+	bundleID := strings.Repeat("b", 26)
+	callbackID := strings.Repeat("c", 26)
+	insertTenantBundleAndCallback(t, database, tenantID, bundleID, callbackID, 2)
+	repository := newTestMySQLJobRepository(t, database, newMemorySourceStore())
+	job := submitWebhookJob(t, repository, tenantID, bundleID, callbackID, "webhook-disabled-expired")
+	claim, err := repository.ClaimNext(context.Background(), "disabled-expired-worker", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec("UPDATE t_external_tenant SET status = 'DISABLED' WHERE external_id = ?", tenantID); err != nil {
+		t.Fatal(err)
+	}
+	expireClaimLease(t, database, claim)
+
+	if _, err := repository.ClaimNext(context.Background(), "disabled-recovery-worker", time.Minute); !errors.Is(err, ErrJobNotClaimable) {
+		t.Fatalf("disabled tenant recovery error=%v", err)
+	}
+	settled, err := repository.Get(context.Background(), tenantID, job.Job.ExternalID)
+	if err != nil || settled.Status != JobStatusFailed || settled.FailureCode != "TENANT_DISABLED" {
+		t.Fatalf("disabled tenant terminal job=%+v error=%v", settled, err)
+	}
+	if got := mustCount(t, database, `SELECT COUNT(*) FROM t_external_job_attempt
+WHERE job_id = ? AND attempt_no = ? AND status = 'EXPIRED'`, job.Job.InternalID, claim.AttemptNo); got != 1 {
+		t.Fatalf("expired attempts=%d want=1", got)
+	}
+	if got := mustCount(t, database, "SELECT COUNT(*) FROM t_external_webhook_outbox WHERE job_id = ?", job.Job.InternalID); got != 1 {
+		t.Fatalf("disabled tenant webhook rows=%d want=1", got)
+	}
+	assertPendingTerminalEvent(t, database, job.Job.ExternalID, "judge.job.failed", JobStatusFailed)
+	var payloadBody []byte
+	if err := database.QueryRow("SELECT payload_body FROM t_external_webhook_outbox WHERE job_id = ?", job.Job.InternalID).Scan(&payloadBody); err != nil {
+		t.Fatal(err)
+	}
+	var payload terminalWebhookPayload
+	if err := json.Unmarshal(payloadBody, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.FailureCode != "TENANT_DISABLED" {
+		t.Fatalf("failure code=%q want=TENANT_DISABLED", payload.FailureCode)
+	}
+}
+
+func TestMySQLDisabledTenantWebhookInsertFailureRollsBackExpiredRunningTransition(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	tenantID := strings.Repeat("d", 26)
+	bundleID := strings.Repeat("e", 26)
+	callbackID := strings.Repeat("f", 26)
+	insertTenantBundleAndCallback(t, database, tenantID, bundleID, callbackID, 2)
+	repository := newTestMySQLJobRepository(t, database, newMemorySourceStore())
+	job := submitWebhookJob(t, repository, tenantID, bundleID, callbackID, "webhook-disabled-rollback")
+	claim, err := repository.ClaimNext(context.Background(), "disabled-rollback-worker", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec("UPDATE t_external_tenant SET status = 'DISABLED' WHERE external_id = ?", tenantID); err != nil {
+		t.Fatal(err)
+	}
+	expireClaimLease(t, database, claim)
+	if _, err := database.Exec(`ALTER TABLE t_external_webhook_outbox
+ADD CONSTRAINT chk_test_reject_disabled_webhook CHECK (event_type <> event_type)`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = database.Exec("ALTER TABLE t_external_webhook_outbox DROP CHECK chk_test_reject_disabled_webhook")
+	})
+
+	if _, err := repository.ClaimNext(context.Background(), "disabled-rollback-recovery", time.Minute); !errors.Is(err, ErrExternalJobUnavailable) {
+		t.Fatalf("disabled tenant rejected webhook error=%v", err)
+	}
+	settled, err := repository.Get(context.Background(), tenantID, job.Job.ExternalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settled.Status != JobStatusRunning || settled.FailureCode != "" {
+		t.Fatalf("rolled back job=%+v", settled)
+	}
+	if got := mustCount(t, database, `SELECT COUNT(*) FROM t_external_job_attempt
+WHERE job_id = ? AND attempt_no = ? AND status = 'RUNNING'`, job.Job.InternalID, claim.AttemptNo); got != 1 {
+		t.Fatalf("running attempts after rollback=%d want=1", got)
+	}
+	if got := mustCount(t, database, "SELECT COUNT(*) FROM t_external_webhook_outbox WHERE job_id = ?", job.Job.InternalID); got != 0 {
+		t.Fatalf("webhook rows after rollback=%d want=0", got)
+	}
+}
+
 func TestMySQLWebhookInsertFailureRollsBackTerminalJobTransition(t *testing.T) {
 	database := openMySQLIntegration(t)
 	prepareExternalJobDatabase(t, database)

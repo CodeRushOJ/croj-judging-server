@@ -27,7 +27,13 @@ type Manifest struct {
 	SchemaVersion int       `json:"schemaVersion"`
 	JudgeMode     JudgeMode `json:"judgeMode"`
 	Checker       Checker   `json:"checker"`
+	Limits        Limits    `json:"limits"`
 	Cases         []Case    `json:"cases"`
+}
+
+type Limits struct {
+	TimeLimitMillis int `json:"timeLimitMillis"`
+	MemoryLimitMiB  int `json:"memoryLimitMiB"`
 }
 
 type Case struct {
@@ -65,6 +71,9 @@ func (manifest Manifest) Validate() error {
 	}
 	if manifest.Checker != CheckerExact && manifest.Checker != CheckerToken {
 		return fmt.Errorf("unsupported checker %q", manifest.Checker)
+	}
+	if manifest.Limits.TimeLimitMillis <= 0 || manifest.Limits.MemoryLimitMiB <= 0 {
+		return fmt.Errorf("manifest execution limits must be positive")
 	}
 	if len(manifest.Cases) == 0 || len(manifest.Cases) > maxCases {
 		return fmt.Errorf("manifest cases must contain 1..%d entries", maxCases)

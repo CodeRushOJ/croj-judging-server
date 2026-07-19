@@ -339,6 +339,7 @@ func TestExternalBundleUploadHTTPIntegration(t *testing.T) {
 	objectRoot := t.TempDir()
 	service, err := external.NewBundleService(repository, &integrationFileObjectStore{root: objectRoot}, external.BundleServiceConfig{
 		TempDir: t.TempDir(), MaxUploadBytes: 1 << 20, ArchiveLimits: bundle.DefaultArchiveLimits(), IdempotencyTTL: 24 * time.Hour,
+		MaxTimeLimitMillis: 10_000, MaxMemoryLimitMiB: 1024,
 		IdempotencyPepper: bytes.Repeat([]byte{0x42}, sha256.Size),
 	})
 	if err != nil {
@@ -401,6 +402,47 @@ func TestExternalBundleSQLRepositoryIntegration(t *testing.T) {
 	if err := external.ApplyMigrations(context.Background(), database); err != nil {
 		t.Fatal(err)
 	}
+
+	t.Run("tenant and platform execution ceilings reject before publication", func(t *testing.T) {
+		tenantID, service, objectStore := newSQLBundleFixture(t, database)
+		if _, err := database.Exec(`UPDATE t_external_tenant
+SET policy_json = JSON_SET(policy_json, '$.maxTimeLimitMillis', 1500, '$.maxMemoryLimitMiB', 512)
+WHERE external_id = ?`, tenantID); err != nil {
+			t.Fatal(err)
+		}
+		for _, test := range []struct {
+			key             string
+			timeLimitMillis int
+			memoryLimitMiB  int
+		}{
+			{key: "tenant-limit-reject", timeLimitMillis: 1501, memoryLimitMiB: 512},
+			{key: "platform-limit-reject", timeLimitMillis: 10001, memoryLimitMiB: 256},
+		} {
+			_, _, err := service.Upload(context.Background(), tenantID, test.key,
+				bytes.NewReader(integrationBundleZIPWithLimits(t, "limits", test.timeLimitMillis, test.memoryLimitMiB)))
+			if !errors.Is(err, external.ErrInvalidBundle) {
+				t.Fatalf("%s error = %v", test.key, err)
+			}
+		}
+		assertSQLBundleRows(t, database, tenantID, 0, 0)
+		assertVisibleBundleObjects(t, objectStore.root, 0)
+	})
+
+	t.Run("invalid tenant policy rejects and discards staging", func(t *testing.T) {
+		tenantID, service, objectStore := newSQLBundleFixture(t, database)
+		if _, err := database.Exec(`UPDATE t_external_tenant
+SET policy_json = JSON_OBJECT('maxQueuedJobs', 4)
+WHERE external_id = ?`, tenantID); err != nil {
+			t.Fatal(err)
+		}
+		_, _, err := service.Upload(context.Background(), tenantID, "invalid-policy-01",
+			bytes.NewReader(integrationBundleZIPWithLimits(t, "invalid-policy", 1000, 256)))
+		if !errors.Is(err, external.ErrInvalidBundle) {
+			t.Fatalf("invalid tenant policy error = %v", err)
+		}
+		assertSQLBundleRows(t, database, tenantID, 0, 0)
+		assertVisibleBundleObjects(t, objectStore.root, 0)
+	})
 
 	t.Run("same key and hash replay one row", func(t *testing.T) {
 		tenantID, service, objectStore := newSQLBundleFixture(t, database)
@@ -588,7 +630,7 @@ func newSQLBundleFixture(t *testing.T, database *sql.DB) (string, *external.Bund
 func newSQLBundleFixtureWithStore(t *testing.T, database *sql.DB, store external.BundleObjectStore) (string, *external.BundleService) {
 	t.Helper()
 	tenantID := randomExternalID(t)
-	if _, err := database.Exec(`INSERT INTO t_external_tenant(external_id, name, status, policy_json) VALUES (?, ?, 'ACTIVE', ?)`, tenantID, "bundle-integration", `{"maxQueuedJobs":10}`); err != nil {
+	if _, err := database.Exec(`INSERT INTO t_external_tenant(external_id, name, status, policy_json) VALUES (?, ?, 'ACTIVE', ?)`, tenantID, "bundle-integration", `{"maxQueuedJobs":10,"maxRunningJobs":2,"maxSourceBytes":1048576,"maxRetainedBundles":100,"dailyExecutionMillis":3600000,"maxInfrastructureTries":3,"maxTimeLimitMillis":10000,"maxMemoryLimitMiB":1024}`); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -602,6 +644,7 @@ func newSQLBundleFixtureWithStore(t *testing.T, database *sql.DB, store external
 	}
 	service, err := external.NewBundleService(repository, store, external.BundleServiceConfig{
 		TempDir: t.TempDir(), MaxUploadBytes: 1 << 20, ArchiveLimits: bundle.DefaultArchiveLimits(), IdempotencyTTL: time.Hour,
+		MaxTimeLimitMillis: 10_000, MaxMemoryLimitMiB: 1024,
 		IdempotencyPepper: bytes.Repeat([]byte{0x42}, sha256.Size), PublicationRetry: 10 * time.Millisecond,
 	})
 	if err != nil {
@@ -720,8 +763,12 @@ func integrationBundleZIP(t *testing.T) []byte {
 }
 
 func integrationBundleZIPWithInput(t *testing.T, input string) []byte {
+	return integrationBundleZIPWithLimits(t, input, 1000, 256)
+}
+
+func integrationBundleZIPWithLimits(t *testing.T, input string, timeLimitMillis, memoryLimitMiB int) []byte {
 	t.Helper()
-	manifest, err := json.Marshal(bundle.Manifest{SchemaVersion: 1, JudgeMode: bundle.JudgeModeACM, Checker: bundle.CheckerExact, Cases: []bundle.Case{{ID: "case-1", Input: "1.in", Output: "1.out", Weight: 1}}})
+	manifest, err := json.Marshal(bundle.Manifest{SchemaVersion: 1, JudgeMode: bundle.JudgeModeACM, Checker: bundle.CheckerExact, Limits: bundle.Limits{TimeLimitMillis: timeLimitMillis, MemoryLimitMiB: memoryLimitMiB}, Cases: []bundle.Case{{ID: "case-1", Input: "1.in", Output: "1.out", Weight: 1}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -743,7 +790,7 @@ func integrationBundleZIPWithInput(t *testing.T, input string) []byte {
 }
 
 func integrationCapabilities() httpapi.Capabilities {
-	return httpapi.Capabilities{APIVersion: "v1", Languages: []httpapi.LanguageCapability{{ID: "cpp20", DisplayName: "C++20", Runtime: "gcc"}}, JudgeModes: []string{"ACM"}, Checkers: []string{"EXACT"}, Limits: httpapi.CapabilityLimits{MaxSourceBytes: 1 << 20, MaxBundleBytes: 1 << 20, MaxCaseBytes: 1 << 20, MaxCaseCount: 256}}
+	return httpapi.Capabilities{APIVersion: "v1", Languages: []httpapi.LanguageCapability{{ID: "cpp20", DisplayName: "C++20", Runtime: "gcc"}}, JudgeModes: []string{"ACM"}, Checkers: []string{"EXACT"}, Limits: httpapi.CapabilityLimits{MaxSourceBytes: 1 << 20, MaxBundleBytes: 1 << 20, MaxCaseBytes: 1 << 20, MaxCaseCount: 256, MaxTimeLimitMillis: 10_000, MaxMemoryLimitMiB: 1024}}
 }
 
 func randomExternalID(t *testing.T) string {

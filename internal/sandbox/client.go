@@ -4,15 +4,59 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"strings"
 	"sync"
 	"time"
 
 	sandboxpb "github.com/CodeRushOJ/croj-judging-server/proto"
 	"google.golang.org/grpc"
+	_ "google.golang.org/grpc/balancer/roundrobin"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/proto"
 )
 
 var ErrClientClosed = errors.New("sandbox client is closed")
+var ErrInvalidBatchStream = errors.New("invalid sandbox batch stream")
+
+const maxBatchMessageBytesV1 = 64 << 20
+const maxBatchResponseBytesV1 = maxBatchMessageBytesV1
+
+type batchStreamGuard struct {
+	maxEvents int
+	maxBytes  int
+	events    int
+	bytes     int
+	terminal  bool
+}
+
+func (guard *batchStreamGuard) observe(event *sandboxpb.ExecuteBatchV1Event) error {
+	if event == nil {
+		return fmt.Errorf("%w: nil event", ErrInvalidBatchStream)
+	}
+	if guard.terminal {
+		return fmt.Errorf("%w: event after terminal", ErrInvalidBatchStream)
+	}
+	guard.events++
+	guard.bytes += proto.Size(event)
+	if guard.events > guard.maxEvents {
+		return fmt.Errorf("%w: event count exceeds %d", ErrInvalidBatchStream, guard.maxEvents)
+	}
+	if guard.bytes > guard.maxBytes {
+		return fmt.Errorf("%w: event bytes exceed %d", ErrInvalidBatchStream, guard.maxBytes)
+	}
+	if event.Kind == sandboxpb.ExecuteBatchV1Event_COMPLETED || event.Kind == sandboxpb.ExecuteBatchV1Event_COMPILE_ERROR {
+		guard.terminal = true
+	}
+	return nil
+}
+
+func (guard *batchStreamGuard) finish() error {
+	if !guard.terminal {
+		return fmt.Errorf("%w: terminal event is missing", ErrInvalidBatchStream)
+	}
+	return nil
+}
 
 // Client owns one reusable gRPC connection per ready sandbox endpoint.
 type Client struct {
@@ -79,6 +123,69 @@ func (c *Client) Execute(ctx context.Context, address string, request *sandboxpb
 	return response, nil
 }
 
+func batchRPCTimeout(base time.Duration, request *sandboxpb.ExecuteBatchV1Request) time.Duration {
+	if request == nil || len(request.Cases) <= 1 {
+		return base
+	}
+	caseTimeoutSeconds := request.Timeout
+	if caseTimeoutSeconds <= 0 {
+		caseTimeoutSeconds = 1
+	}
+	if caseTimeoutSeconds > 30 {
+		caseTimeoutSeconds = 30
+	}
+	return base + time.Duration(len(request.Cases)-1)*time.Duration(caseTimeoutSeconds)*time.Second
+}
+
+// ExecuteBatch runs one compile-once stream and returns events only after a clean EOF.
+// Partial streams are discarded so callers can safely retry the complete batch.
+func (c *Client) ExecuteBatch(
+	ctx context.Context,
+	address string,
+	request *sandboxpb.ExecuteBatchV1Request,
+) ([]*sandboxpb.ExecuteBatchV1Event, error) {
+	if address == "" {
+		return nil, fmt.Errorf("sandbox address is required")
+	}
+	if request == nil {
+		return nil, fmt.Errorf("sandbox batch request is required")
+	}
+	entry, err := c.acquire(address)
+	if err != nil {
+		return nil, err
+	}
+	defer c.release(address, entry)
+	rpcContext, cancel := context.WithTimeout(ctx, batchRPCTimeout(c.timeout, request))
+	defer cancel()
+	stream, err := sandboxpb.NewSandboxServiceClient(entry.connection).ExecuteBatchV1(
+		rpcContext,
+		request,
+		grpc.MaxCallSendMsgSize(maxBatchMessageBytesV1),
+		grpc.MaxCallRecvMsgSize(maxBatchMessageBytesV1),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("start batch on sandbox %s: %w", address, err)
+	}
+	events := make([]*sandboxpb.ExecuteBatchV1Event, 0, len(request.Cases)+1)
+	guard := batchStreamGuard{maxEvents: len(request.Cases) + 1, maxBytes: maxBatchResponseBytesV1}
+	for {
+		event, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			if err := guard.finish(); err != nil {
+				return nil, err
+			}
+			return events, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("receive batch from sandbox %s: %w", address, err)
+		}
+		if err := guard.observe(event); err != nil {
+			return nil, err
+		}
+		events = append(events, event)
+	}
+}
+
 func (c *Client) acquire(address string) (*connectionEntry, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -98,9 +205,16 @@ func (c *Client) acquire(address string) (*connectionEntry, error) {
 	if len(c.conns) >= c.maxConns {
 		return nil, fmt.Errorf("sandbox connection cache is full")
 	}
-	// EndpointSlice returns an already-resolved Pod address. Passthrough avoids
-	// sending that address through gRPC's default DNS resolver a second time.
-	connection, err := grpc.NewClient("passthrough:///"+address, c.dialOptions...)
+	// URI targets (the production default is dns:/// for a headless Service)
+	// must reach gRPC's resolver and round_robin balancer unchanged. Deprecated
+	// direct EndpointSlice addresses retain passthrough compatibility.
+	target := address
+	if !strings.Contains(address, ":///") {
+		target = "passthrough:///" + address
+	}
+	options := append([]grpc.DialOption(nil), c.dialOptions...)
+	options = append(options, grpc.WithDefaultServiceConfig(`{"loadBalancingConfig":[{"round_robin":{}}]}`))
+	connection, err := grpc.NewClient(target, options...)
 	if err != nil {
 		return nil, fmt.Errorf("create gRPC client for sandbox %s: %w", address, err)
 	}
