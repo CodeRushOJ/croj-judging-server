@@ -97,6 +97,21 @@ func TestBundleUploadReplayReturns200(t *testing.T) {
 	}
 }
 
+func TestBundleUploadRejectsAmbiguousIdempotencyHeaders(t *testing.T) {
+	application := &bundleApplicationStub{metadata: testBundleMetadata()}
+	server := newBundleTestServer(t, ScopeBundleWrite, application)
+	body, contentType := multipartBody(t, []multipartValue{{name: "bundle", filename: "tests.zip", body: []byte("zip")}})
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/bundles", bytes.NewReader(body))
+	request.Header.Set("Content-Type", contentType)
+	request.Header.Add("Idempotency-Key", "upload-key-00001")
+	request.Header.Add("Idempotency-Key", "upload-key-00002")
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || application.calls != 0 {
+		t.Fatalf("status=%d calls=%d body=%s", response.Code, application.calls, response.Body.String())
+	}
+}
+
 func TestBundleUploadRejectsMissingKeyCallerStorageFieldsAndExtraParts(t *testing.T) {
 	for name, test := range map[string]struct {
 		values []multipartValue
