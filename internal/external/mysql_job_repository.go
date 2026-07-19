@@ -173,7 +173,9 @@ WHERE tenant_id = ? AND external_id = ? AND disabled_at IS NULL`,
 		return SubmitJobResult{}, repositoryUnavailable("encrypt source", err)
 	}
 	if err := repository.sourceObjects.Create(ctx, sourceObjectKey, encrypted.Ciphertext); err != nil {
-		return SubmitJobResult{}, repositoryUnavailable("persist encrypted source", err)
+		// Object-store SDK errors commonly embed bucket/key/request details.
+		// Preserve the availability class without making those details loggable.
+		return SubmitJobResult{}, fmt.Errorf("%w: persist encrypted source", ErrExternalJobUnavailable)
 	}
 	objectPublished := true
 	cleanupObject := func(cause error) error {
@@ -339,6 +341,16 @@ func (repository *MySQLJobRepository) Cancel(ctx context.Context, tenantExternal
 		return ExternalJobRecord{}, repositoryUnavailable("begin cancellation", err)
 	}
 	defer tx.Rollback()
+	// All mutating paths use tenant -> job lock order. This avoids a cancel
+	// racing a worker claim into the inverse job -> tenant deadlock pattern.
+	var tenantInternalID uint64
+	if err := tx.QueryRowContext(ctx,
+		"SELECT id FROM t_external_tenant WHERE external_id = ? FOR UPDATE",
+		tenantExternalID).Scan(&tenantInternalID); errors.Is(err, sql.ErrNoRows) {
+		return ExternalJobRecord{}, ErrExternalJobNotFound
+	} else if err != nil {
+		return ExternalJobRecord{}, repositoryUnavailable("lock cancellation tenant", err)
+	}
 	job, err := getExternalJob(ctx, tx, tenantExternalID, jobExternalID, true)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ExternalJobRecord{}, ErrExternalJobNotFound
