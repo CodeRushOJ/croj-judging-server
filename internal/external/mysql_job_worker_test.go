@@ -173,6 +173,14 @@ func TestMySQLWorkerLoadsAuthenticatedSourceForItsClaim(t *testing.T) {
 		t.Fatalf("loaded source mismatch")
 	}
 	clear(loaded)
+	forged := claim
+	forged.Job.Source.ObjectKey = "external/forged/source.bin"
+	forged.Job.Source.ExternalID = strings.Repeat("5", 26)
+	loaded, err = repository.LoadClaimSource(context.Background(), forged)
+	if err != nil || !bytes.Equal(loaded, plaintext) {
+		t.Fatalf("claim-carried source metadata was trusted: loaded=%q error=%v", loaded, err)
+	}
+	clear(loaded)
 
 	store.mutex.Lock()
 	store.objects[claim.Job.Source.ObjectKey][0] ^= 0xff
@@ -239,6 +247,34 @@ func TestMySQLWorkerInfrastructureRetryAndCancellationRecovery(t *testing.T) {
 	cancelled, err := restarted.Get(context.Background(), tenantID, cancelJob.Job.ExternalID)
 	if err != nil || cancelled.Status != JobStatusCancelled || cancelled.CompletedAt == nil {
 		t.Fatalf("recovered cancellation = %+v, error = %v", cancelled, err)
+	}
+
+	exhaustedJob, err := restarted.Submit(context.Background(), tenantID, "exhausted-retry-key", JudgeJobRequest{
+		BundleID: bundleID, Language: "java17", SourceCode: []byte("class Exhausted {}"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 1; attempt <= 3; attempt++ {
+		claim, err := restarted.ClaimNext(context.Background(), "failure-worker", time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		disposition, err := restarted.FailInfrastructure(context.Background(), claim, InfrastructureFailure{Code: "SANDBOX_UNAVAILABLE"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := FailureRequeued
+		if attempt == 3 {
+			want = FailureTerminal
+		}
+		if disposition != want {
+			t.Fatalf("attempt %d disposition = %s, want %s", attempt, disposition, want)
+		}
+	}
+	exhausted, err := restarted.Get(context.Background(), tenantID, exhaustedJob.Job.ExternalID)
+	if err != nil || exhausted.Status != JobStatusFailed || exhausted.FailureCode != "SANDBOX_UNAVAILABLE" || exhausted.CompletedAt == nil {
+		t.Fatalf("exhausted job = %+v, error = %v", exhausted, err)
 	}
 }
 
