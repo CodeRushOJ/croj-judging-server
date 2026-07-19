@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+
+	"github.com/CodeRushOJ/croj-judging-server/internal/external"
 )
 
 const (
@@ -49,6 +51,15 @@ func normalizeCapabilities(value Capabilities) (Capabilities, error) {
 	for _, language := range value.Languages {
 		if !capabilityLanguageIDPattern.MatchString(language.ID) || language.DisplayName == "" || language.Runtime == "" {
 			return Capabilities{}, fmt.Errorf("language capabilities must contain a valid ID, display name, and runtime")
+		}
+		definition, ok := external.ResolveLanguage(language.ID)
+		if !ok || definition.DisplayName != language.DisplayName || definition.Runtime != language.Runtime {
+			return Capabilities{}, fmt.Errorf("language capabilities must match the canonical Sandbox registry")
+		}
+	}
+	for _, checker := range value.Checkers {
+		if !external.IsCanonicalChecker(checker) {
+			return Capabilities{}, fmt.Errorf("checker capabilities must match bundle manifest identifiers")
 		}
 	}
 	value.Languages = append([]LanguageCapability(nil), value.Languages...)

@@ -23,6 +23,7 @@ import (
 	"github.com/CodeRushOJ/croj-judging-server/internal/bundle"
 	"github.com/CodeRushOJ/croj-judging-server/internal/callback"
 	"github.com/CodeRushOJ/croj-judging-server/internal/discovery"
+	"github.com/CodeRushOJ/croj-judging-server/internal/external"
 	judgesandbox "github.com/CodeRushOJ/croj-judging-server/internal/sandbox"
 	"github.com/CodeRushOJ/croj-judging-server/internal/scheduler"
 	"github.com/CodeRushOJ/croj-judging-server/internal/service"
@@ -38,6 +39,46 @@ import (
 )
 
 const integrationServiceToken = "0123456789abcdef0123456789abcdef"
+
+func TestExternalCanonicalLanguageRegistryExecutesAgainstRealGRPCFakeSandbox(t *testing.T) {
+	language, ok := external.ResolveLanguage("cpp")
+	if !ok || language.SandboxID != "cpp" {
+		t.Fatalf("canonical language = %+v available=%v", language, ok)
+	}
+	address, stop := startGRPCSandbox(t, func(_ context.Context, request *sandboxpb.ExecuteRequest) (*sandboxpb.ExecuteResponse, error) {
+		if request.Language != language.SandboxID || request.SourceCode != "int main(){}" {
+			t.Fatalf("Sandbox received drifted canonical request: %+v", request)
+		}
+		return &sandboxpb.ExecuteResponse{Status: "Accepted", Stdout: request.ExpectedOutput, TimeUsed: 7, MemoryUsed: 256}, nil
+	})
+	defer stop()
+	api := newEndpointSliceAPI(t)
+	api.SetEndpoint(t, address)
+	discoverer, err := discovery.NewKubernetesDiscovery("coderushoj", "croj-sandbox", "grpc", writeKubeconfig(t, api.URL()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector := scheduler.New(discoverer)
+	if err := selector.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	client := judgesandbox.NewClientWithCache(2*time.Second, 2, time.Minute)
+	defer client.Close()
+	metadata, provider := immutableBundle(t, "hidden input", "hidden output\n")
+	artifact, err := provider.OpenMetadata(context.Background(), bundle.Metadata{
+		ObjectKey: metadata.ObjectKey, SHA256: metadata.SHA256, SizeBytes: metadata.SizeBytes,
+	}, metadata.ManifestJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer artifact.Close()
+	result, err := service.NewBatchBundlePipeline(selector, client, 1).ExecuteCanonical(context.Background(), service.CanonicalExecutionRequest{
+		Language: language.SandboxID, SourceCode: "int main(){}", StopOnFailure: true,
+	}, artifact)
+	if err != nil || result.Status != callback.StatusAccepted || result.TimeUsedMillis != 7 {
+		t.Fatalf("canonical result=%+v error=%v", result, err)
+	}
+}
 
 func TestImmutableBundleUsesEndpointSliceFailoverGRPCAndRedactedCallback(t *testing.T) {
 	const (

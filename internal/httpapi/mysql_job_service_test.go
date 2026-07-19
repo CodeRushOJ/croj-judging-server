@@ -59,7 +59,7 @@ func TestMySQLJobServiceMapsCommandsAndRedactsRepositoryInternals(t *testing.T) 
 			ExternalID: "dddddddddddddddddddddddddd", ObjectKey: "external/secret/source.bin",
 			SHA256: []byte("secret-digest"), Nonce: []byte("secret-nonce"), KeyVersion: 7,
 		},
-		Status: external.JobStatusSucceeded, Language: "cpp20", ClientReference: "client-7",
+		Status: external.JobStatusSucceeded, Language: "cpp", ClientReference: "client-7",
 		WorkerID: "private-worker", CreatedAt: now,
 		Result: &external.DurableJobResult{
 			Verdict: "ACCEPTED", CompileStatus: "SUCCEEDED", TimeMillis: 7, MemoryBytes: 1024,
@@ -72,7 +72,7 @@ func TestMySQLJobServiceMapsCommandsAndRedactsRepositoryInternals(t *testing.T) 
 		t.Fatal(err)
 	}
 	view, replayed, err := service.Submit(context.Background(), record.TenantExternalID, "idempotency-key", SubmitJobCommand{
-		BundleID: record.BundleExternalID, Language: "cpp20", SourceCode: "int main(){}",
+		BundleID: record.BundleExternalID, Language: "cpp", SourceCode: "int main(){}",
 		StopOnFailure: true, CallbackID: "eeeeeeeeeeeeeeeeeeeeeeeeee", ClientReference: "client-7",
 	}, func() error { return nil })
 	if err != nil {
@@ -138,7 +138,7 @@ func TestMySQLJobServicePreservesAdmissionError(t *testing.T) {
 	}
 	quotaError := errors.New("quota unavailable")
 	_, _, err = service.Submit(context.Background(), "bbbbbbbbbbbbbbbbbbbbbbbbbb", "idempotency-key", SubmitJobCommand{
-		BundleID: "cccccccccccccccccccccccccc", Language: "cpp20", SourceCode: "int main(){}",
+		BundleID: "cccccccccccccccccccccccccc", Language: "cpp", SourceCode: "int main(){}",
 	}, func() error { return quotaError })
 	if !errors.Is(err, quotaError) {
 		t.Fatalf("admission error was remapped: %v", err)
@@ -148,5 +148,53 @@ func TestMySQLJobServicePreservesAdmissionError(t *testing.T) {
 func TestNewMySQLJobServiceRejectsNilRepository(t *testing.T) {
 	if _, err := NewMySQLJobService(nil); err == nil {
 		t.Fatal("nil repository accepted")
+	}
+}
+
+func TestMySQLJobServiceValidatesAndMapsCanonicalLanguageBeforePersistence(t *testing.T) {
+	repository := &durableJobRepositoryStub{submitResult: external.SubmitJobResult{Job: external.ExternalJobRecord{
+		ExternalID: "aaaaaaaaaaaaaaaaaaaaaaaaaa", Status: external.JobStatusQueued, CreatedAt: time.Now(),
+	}}}
+	service, err := NewMySQLJobService(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = service.Submit(context.Background(), "bbbbbbbbbbbbbbbbbbbbbbbbbb", "idempotency-key", SubmitJobCommand{
+		BundleID: "cccccccccccccccccccccccccc", Language: "cpp20", SourceCode: "int main(){}",
+	}, func() error { return nil })
+	if !errors.Is(err, ErrJobInvalid) {
+		t.Fatalf("unsupported advertised language error = %v, want ErrJobInvalid", err)
+	}
+	if repository.request.Language != "" {
+		t.Fatalf("unsupported language reached repository: %+v", repository.request)
+	}
+
+	repository.submitResult.Job.Language = "cpp"
+	_, _, err = service.Submit(context.Background(), "bbbbbbbbbbbbbbbbbbbbbbbbbb", "another-idempotency-key", SubmitJobCommand{
+		BundleID: "cccccccccccccccccccccccccc", Language: "cpp", SourceCode: "int main(){}",
+	}, func() error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repository.request.Language != "cpp" {
+		t.Fatalf("sandbox language = %q, want cpp", repository.request.Language)
+	}
+}
+
+func TestMySQLJobServiceExposesStableFailureCodeWithoutInternals(t *testing.T) {
+	repository := &durableJobRepositoryStub{getResult: external.ExternalJobRecord{
+		ExternalID: "aaaaaaaaaaaaaaaaaaaaaaaaaa", Status: external.JobStatusFailed,
+		CreatedAt: time.Now(), FailureCode: "SANDBOX_UNAVAILABLE", WorkerID: "private-worker-7",
+	}}
+	service, err := NewMySQLJobService(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := service.Get(context.Background(), "bbbbbbbbbbbbbbbbbbbbbbbbbb", repository.getResult.ExternalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.FailureCode != "SANDBOX_UNAVAILABLE" {
+		t.Fatalf("failureCode = %q", view.FailureCode)
 	}
 }

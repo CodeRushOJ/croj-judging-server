@@ -101,7 +101,7 @@ func TestCapabilitiesReturnsStableAuthenticatedContract(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &capabilities); err != nil {
 		t.Fatal(err)
 	}
-	if capabilities.APIVersion != "v1" || len(capabilities.Languages) != 1 || capabilities.Languages[0].ID != "cpp20" || capabilities.Limits.MaxCaseCount != 256 || capabilities.Limits.MaxTimeLimitMillis != 10_000 || capabilities.Limits.MaxMemoryLimitMiB != 1024 {
+	if capabilities.APIVersion != "v1" || len(capabilities.Languages) != 1 || capabilities.Languages[0].ID != "cpp" || capabilities.Limits.MaxCaseCount != 256 || capabilities.Limits.MaxTimeLimitMillis != 10_000 || capabilities.Limits.MaxMemoryLimitMiB != 1024 {
 		t.Fatalf("capabilities = %+v", capabilities)
 	}
 	if strings.Contains(response.Body.String(), "tenant-7") || strings.Contains(response.Body.String(), "valid-secret") {
@@ -124,15 +124,17 @@ func TestCapabilitiesRejectsUnsupportedMethods(t *testing.T) {
 
 func TestServerRejectsCapabilitiesOutsideThePublishedV1Contract(t *testing.T) {
 	for name, mutate := range map[string]func(*Capabilities){
-		"invalid language id": func(value *Capabilities) { value.Languages[0].ID = "C++" },
-		"empty display name":  func(value *Capabilities) { value.Languages[0].DisplayName = "" },
-		"empty runtime":       func(value *Capabilities) { value.Languages[0].Runtime = "" },
-		"zero bundle limit":   func(value *Capabilities) { value.Limits.MaxBundleBytes = 0 },
-		"zero case limit":     func(value *Capabilities) { value.Limits.MaxCaseBytes = 0 },
-		"zero case count":     func(value *Capabilities) { value.Limits.MaxCaseCount = 0 },
-		"excess case count":   func(value *Capabilities) { value.Limits.MaxCaseCount = 257 },
-		"zero time limit":     func(value *Capabilities) { value.Limits.MaxTimeLimitMillis = 0 },
-		"zero memory limit":   func(value *Capabilities) { value.Limits.MaxMemoryLimitMiB = 0 },
+		"invalid language id":     func(value *Capabilities) { value.Languages[0].ID = "C++" },
+		"unsupported language id": func(value *Capabilities) { value.Languages[0].ID = "cpp20" },
+		"unsupported checker":     func(value *Capabilities) { value.Checkers[0] = "EXACT" },
+		"empty display name":      func(value *Capabilities) { value.Languages[0].DisplayName = "" },
+		"empty runtime":           func(value *Capabilities) { value.Languages[0].Runtime = "" },
+		"zero bundle limit":       func(value *Capabilities) { value.Limits.MaxBundleBytes = 0 },
+		"zero case limit":         func(value *Capabilities) { value.Limits.MaxCaseBytes = 0 },
+		"zero case count":         func(value *Capabilities) { value.Limits.MaxCaseCount = 0 },
+		"excess case count":       func(value *Capabilities) { value.Limits.MaxCaseCount = 257 },
+		"zero time limit":         func(value *Capabilities) { value.Limits.MaxTimeLimitMillis = 0 },
+		"zero memory limit":       func(value *Capabilities) { value.Limits.MaxMemoryLimitMiB = 0 },
 	} {
 		t.Run(name, func(t *testing.T) {
 			capabilities := testCapabilities()
@@ -178,9 +180,9 @@ func TestServerNormalizesNilCapabilityCollectionsToJSONArrays(t *testing.T) {
 func testCapabilities() Capabilities {
 	return Capabilities{
 		APIVersion: "v1",
-		Languages:  []LanguageCapability{{ID: "cpp20", DisplayName: "C++ 20", Runtime: "gcc-15"}},
+		Languages:  []LanguageCapability{{ID: "cpp", DisplayName: "C++ 20", Runtime: "gcc"}},
 		JudgeModes: []string{"ACM"},
-		Checkers:   []string{"EXACT", "TOKEN"},
+		Checkers:   []string{"exact", "token"},
 		Limits: CapabilityLimits{
 			MaxSourceBytes:     1 << 20,
 			MaxBundleBytes:     64 << 20,

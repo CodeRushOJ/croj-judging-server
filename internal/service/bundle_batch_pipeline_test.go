@@ -73,7 +73,7 @@ func TestBatchBundlePipelineRejectsOversizedBatchBeforeSandbox(t *testing.T) {
 }
 
 func TestIncrementalBatchCaseWireSizeMatchesProtobuf(t *testing.T) {
-	request := &sandboxpb.ExecuteBatchV1Request{Language: "cpp20", SourceCode: "int main(){}", Timeout: 2, MemoryLimit: 64}
+	request := &sandboxpb.ExecuteBatchV1Request{Language: "cpp", SourceCode: "int main(){}", Timeout: 2, MemoryLimit: 64}
 	incremental := proto.Size(request)
 	for index := 0; index < 256; index++ {
 		requestCase := &sandboxpb.ExecuteBatchV1Case{CaseId: fmt.Sprintf("case-%03d", index), Stdin: strings.Repeat("x", index*17), ExpectedOutput: "answer", CompareOutput: true}
@@ -174,7 +174,7 @@ func TestBatchBundlePipelineRoutesSandboxSystemErrorToInfrastructureFailure(t *t
 		{Kind: sandboxpb.ExecuteBatchV1Event_COMPLETED},
 	}}
 	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a"}}, executor, 1)
-	result, err := pipeline.ExecuteCanonical(context.Background(), CanonicalExecutionRequest{Language: "cpp20", SourceCode: "int main(){}", StopOnFailure: true}, exactArtifact(1))
+	result, err := pipeline.ExecuteCanonical(context.Background(), CanonicalExecutionRequest{Language: "cpp", SourceCode: "int main(){}", StopOnFailure: true}, exactArtifact(1))
 	if !errors.Is(err, ErrCanonicalInfrastructure) || result.Status != "" {
 		t.Fatalf("result=%+v error=%v", result, err)
 	}
@@ -215,13 +215,13 @@ func TestBatchBundlePipelineCanonicalRequestUsesBundleLimitsAndStopPolicy(t *tes
 	}}
 	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"dns:///sandbox-workers.coderushoj.svc.cluster.local:50051"}}, executor, 1)
 	result, err := pipeline.ExecuteCanonical(context.Background(), CanonicalExecutionRequest{
-		Language: "cpp20", SourceCode: "int main(){}", StopOnFailure: false,
+		Language: "cpp", SourceCode: "int main(){}", StopOnFailure: false,
 	}, artifact)
 	if err != nil || result.Status != callback.StatusAccepted || len(result.Cases) != 1 || result.Cases[0].CaseID != "case-1" || result.Cases[0].Status != callback.StatusAccepted {
 		t.Fatalf("result=%+v error=%v", result, err)
 	}
 	request := executor.requests[0]
-	if request.Language != "cpp20" || request.SourceCode != "int main(){}" || request.Timeout != 2 || request.MemoryLimit != 512 || request.StopOnFailure {
+	if request.Language != "cpp" || request.SourceCode != "int main(){}" || request.Timeout != 2 || request.MemoryLimit != 512 || request.StopOnFailure {
 		t.Fatalf("canonical sandbox request = %+v", request)
 	}
 }
@@ -234,7 +234,7 @@ func TestBatchBundlePipelineKeepsOrderedResultsWhenStopOnFailureIsDisabled(t *te
 	}}
 	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a"}}, executor, 1)
 	result, err := pipeline.ExecuteCanonical(context.Background(), CanonicalExecutionRequest{
-		Language: "cpp20", SourceCode: "int main(){}", StopOnFailure: false,
+		Language: "cpp", SourceCode: "int main(){}", StopOnFailure: false,
 	}, exactArtifact(2))
 	if err != nil {
 		t.Fatal(err)

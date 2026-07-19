@@ -229,6 +229,62 @@ func TestBundleUploadBoundsTheWholeMultipartEnvelope(t *testing.T) {
 	}
 }
 
+func TestBundleUploadRejectsExcessConcurrentUploadBeforeReadingBody(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	application := &blockingBundleApplication{started: started, release: release}
+	capabilities := testCapabilities()
+	server, err := NewServer(staticAuthenticator{principal: Principal{TenantID: "tenant-7", scopes: map[Scope]struct{}{ScopeBundleWrite: {}}}}, capabilities,
+		WithBundleApplication(application), WithBundleWriteQuota(&writeQuotaStub{decision: external.QuotaDecision{Allowed: true}}, external.QuotaLimit{Capacity: capabilities.Limits.MaxBundleBytes, RefillPeriod: time.Minute}),
+		WithBundleUploadConcurrency(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := validBundleRequest(t, "first-key-00000001", []byte("first"))
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		response := httptest.NewRecorder()
+		server.ServeHTTP(response, first)
+		done <- response
+	}()
+	<-started
+
+	second := validBundleRequest(t, "second-key-0000002", []byte("second"))
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, second)
+	if response.Code != http.StatusServiceUnavailable || application.calls != 1 {
+		t.Fatalf("status=%d calls=%d body=%s", response.Code, application.calls, response.Body.String())
+	}
+	close(release)
+	<-done
+}
+
+type blockingBundleApplication struct {
+	started chan struct{}
+	release chan struct{}
+	calls   int
+}
+
+func validBundleRequest(t *testing.T, key string, contents []byte) *http.Request {
+	t.Helper()
+	body, contentType := multipartBody(t, []multipartValue{{name: "bundle", filename: "tests.zip", body: contents}})
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/bundles", bytes.NewReader(body))
+	request.Header.Set("Content-Type", contentType)
+	request.Header.Set("Idempotency-Key", key)
+	return request
+}
+
+func (application *blockingBundleApplication) UploadWithAdmission(_ context.Context, _, _ string, _ io.Reader, _ external.BundleUploadAdmission) (external.BundleMetadata, bool, error) {
+	application.calls++
+	close(application.started)
+	<-application.release
+	return external.BundleMetadata{BundleID: "aaaaaaaaaaaaaaaaaaaaaaaaaa"}, false, nil
+}
+
+func (application *blockingBundleApplication) Get(context.Context, string, string) (external.BundleMetadata, error) {
+	return external.BundleMetadata{}, external.ErrBundleNotFound
+}
+
 func TestBundleUploadMapsBoundedAndIdempotencyFailures(t *testing.T) {
 	for name, test := range map[string]struct {
 		err       error

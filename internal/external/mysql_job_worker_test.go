@@ -39,7 +39,7 @@ WHERE external_id = ?`, tenantID); err != nil {
 	repository := newTestMySQLJobRepositoryWithClock(t, database, newMemorySourceStore(), clock.Now)
 	for index := 0; index < 3; index++ {
 		if _, err := repository.Submit(context.Background(), tenantID, "claim-job-key-000"+string(rune('1'+index)), JudgeJobRequest{
-			BundleID: bundleID, Language: "cpp20", SourceCode: []byte("int main(){return 0;}"),
+			BundleID: bundleID, Language: "cpp", SourceCode: []byte("int main(){return 0;}"),
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -100,13 +100,13 @@ func TestMySQLWorkerSkipsQuotaFullTenantWithoutStarvingOthers(t *testing.T) {
 	repository := newTestMySQLJobRepositoryWithClock(t, database, newMemorySourceStore(), clock.Now)
 	for index := 0; index < 2; index++ {
 		if _, err := repository.Submit(context.Background(), tenantA, "starve-tenant-a-00"+string(rune('1'+index)), JudgeJobRequest{
-			BundleID: bundleA, Language: "cpp20", SourceCode: []byte("int main(){}"),
+			BundleID: bundleA, Language: "cpp", SourceCode: []byte("int main(){}"),
 		}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if _, err := repository.Submit(context.Background(), tenantB, "starve-tenant-b-001", JudgeJobRequest{
-		BundleID: bundleB, Language: "cpp20", SourceCode: []byte("int main(){}"),
+		BundleID: bundleB, Language: "cpp", SourceCode: []byte("int main(){}"),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -117,6 +117,104 @@ func TestMySQLWorkerSkipsQuotaFullTenantWithoutStarvingOthers(t *testing.T) {
 	second, err := repository.ClaimNext(context.Background(), "worker-b", time.Minute)
 	if err != nil || second.Job.TenantExternalID != tenantB {
 		t.Fatalf("quota-full tenant starved runnable tenant: claim=%+v error=%v", second, err)
+	}
+}
+
+func TestMySQLWorkerRoundRobinsTenantsWithOlderBacklog(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	tenantA, tenantB := strings.Repeat("a", 26), strings.Repeat("b", 26)
+	bundleA, bundleB := strings.Repeat("c", 26), strings.Repeat("d", 26)
+	insertTenantBundleAndCallback(t, database, tenantA, bundleA, "", 10)
+	insertTenantBundleAndCallback(t, database, tenantB, bundleB, "", 10)
+	if _, err := database.Exec(`UPDATE t_external_tenant SET policy_json = JSON_SET(policy_json, '$.maxRunningJobs', 10)`); err != nil {
+		t.Fatal(err)
+	}
+	repository := newTestMySQLJobRepository(t, database, newMemorySourceStore())
+	for index := 0; index < 3; index++ {
+		if _, err := repository.Submit(context.Background(), tenantA, fmt.Sprintf("fair-tenant-a-%04d", index), JudgeJobRequest{BundleID: bundleA, Language: "cpp", SourceCode: []byte("int main(){}")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(5 * time.Millisecond)
+	if _, err := repository.Submit(context.Background(), tenantB, "fair-tenant-b-0001", JudgeJobRequest{BundleID: bundleB, Language: "cpp", SourceCode: []byte("int main(){}")}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := repository.ClaimNext(context.Background(), "fair-worker-a", time.Minute)
+	if err != nil || first.Job.TenantExternalID != tenantA {
+		t.Fatalf("first claim=%+v error=%v", first, err)
+	}
+	second, err := repository.ClaimNext(context.Background(), "fair-worker-b", time.Minute)
+	if err != nil || second.Job.TenantExternalID != tenantB {
+		t.Fatalf("older tenant backlog starved tenant B: claim=%+v error=%v", second, err)
+	}
+}
+
+func TestMySQLWorkerDailyExecutionReservationsUseDatabaseDateAndRecover(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	tenantID, bundleID := strings.Repeat("n", 26), strings.Repeat("p", 26)
+	insertTenantBundleAndCallback(t, database, tenantID, bundleID, "", 4)
+	if _, err := database.Exec(`UPDATE t_external_tenant SET policy_json = JSON_SET(policy_json, '$.maxRunningJobs', 2, '$.dailyExecutionMillis', 1500) WHERE external_id = ?`, tenantID); err != nil {
+		t.Fatal(err)
+	}
+	repository := newTestMySQLJobRepository(t, database, newMemorySourceStore())
+	for index := 0; index < 2; index++ {
+		if _, err := repository.Submit(context.Background(), tenantID, fmt.Sprintf("daily-key-%06d", index), JudgeJobRequest{BundleID: bundleID, Language: "cpp", SourceCode: []byte("int main(){}")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, err := repository.ClaimNext(context.Background(), "daily-worker-a", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.ClaimNext(context.Background(), "daily-worker-b", time.Minute); !errors.Is(err, ErrJobNotClaimable) {
+		t.Fatalf("daily reservation allowed excess claim: %v", err)
+	}
+	if err := repository.Complete(context.Background(), first, DurableJobResult{Verdict: "ACCEPTED", CompileStatus: "SUCCEEDED", TimeMillis: 400}); err != nil {
+		t.Fatal(err)
+	}
+	second, err := repository.ClaimNext(context.Background(), "daily-worker-b", time.Minute)
+	if err != nil {
+		t.Fatalf("settlement did not release unused reservation: %v", err)
+	}
+	if _, err := repository.FailInfrastructure(context.Background(), second, InfrastructureFailure{Code: "SANDBOX_UNAVAILABLE"}); err != nil {
+		t.Fatal(err)
+	}
+	var reserved, consumed int64
+	var databaseDayMatches bool
+	if err := database.QueryRow(`SELECT reserved_millis, consumed_millis, accounting_day = CURRENT_DATE FROM t_external_execution_daily`).Scan(&reserved, &consumed, &databaseDayMatches); err != nil {
+		t.Fatal(err)
+	}
+	if reserved != 0 || consumed != 400 || !databaseDayMatches {
+		t.Fatalf("daily ledger reserved=%d consumed=%d databaseDay=%v", reserved, consumed, databaseDayMatches)
+	}
+}
+
+func TestMySQLWorkerExpiredAttemptReleasesReservationBeforeReclaim(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	tenantID, bundleID := strings.Repeat("q", 26), strings.Repeat("r", 26)
+	insertTenantBundleAndCallback(t, database, tenantID, bundleID, "", 2)
+	repository := newTestMySQLJobRepository(t, database, newMemorySourceStore())
+	if _, err := repository.Submit(context.Background(), tenantID, "daily-crash-key-01", JudgeJobRequest{BundleID: bundleID, Language: "cpp", SourceCode: []byte("int main(){}")}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := repository.ClaimNext(context.Background(), "crashed-worker", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expireClaimLease(t, database, first)
+	second, err := repository.ClaimNext(context.Background(), "recovery-worker", time.Minute)
+	if err != nil || second.AttemptNo != 2 {
+		t.Fatalf("recovery claim=%+v error=%v", second, err)
+	}
+	var reserved int64
+	if err := database.QueryRow(`SELECT reserved_millis FROM t_external_execution_daily`).Scan(&reserved); err != nil {
+		t.Fatal(err)
+	}
+	if reserved != 1000 {
+		t.Fatalf("crash recovery double-reserved execution: %d", reserved)
 	}
 }
 
@@ -135,7 +233,7 @@ func TestMySQLWorkerRetriesTenantSelectionAfterConcurrentContention(t *testing.T
 		{tenantB, "contention-tenant-b", bundleB},
 	} {
 		if _, err := repository.Submit(context.Background(), job.tenant, job.key, JudgeJobRequest{
-			BundleID: job.bundle, Language: "cpp20", SourceCode: []byte("int main(){}"),
+			BundleID: job.bundle, Language: "cpp", SourceCode: []byte("int main(){}"),
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -197,7 +295,7 @@ func TestMySQLWorkerLeaseExpiryUsesDatabaseClock(t *testing.T) {
 	store := newMemorySourceStore()
 	repository := newTestMySQLJobRepository(t, database, store)
 	if _, err := repository.Submit(context.Background(), tenantID, "database-clock-lease", JudgeJobRequest{
-		BundleID: bundleID, Language: "cpp20", SourceCode: []byte("int main(){}"),
+		BundleID: bundleID, Language: "cpp", SourceCode: []byte("int main(){}"),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +325,7 @@ func TestMySQLWorkerSchedulingAndBackoffUseDatabaseClockDespiteApplicationSkew(t
 		return time.Now().Add(10 * 365 * 24 * time.Hour)
 	})
 	job, err := futureClock.Submit(context.Background(), tenantID, "database-clock-schedule", JudgeJobRequest{
-		BundleID: bundleID, Language: "cpp20", SourceCode: []byte("int main(){}"),
+		BundleID: bundleID, Language: "cpp", SourceCode: []byte("int main(){}"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -280,7 +378,7 @@ func TestMySQLSubmitIdempotencyExpiryUsesDatabaseClockDespitePastApplicationCloc
 		return time.Now().Add(-10 * 365 * 24 * time.Hour)
 	})
 	request := JudgeJobRequest{
-		BundleID: bundleID, Language: "cpp20", SourceCode: []byte("int main(){}"),
+		BundleID: bundleID, Language: "cpp", SourceCode: []byte("int main(){}"),
 	}
 	first, err := pastClock.Submit(context.Background(), tenantID, "database-clock-idempotency", request)
 	if err != nil {
@@ -320,7 +418,7 @@ func TestMySQLWorkerSkipsDisabledTenantWithoutStarvingOthers(t *testing.T) {
 	clock := &mutableClock{now: time.Now().UTC()}
 	repository := newTestMySQLJobRepositoryWithClock(t, database, newMemorySourceStore(), clock.Now)
 	if _, err := repository.Submit(context.Background(), tenantA, "disabled-tenant-job", JudgeJobRequest{
-		BundleID: bundleA, Language: "cpp20", SourceCode: []byte("int main(){}"),
+		BundleID: bundleA, Language: "cpp", SourceCode: []byte("int main(){}"),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -332,7 +430,7 @@ func TestMySQLWorkerSkipsDisabledTenantWithoutStarvingOthers(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := repository.Submit(context.Background(), tenantB, "active-tenant-job", JudgeJobRequest{
-		BundleID: bundleB, Language: "cpp20", SourceCode: []byte("int main(){}"),
+		BundleID: bundleB, Language: "cpp", SourceCode: []byte("int main(){}"),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -371,7 +469,7 @@ WHERE external_id = ?`, disabledTenant); err != nil {
 	claims := make([]WorkerJobClaim, 0, 33)
 	for index := 0; index < 33; index++ {
 		if _, err := repository.Submit(context.Background(), disabledTenant, fmt.Sprintf("disabled-maint-%03d", index), JudgeJobRequest{
-			BundleID: disabledBundle, Language: "cpp20", SourceCode: []byte("int main(){}"),
+			BundleID: disabledBundle, Language: "cpp", SourceCode: []byte("int main(){}"),
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -388,7 +486,7 @@ WHERE external_id = ?`, disabledTenant); err != nil {
 		expireClaimLease(t, database, claim)
 	}
 	active, err := repository.Submit(context.Background(), activeTenant, "active-after-maint", JudgeJobRequest{
-		BundleID: activeBundle, Language: "cpp20", SourceCode: []byte("int main(){}"),
+		BundleID: activeBundle, Language: "cpp", SourceCode: []byte("int main(){}"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -674,7 +772,7 @@ func TestMySQLWorkerCancelAndInfrastructureFailureShareTenantJobLockOrder(t *tes
 	for iteration := 0; iteration < 24; iteration++ {
 		job, err := repository.Submit(context.Background(), tenantID,
 			fmt.Sprintf("cancel-failure-race-%03d", iteration),
-			JudgeJobRequest{BundleID: bundleID, Language: "cpp20", SourceCode: []byte("int main(){}")})
+			JudgeJobRequest{BundleID: bundleID, Language: "cpp", SourceCode: []byte("int main(){}")})
 		if err != nil {
 			t.Fatal(err)
 		}
