@@ -16,7 +16,8 @@
 - 增加 Redis 服务端时间驱动的原子令牌桶，跨 HTTP 副本统一限制租户任务提交；配额状态不确定时新任务写入 fail closed，已授权读请求保持可用。上传字节配额将在 bundle upload 分支接线后启用。
 - 增加 `POST/GET /api/v1/bundles`：有界单文件 multipart 流式上传、SHA-256 内容寻址、tenant-scoped 元数据与 RFC 9457 错误。
 - 增加外部题包 ZIP 安全复用校验、case CRC/size/UTF-8 流式核验、取消/超限清理、MySQL 原子 ownership+幂等事务及并发单逻辑记录回归。
-- 外部题包幂等键统一采用独立 pepper 的 HMAC-SHA256；对象发布改为 PENDING ownership→原子 publish→`ready_at` 两阶段可见性，并增加发布失败安全重放修复、阻塞发布不可见性和真实 MySQL 三类并发竞争门禁，避免 orphan 或半成品被 GET/判题任务读取。
+- 外部题包幂等键统一采用独立 pepper 的 HMAC-SHA256；对象发布改为 durable staging→PENDING→CAS-leased PUBLISHING→远端 size/SHA 校验→READY 状态机，增加持久 reconciler、退避/attempt/lease、ABANDONED 审计、单 promoter 和客户端不重放恢复测试。
+- CI 增加 digest 固定 MySQL 8.4.10 的 bundle integration job，真实运行迁移、并发、不可见窗口、reconciliation，以及 legacy pending 放弃与重新上传恢复，不允许通过 skip 绕过。
 - 增加与 `croj-sandbox` 一致的 `SandboxService.Execute` protobuf/gRPC 客户端。
 - 为 Pod endpoint 建立可复用连接、显式 RPC deadline 与确定性关闭流程。
 - 增加 bufconn、fake scheduler、失败传播和 verdict 映射测试。

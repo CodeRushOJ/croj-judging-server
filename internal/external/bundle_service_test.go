@@ -24,12 +24,17 @@ import (
 const testTenantID = "aaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 type memoryBundleRepository struct {
-	mu             sync.Mutex
-	idempotency    map[string]bundleUploadRecord
-	bundles        map[string]BundleMetadata
-	ready          map[string]bool
-	logicalCreates int
-	commitErr      error
+	mu              sync.Mutex
+	idempotency     map[string]bundleUploadRecord
+	bundles         map[string]BundleMetadata
+	status          map[string]BundlePublicationStatus
+	staging         map[string]string
+	claims          map[string]BundlePublicationClaim
+	leaseUntil      map[string]time.Time
+	attempts        map[string]int
+	logicalCreates  int
+	commitErr       error
+	completeErrOnce error
 }
 
 type bundleUploadRecord struct {
@@ -38,7 +43,10 @@ type bundleUploadRecord struct {
 }
 
 func newMemoryBundleRepository() *memoryBundleRepository {
-	return &memoryBundleRepository{idempotency: map[string]bundleUploadRecord{}, bundles: map[string]BundleMetadata{}, ready: map[string]bool{}}
+	return &memoryBundleRepository{
+		idempotency: map[string]bundleUploadRecord{}, bundles: map[string]BundleMetadata{}, status: map[string]BundlePublicationStatus{},
+		staging: map[string]string{}, claims: map[string]BundlePublicationClaim{}, leaseUntil: map[string]time.Time{}, attempts: map[string]int{},
+	}
 }
 
 func (repository *memoryBundleRepository) FindBundleUpload(_ context.Context, tenantID string, keyDigest [sha256.Size]byte) (BundleUploadLookup, error) {
@@ -46,7 +54,7 @@ func (repository *memoryBundleRepository) FindBundleUpload(_ context.Context, te
 	defer repository.mu.Unlock()
 	record, found := repository.idempotency[tenantID+":"+hex.EncodeToString(keyDigest[:])]
 	bundleKey := tenantID + ":" + record.metadata.SHA256
-	return BundleUploadLookup{Found: found, Ready: found && repository.ready[bundleKey], RequestHash: record.requestHash, Metadata: record.metadata}, nil
+	return BundleUploadLookup{Found: found, Status: repository.status[bundleKey], RequestHash: record.requestHash, StagingKey: repository.staging[bundleKey], Metadata: record.metadata}, nil
 }
 
 func (repository *memoryBundleRepository) CommitBundleUpload(_ context.Context, input BundleCommitInput) (BundleCommitResult, error) {
@@ -60,36 +68,129 @@ func (repository *memoryBundleRepository) CommitBundleUpload(_ context.Context, 
 		if record.requestHash != input.RequestHash {
 			return BundleCommitResult{}, ErrIdempotencyConflict
 		}
-		return BundleCommitResult{Metadata: record.metadata, Replay: true, Ready: repository.ready[input.TenantID+":"+record.metadata.SHA256]}, nil
+		bundleKey := input.TenantID + ":" + record.metadata.SHA256
+		if bundlePublicationNeedsFreshStaging(repository.status[bundleKey], repository.staging[bundleKey]) {
+			repository.status[bundleKey] = BundlePublicationPending
+			repository.staging[bundleKey] = input.StagingObjectKey
+			repository.attempts[bundleKey] = 0
+		}
+		return BundleCommitResult{Metadata: record.metadata, Replay: true, Status: repository.status[bundleKey], StagingKey: repository.staging[bundleKey]}, nil
 	}
 	bundleKey := input.TenantID + ":" + hex.EncodeToString(input.RequestHash[:])
 	metadata, found := repository.bundles[bundleKey]
 	if !found {
 		metadata = input.Metadata
 		repository.bundles[bundleKey] = metadata
+		repository.status[bundleKey] = BundlePublicationPending
+		repository.staging[bundleKey] = input.StagingObjectKey
 		repository.logicalCreates++
+	} else if bundlePublicationNeedsFreshStaging(repository.status[bundleKey], repository.staging[bundleKey]) {
+		repository.status[bundleKey] = BundlePublicationPending
+		repository.staging[bundleKey] = input.StagingObjectKey
+		repository.attempts[bundleKey] = 0
 	}
 	repository.idempotency[idempotencyKey] = bundleUploadRecord{requestHash: input.RequestHash, metadata: metadata}
-	return BundleCommitResult{Metadata: metadata, Replay: found, Ready: repository.ready[bundleKey]}, nil
+	return BundleCommitResult{Metadata: metadata, Replay: found, Status: repository.status[bundleKey], StagingKey: repository.staging[bundleKey]}, nil
 }
 
-func (repository *memoryBundleRepository) MarkBundleReady(_ context.Context, tenantID, bundleID string, digest [sha256.Size]byte) error {
+func (repository *memoryBundleRepository) ClaimBundlePublication(_ context.Context, tenantID, bundleID, leaseToken string, now, leaseUntil time.Time) (BundlePublicationClaim, bool, error) {
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
-	bundleKey := tenantID + ":" + hex.EncodeToString(digest[:])
-	metadata, found := repository.bundles[bundleKey]
-	if !found || metadata.BundleID != bundleID {
-		return ErrBundleNotFound
+	for key, metadata := range repository.bundles {
+		if strings.HasPrefix(key, tenantID+":") && metadata.BundleID == bundleID {
+			if repository.status[key] == BundlePublicationReady || repository.status[key] == BundlePublicationAbandoned ||
+				(repository.status[key] == BundlePublicationPublishing && repository.leaseUntil[key].After(now)) {
+				return BundlePublicationClaim{}, false, nil
+			}
+			repository.status[key] = BundlePublicationPublishing
+			repository.attempts[key]++
+			digest, _ := hex.DecodeString(metadata.SHA256)
+			claim := BundlePublicationClaim{TenantID: tenantID, BundleID: bundleID, ObjectKey: bundleObjectKey(tenantID, arrayDigest(digest)), StagingKey: repository.staging[key], SizeBytes: metadata.SizeBytes, LeaseToken: leaseToken, AttemptCount: repository.attempts[key]}
+			copy(claim.RequestHash[:], digest)
+			repository.claims[key] = claim
+			repository.leaseUntil[key] = leaseUntil
+			return claim, true, nil
+		}
 	}
-	repository.ready[bundleKey] = true
+	return BundlePublicationClaim{}, false, ErrBundleNotFound
+}
+
+func (repository *memoryBundleRepository) ClaimNextBundlePublication(ctx context.Context, leaseToken string, now, leaseUntil time.Time) (BundlePublicationClaim, bool, error) {
+	repository.mu.Lock()
+	var tenantID, bundleID string
+	for key, metadata := range repository.bundles {
+		if repository.status[key] == BundlePublicationPending || (repository.status[key] == BundlePublicationPublishing && !repository.leaseUntil[key].After(now)) {
+			tenantID = strings.SplitN(key, ":", 2)[0]
+			bundleID = metadata.BundleID
+			break
+		}
+	}
+	repository.mu.Unlock()
+	if bundleID == "" {
+		return BundlePublicationClaim{}, false, nil
+	}
+	return repository.ClaimBundlePublication(ctx, tenantID, bundleID, leaseToken, now, leaseUntil)
+}
+
+func (repository *memoryBundleRepository) CompleteBundlePublication(_ context.Context, claim BundlePublicationClaim, _ time.Time) error {
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	key := claim.TenantID + ":" + hex.EncodeToString(claim.RequestHash[:])
+	stored, found := repository.claims[key]
+	if !found || stored.LeaseToken != claim.LeaseToken {
+		return ErrBundlePublishing
+	}
+	if repository.completeErrOnce != nil {
+		err := repository.completeErrOnce
+		repository.completeErrOnce = nil
+		return err
+	}
+	repository.status[key] = BundlePublicationReady
+	delete(repository.claims, key)
+	delete(repository.leaseUntil, key)
 	return nil
+}
+
+func (repository *memoryBundleRepository) FailBundlePublication(_ context.Context, claim BundlePublicationClaim, _ string, _ time.Time, maxAttempts int) (bool, error) {
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	key := claim.TenantID + ":" + hex.EncodeToString(claim.RequestHash[:])
+	stored, found := repository.claims[key]
+	if !found || stored.LeaseToken != claim.LeaseToken {
+		return false, ErrBundlePublishing
+	}
+	abandoned := claim.AttemptCount >= maxAttempts
+	if abandoned {
+		repository.status[key] = BundlePublicationAbandoned
+	} else {
+		repository.status[key] = BundlePublicationPending
+	}
+	delete(repository.claims, key)
+	delete(repository.leaseUntil, key)
+	return abandoned, nil
+}
+
+func (repository *memoryBundleRepository) SweepUnrecoverableBundlePublications(_ context.Context, _ time.Time, limit int) (int64, error) {
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	var swept int64
+	for key := range repository.bundles {
+		if swept >= int64(limit) {
+			break
+		}
+		if repository.staging[key] == "" && repository.status[key] == BundlePublicationPending {
+			repository.status[key] = BundlePublicationAbandoned
+			swept++
+		}
+	}
+	return swept, nil
 }
 
 func (repository *memoryBundleRepository) FindBundle(_ context.Context, tenantID, bundleID string) (BundleMetadata, error) {
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
 	for key, metadata := range repository.bundles {
-		if strings.HasPrefix(key, tenantID+":") && metadata.BundleID == bundleID && repository.ready[key] {
+		if strings.HasPrefix(key, tenantID+":") && metadata.BundleID == bundleID && repository.status[key] == BundlePublicationReady {
 			return metadata, nil
 		}
 	}
@@ -97,10 +198,12 @@ func (repository *memoryBundleRepository) FindBundle(_ context.Context, tenantID
 }
 
 type atomicMemoryObjectStore struct {
-	mu        sync.Mutex
-	objects   map[string][]byte
-	publishes int
-	failNext  int
+	mu           sync.Mutex
+	staged       map[string][]byte
+	objects      map[string][]byte
+	publishes    int
+	promoteCalls int
+	failNext     int
 }
 
 type blockingMemoryObjectStore struct {
@@ -110,40 +213,72 @@ type blockingMemoryObjectStore struct {
 	once    sync.Once
 }
 
-func (store *blockingMemoryObjectStore) Publish(ctx context.Context, key, filename string, size int64, digest [sha256.Size]byte) error {
+func (store *blockingMemoryObjectStore) Stage(ctx context.Context, key, filename string, size int64, digest [sha256.Size]byte) error {
+	return store.inner.Stage(ctx, key, filename, size, digest)
+}
+
+func (store *blockingMemoryObjectStore) Promote(ctx context.Context, stagingKey, finalKey string, size int64, digest [sha256.Size]byte) error {
 	store.once.Do(func() { close(store.started) })
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-store.release:
-		return store.inner.Publish(ctx, key, filename, size, digest)
+		return store.inner.Promote(ctx, stagingKey, finalKey, size, digest)
 	}
 }
 
-func (store *atomicMemoryObjectStore) Publish(_ context.Context, key, filename string, size int64, digest [sha256.Size]byte) error {
+func (store *blockingMemoryObjectStore) Discard(ctx context.Context, key string) error {
+	return store.inner.Discard(ctx, key)
+}
+
+func (store *atomicMemoryObjectStore) Stage(_ context.Context, key, filename string, size int64, digest [sha256.Size]byte) error {
 	data, err := os.ReadFile(filename)
 	if err != nil {
 		return err
 	}
 	actual := sha256.Sum256(data)
 	if int64(len(data)) != size || actual != digest {
-		return errors.New("publish metadata mismatch")
+		return errors.New("stage metadata mismatch")
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	if store.staged == nil {
+		store.staged = map[string][]byte{}
+	}
+	store.staged[key] = append([]byte(nil), data...)
+	return nil
+}
+
+func (store *atomicMemoryObjectStore) Promote(_ context.Context, stagingKey, finalKey string, size int64, digest [sha256.Size]byte) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	store.promoteCalls++
 	if store.failNext > 0 {
 		store.failNext--
 		return errors.New("injected object publish failure")
 	}
+	data, found := store.staged[stagingKey]
+	if !found || int64(len(data)) != size || sha256.Sum256(data) != digest {
+		return errors.New("staged object missing or invalid")
+	}
 	if store.objects == nil {
 		store.objects = map[string][]byte{}
 	}
-	if _, exists := store.objects[key]; !exists {
+	if _, exists := store.objects[finalKey]; !exists {
 		store.publishes++
-		store.objects[key] = append([]byte(nil), data...)
+		store.objects[finalKey] = append([]byte(nil), data...)
 	}
 	return nil
 }
+
+func (store *atomicMemoryObjectStore) Discard(_ context.Context, key string) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	delete(store.staged, key)
+	return nil
+}
+
+func arrayDigest(value []byte) (digest [sha256.Size]byte) { copy(digest[:], value); return digest }
 
 func TestBundleServiceNeverPublishesUnownedFinalObject(t *testing.T) {
 	repository := newMemoryBundleRepository()
@@ -172,6 +307,113 @@ func TestBundleServiceReconcilesOwnedObjectAfterPublishFailure(t *testing.T) {
 	metadata, replay, err := service.Upload(context.Background(), testTenantID, "upload-key-00001", bytes.NewReader(body))
 	if err != nil || !replay || metadata.BundleID == "" || len(store.objects) != 1 {
 		t.Fatalf("metadata=%+v replay=%v error=%v objects=%d", metadata, replay, err, len(store.objects))
+	}
+}
+
+func TestBundleReconcilerCompletesPublicationWithoutClientReplay(t *testing.T) {
+	repository := newMemoryBundleRepository()
+	store := &atomicMemoryObjectStore{failNext: 1}
+	service := newTestBundleService(t, repository, store, t.TempDir(), 1<<20, bundle.DefaultArchiveLimits())
+	body := validExternalBundle(t, "input")
+	if _, _, err := service.Upload(context.Background(), testTenantID, "upload-key-00001", bytes.NewReader(body)); err == nil {
+		t.Fatal("expected initial promotion failure")
+	}
+	reconciler, err := NewBundleReconciler(service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconciler.now = func() time.Time { return service.now().Add(service.config.PublicationRetry) }
+	processed, err := reconciler.ReconcileOnce(context.Background())
+	if err != nil || !processed {
+		t.Fatalf("processed=%v error=%v", processed, err)
+	}
+	for _, metadata := range repository.bundles {
+		if _, err := service.Get(context.Background(), testTenantID, metadata.BundleID); err != nil {
+			t.Fatalf("reconciled metadata unavailable: %v", err)
+		}
+	}
+}
+
+func TestBundleReconcilerRepairsAmbiguousReadyCommitAfterLeaseExpiry(t *testing.T) {
+	repository := newMemoryBundleRepository()
+	repository.completeErrOnce = errors.New("ambiguous database completion")
+	store := &atomicMemoryObjectStore{}
+	service := newTestBundleService(t, repository, store, t.TempDir(), 1<<20, bundle.DefaultArchiveLimits())
+	body := validExternalBundle(t, "input")
+	if _, _, err := service.Upload(context.Background(), testTenantID, "upload-key-00001", bytes.NewReader(body)); err == nil {
+		t.Fatal("expected ambiguous completion error")
+	}
+	reconciler, _ := NewBundleReconciler(service)
+	reconciler.now = func() time.Time { return service.now().Add(service.config.PublicationLease + time.Second) }
+	processed, err := reconciler.ReconcileOnce(context.Background())
+	if err != nil || !processed || store.promoteCalls != 2 || len(store.objects) != 1 {
+		t.Fatalf("processed=%v error=%v promotes=%d objects=%d", processed, err, store.promoteCalls, len(store.objects))
+	}
+}
+
+func TestBundleReconcilerAbandonsAfterBoundedFailures(t *testing.T) {
+	repository := newMemoryBundleRepository()
+	store := &atomicMemoryObjectStore{failNext: 2}
+	service := newTestBundleService(t, repository, store, t.TempDir(), 1<<20, bundle.DefaultArchiveLimits())
+	service.config.MaxPublishAttempts = 2
+	body := validExternalBundle(t, "input")
+	if _, _, err := service.Upload(context.Background(), testTenantID, "upload-key-00001", bytes.NewReader(body)); err == nil {
+		t.Fatal("expected first promotion failure")
+	}
+	reconciler, _ := NewBundleReconciler(service)
+	reconciler.now = func() time.Time { return service.now().Add(service.config.PublicationRetry) }
+	processed, err := reconciler.ReconcileOnce(context.Background())
+	if err == nil || !processed {
+		t.Fatalf("processed=%v error=%v", processed, err)
+	}
+	for key := range repository.bundles {
+		if repository.status[key] != BundlePublicationAbandoned {
+			t.Fatalf("publication status=%s", repository.status[key])
+		}
+	}
+}
+
+func TestBundleServiceRevivesAbandonedPublicationFromSameIdempotentUpload(t *testing.T) {
+	repository := newMemoryBundleRepository()
+	store := &atomicMemoryObjectStore{failNext: 1}
+	service := newTestBundleService(t, repository, store, t.TempDir(), 1<<20, bundle.DefaultArchiveLimits())
+	service.config.MaxPublishAttempts = 1
+	body := validExternalBundle(t, "input")
+
+	if _, _, err := service.Upload(context.Background(), testTenantID, "upload-key-00001", bytes.NewReader(body)); err == nil {
+		t.Fatal("expected initial promotion failure")
+	}
+	metadata, replay, err := service.Upload(context.Background(), testTenantID, "upload-key-00001", bytes.NewReader(body))
+	if err != nil || !replay || metadata.BundleID == "" {
+		t.Fatalf("metadata=%+v replay=%v error=%v", metadata, replay, err)
+	}
+	digest := sha256.Sum256(body)
+	key := testTenantID + ":" + hex.EncodeToString(digest[:])
+	if repository.status[key] != BundlePublicationReady || repository.attempts[key] != 1 || len(store.objects) != 1 {
+		t.Fatalf("status=%s attempts=%d objects=%d", repository.status[key], repository.attempts[key], len(store.objects))
+	}
+}
+
+func TestBundleServiceAttachesFreshStagingToLegacyPendingBundle(t *testing.T) {
+	repository := newMemoryBundleRepository()
+	store := &atomicMemoryObjectStore{}
+	service := newTestBundleService(t, repository, store, t.TempDir(), 1<<20, bundle.DefaultArchiveLimits())
+	body := validExternalBundle(t, "input")
+	digest := sha256.Sum256(body)
+	digestHex := hex.EncodeToString(digest[:])
+	legacy := BundleMetadata{
+		BundleID: "bbbbbbbbbbbbbbbbbbbbbbbbbb", SHA256: digestHex, SizeBytes: int64(len(body)),
+		CaseCount: 1, ManifestVersion: 1, CreatedAt: service.now(),
+	}
+	repository.bundles[testTenantID+":"+digestHex] = legacy
+	repository.status[testTenantID+":"+digestHex] = BundlePublicationPending
+
+	metadata, replay, err := service.Upload(context.Background(), testTenantID, "upload-key-legacy01", bytes.NewReader(body))
+	if err != nil || !replay || metadata.BundleID != legacy.BundleID {
+		t.Fatalf("metadata=%+v replay=%v error=%v", metadata, replay, err)
+	}
+	if repository.status[testTenantID+":"+digestHex] != BundlePublicationReady || repository.staging[testTenantID+":"+digestHex] == "" || len(store.objects) != 1 {
+		t.Fatalf("status=%s staging=%q objects=%d", repository.status[testTenantID+":"+digestHex], repository.staging[testTenantID+":"+digestHex], len(store.objects))
 	}
 }
 
@@ -417,7 +659,9 @@ func TestBundleServiceConcurrentIdenticalUploadsCreateOneLogicalRecord(t *testin
 	close(results)
 	close(errorsChannel)
 	for err := range errorsChannel {
-		t.Error(err)
+		if !errors.Is(err, ErrBundlePublishing) {
+			t.Error(err)
+		}
 	}
 	var bundleID string
 	for result := range results {
@@ -428,8 +672,8 @@ func TestBundleServiceConcurrentIdenticalUploadsCreateOneLogicalRecord(t *testin
 			t.Fatalf("concurrent uploads returned different logical IDs: %q and %q", bundleID, result.BundleID)
 		}
 	}
-	if repository.logicalCreates != 1 || len(store.objects) != 1 {
-		t.Fatalf("logical rows=%d visible objects=%d", repository.logicalCreates, len(store.objects))
+	if bundleID == "" || repository.logicalCreates != 1 || len(store.objects) != 1 || store.promoteCalls != 1 {
+		t.Fatalf("bundleID=%q logical rows=%d visible objects=%d promote calls=%d", bundleID, repository.logicalCreates, len(store.objects), store.promoteCalls)
 	}
 }
 

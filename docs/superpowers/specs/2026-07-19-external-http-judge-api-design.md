@@ -45,11 +45,11 @@ Authenticated `GET /api/v1/capabilities` returns supported languages, compiler/r
 
 ### 3.2 Bundles
 
-`POST /api/v1/bundles` accepts `multipart/form-data` with one deterministic bundle ZIP and an `Idempotency-Key` header. The server streams the upload to temporary object storage while enforcing compressed size, SHA-256, ZIP path/link/file/count/ratio/uncompressed limits, manifest schema, and case pairing. It then publishes the object atomically under a tenant-owned content address:
+`POST /api/v1/bundles` accepts `multipart/form-data` with one deterministic bundle ZIP and an `Idempotency-Key` header. The server streams and validates the upload, writes it to a unique tenant staging key, and commits PENDING ownership. A database CAS lease elects one promoter, which copies to the content address, verifies remote size and SHA-256 metadata, and only then marks the row READY:
 
 `external/<tenant-id>/sha256/<lowercase-sha256>.zip`
 
-The response is `201 Created` for the first accepted upload and `200 OK` for an idempotent replay. It contains `bundleId`, `sha256`, `sizeBytes`, `caseCount`, `manifestVersion`, and `createdAt`. Hidden files and a download URL are never returned. `GET /api/v1/bundles/{bundleId}` returns metadata only.
+The response is `201 Created` for the first accepted upload and `200 OK` for an idempotent replay. A concurrent request that does not own the publication lease receives retryable `503`. It contains `bundleId`, `sha256`, `sizeBytes`, `caseCount`, `manifestVersion`, and `createdAt`. Hidden files and a download URL are never returned. `GET /api/v1/bundles/{bundleId}` returns READY metadata only. A durable reconciler reclaims expired leases, applies bounded backoff, and marks exhausted or staging-less legacy rows ABANDONED; migrations never infer READY without remote verification.
 
 The API never accepts a caller-provided object URL. This prevents SSRF, DNS rebinding, cloud metadata access, and credential ambiguity. Physical cross-tenant deduplication may occur internally, but authorization is always checked through a tenant-owned metadata row so object existence cannot be used as a cross-tenant oracle.
 

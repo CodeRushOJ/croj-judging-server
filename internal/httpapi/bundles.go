@@ -156,6 +156,9 @@ func writeBundleProblem(response http.ResponseWriter, requestID string, err erro
 		problem = problemFor(http.StatusConflict, "idempotency-conflict", "Idempotency conflict", "The Idempotency-Key was already used for different content.", requestID)
 	case errors.Is(err, external.ErrBundleNotFound):
 		problem = problemFor(http.StatusNotFound, "not-found", "Resource not found", "The requested API resource does not exist.", requestID)
+	case errors.Is(err, external.ErrBundlePublishing):
+		response.Header().Set("Retry-After", "2")
+		problem = problemFor(http.StatusServiceUnavailable, "bundle-publishing", "Bundle publication in progress", "Retry this idempotent upload later.", requestID)
 	}
 	writeProblem(response, problem)
 }

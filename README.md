@@ -153,9 +153,13 @@ go run ./cmd/judge-admin api-key create \
 
 `POST /api/v1/bundles` 只接受一个名为 `bundle` 的 multipart 文件和 16–128 字节可见 ASCII `Idempotency-Key`。HTTP 外层和 Service 内层分别执行请求体/文件体积上限；文件流式写入专用临时文件并同步计算 SHA-256，取消、超限或校验失败都会清理临时文件。安全校验与内部 immutable bundle 共用同一条 ZIP 路径，覆盖路径穿越、link/非普通文件、加密/未知压缩、文件数、单文件/总解压量、压缩比、manifest 严格 schema、case 成对和 256 case 协议上限；每个 case 文件还会流式读取以核对 CRC、声明大小和 UTF-8，损坏内容不会发布。
 
-服务端只能发布到 `external/<tenant-id>/sha256/<lowercase-sha256>.zip`；请求不接受 URL、bucket 或 object key，响应也只返回 `bundleId`/digest/size/case/manifest version/创建时间。`Idempotency-Key` 使用不少于 32 字节独立 pepper 的 `HMAC-SHA256` 后才进入 MySQL，与 job API 使用同一安全语义，原始 key 不落库。MySQL 先在租户行锁下原子提交 `PENDING` ownership 与幂等记录，随后把完整对象原子发布到 final prefix，最后在同样的 tenant→bundle 锁顺序下设置 `ready_at`。`GET` 和判题任务的 bundle lookup 只允许 READY 行，因此发布窗口、失败对象和并发半成品不会被读取或提交；数据库/ID 失败也不会留下无 owner 的 final object。若 ownership 已提交但发布或 ready 标记失败，使用同一 key 与相同内容重试会按确定性 object key 安全补齐并转为 READY 后再返回 `200`。同租户并发上传同一 digest 只产生一条逻辑 bundle；同一幂等键+同一 digest 返回 `200`，同键不同 digest 返回 `409`。跨租户统一返回 `404`。
+服务端只能发布到 `external/<tenant-id>/sha256/<lowercase-sha256>.zip`；请求不接受 URL、bucket 或 object key，响应也只返回 `bundleId`/digest/size/case/manifest version/创建时间。`Idempotency-Key` 使用不少于 32 字节独立 pepper 的 `HMAC-SHA256` 后才进入 MySQL，与 job API 使用同一安全语义，原始 key 不落库。
 
-MySQL 集成回归默认跳过；对开发专用库设置 `EXTERNAL_JUDGE_MYSQL_TEST_DSN` 后，`go test -race ./internal/integration -run ExternalBundleSQLRepositoryIntegration` 会执行迁移，并真实竞争同 key/同 hash、不同 key/同 hash、同 key/不同 hash 三种事务，断言单 bundle、正确幂等记录数、一致响应和单一可见对象；阻塞对象发布用例还会断言 pending 行在 `ready_at` 设置前始终返回 `404`。
+通过校验的字节先写入唯一的 `external/<tenant-id>/staging/<upload-id>/<sha256>.zip`，再提交 `PENDING` ownership。发布者必须通过 MySQL CAS 取得带过期时间的 `PUBLISHING` lease；同一 bundle 同时只有一个 promoter，其他请求返回带 `Retry-After` 的 `503` 或读取已经完成的 READY 结果。promoter 从 staging 原子复制到 final key，并通过远端 HEAD 同时核对 size 与 `x-amz-meta-sha256` 后，才可把状态改为 READY。数据库所有多行写路径固定使用 tenant→bundle 锁序；对象操作被限制在 lease 的前半段，过期 claim 不能提交 READY。
+
+`BundleReconciler` 会持久领取到期的 PENDING/过期 PUBLISHING 行，记录 attempt、next-attempt、last-error 与 lease；客户端断线或不重放时仍可完成发布。超过最大失败次数或旧迁移留下的无 staging 行会转为 ABANDONED 并保留审计信息，绝不会无条件 backfill READY；相同内容之后重新上传时会把新 staging 对象安全挂回原 bundle，并从 PENDING 重新发布。对象存储应再为 `external/*/staging/` 配置大于数据库最大重试窗口的生命周期规则，清理数据库提交失败后无法安全判定 ownership 的唯一 staging 对象。`GET` 和判题任务 lookup 只允许 `publication_status=READY AND ready_at IS NOT NULL`；跨租户统一返回 `404`。
+
+本地未提供 DSN 时 MySQL 集成回归会跳过；对开发专用库设置 `EXTERNAL_JUDGE_MYSQL_TEST_DSN` 后，`go test -race ./internal/integration -run ExternalBundleSQLRepositoryIntegration` 会执行迁移，并真实竞争同 key/同 hash、不同 key/同 hash、同 key/不同 hash 三种事务，断言单 bundle、单 promoter、正确幂等记录数和单一可见对象；还覆盖阻塞发布期间 `404`、客户端不重放的 durable reconciliation、失败退避及 legacy pending 的放弃与重新上传恢复。GitHub Actions 的 `mysql84-bundle-integration` job 使用 digest 固定的 MySQL 8.4.10，因此该测试在 PR 中不得 skip。
 
 ## 构建镜像
 
