@@ -3,7 +3,9 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -59,7 +61,7 @@ func TestClientCollectsCompleteBatchStream(t *testing.T) {
 }
 
 func TestClientSendsBatchLargerThanDefaultGRPCLimit(t *testing.T) {
-	client, stop := newBufconnBatchClient(t, time.Second, func(_ *sandboxpb.ExecuteBatchV1Request, stream grpc.ServerStreamingServer[sandboxpb.ExecuteBatchV1Event]) error {
+	client, stop := newBufconnBatchClient(t, 10*time.Second, func(_ *sandboxpb.ExecuteBatchV1Request, stream grpc.ServerStreamingServer[sandboxpb.ExecuteBatchV1Event]) error {
 		return stream.Send(&sandboxpb.ExecuteBatchV1Event{Kind: sandboxpb.ExecuteBatchV1Event_COMPLETED})
 	})
 	defer stop()
@@ -111,6 +113,27 @@ func TestBatchStreamGuardRejectsCumulativeProtoBytes(t *testing.T) {
 	}
 }
 
+func TestBatchStreamGuardAllowsAllCasesAtDocumentedOutputLimits(t *testing.T) {
+	guard := batchStreamGuard{maxEvents: 257, maxBytes: maxBatchResponseBytesV1}
+	output := strings.Repeat("x", 64<<10)
+	for index := range 256 {
+		event := &sandboxpb.ExecuteBatchV1Event{
+			Kind:   sandboxpb.ExecuteBatchV1Event_CASE_RESULT,
+			CaseId: fmt.Sprintf("case-%03d", index),
+			Result: &sandboxpb.ExecuteResponse{Status: "Accepted", Stdout: output, Stderr: output},
+		}
+		if err := guard.observe(event); err != nil {
+			t.Fatalf("case %d rejected within documented output limits: %v", index, err)
+		}
+	}
+	if err := guard.observe(&sandboxpb.ExecuteBatchV1Event{Kind: sandboxpb.ExecuteBatchV1Event_COMPLETED}); err != nil {
+		t.Fatalf("completion rejected within documented output limits: %v", err)
+	}
+	if err := guard.finish(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestBatchStreamGuardRejectsEOFWithoutTerminalEvent(t *testing.T) {
 	guard := batchStreamGuard{maxEvents: 2, maxBytes: 1024}
 	if err := guard.observe(&sandboxpb.ExecuteBatchV1Event{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT}); err != nil {
@@ -118,6 +141,37 @@ func TestBatchStreamGuardRejectsEOFWithoutTerminalEvent(t *testing.T) {
 	}
 	if err := guard.finish(); !errors.Is(err, ErrInvalidBatchStream) {
 		t.Fatalf("unterminated stream error = %v, want ErrInvalidBatchStream", err)
+	}
+}
+
+func TestClientCancelsAndDropsRejectedBatchStream(t *testing.T) {
+	serverCancelled := make(chan struct{})
+	client, stop := newBufconnBatchClient(t, time.Second, func(_ *sandboxpb.ExecuteBatchV1Request, stream grpc.ServerStreamingServer[sandboxpb.ExecuteBatchV1Event]) error {
+		for index := range 3 {
+			if err := stream.Send(&sandboxpb.ExecuteBatchV1Event{
+				Kind:   sandboxpb.ExecuteBatchV1Event_CASE_RESULT,
+				CaseId: fmt.Sprintf("case-%d", index),
+				Result: &sandboxpb.ExecuteResponse{Status: "Accepted"},
+			}); err != nil {
+				return err
+			}
+		}
+		<-stream.Context().Done()
+		close(serverCancelled)
+		return stream.Context().Err()
+	})
+	defer stop()
+
+	events, err := client.ExecuteBatch(context.Background(), "sandbox.test:50051", &sandboxpb.ExecuteBatchV1Request{
+		Cases: []*sandboxpb.ExecuteBatchV1Case{{CaseId: "case-0"}},
+	})
+	if !errors.Is(err, ErrInvalidBatchStream) || events != nil {
+		t.Fatalf("events=%v error=%v, want discarded stream and ErrInvalidBatchStream", events, err)
+	}
+	select {
+	case <-serverCancelled:
+	case <-time.After(time.Second):
+		t.Fatal("server stream context was not cancelled")
 	}
 }
 

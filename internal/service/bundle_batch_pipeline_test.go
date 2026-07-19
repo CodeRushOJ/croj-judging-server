@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"strings"
 	"testing"
@@ -90,6 +91,39 @@ func TestBatchBundlePipelineStopsReadingCasesWhenWireLimitIsCrossed(t *testing.T
 	}
 	if result.Status != callback.StatusSystemError || artifact.reads != 1 || len(executor.requests) != 0 {
 		t.Fatalf("result=%+v reads=%d sandbox calls=%d", result, artifact.reads, len(executor.requests))
+	}
+}
+
+func TestBatchBundlePipelineRetainsOnlyHashesForLargeTokenOutputs(t *testing.T) {
+	const caseCount = 64
+	artifact := &countingArtifact{memoryArtifact: &memoryArtifact{
+		manifest: bundle.Manifest{SchemaVersion: 1, JudgeMode: bundle.JudgeModeACM, Checker: bundle.CheckerToken},
+		contents: make(map[string]string, caseCount*2),
+	}}
+	largeToken := strings.Repeat("x", 256<<10)
+	for index := range caseCount {
+		id := fmt.Sprintf("case-%03d", index)
+		input, output := id+".in", id+".out"
+		artifact.manifest.Cases = append(artifact.manifest.Cases, bundle.Case{ID: id, Input: input, Output: output, Weight: 1})
+		artifact.contents[input] = "x"
+		artifact.contents[output] = fmt.Sprintf("%03d-%s", index, largeToken)
+	}
+	executor := &batchExecutorStub{events: []*sandboxpb.ExecuteBatchV1Event{{
+		Kind:   sandboxpb.ExecuteBatchV1Event_COMPILE_ERROR,
+		Result: &sandboxpb.ExecuteResponse{Status: "Compile Error"},
+	}}}
+	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a"}}, executor, 1)
+	pipeline.maxExpectedCheckBytes = caseCount * sha256.Size * 2
+
+	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validExecutionConfig(), artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != callback.StatusCompileError || artifact.reads != caseCount || len(executor.requests) != 1 {
+		t.Fatalf("result=%+v reads=%d sandbox calls=%d", result, artifact.reads, len(executor.requests))
+	}
+	if size := proto.Size(executor.requests[0]); size >= 1<<20 {
+		t.Fatalf("token request retained raw expected outputs: protobuf size=%d", size)
 	}
 }
 
@@ -233,6 +267,24 @@ func TestBatchBundlePipelineKeepsTokenExpectedOutputOutOfSandbox(t *testing.T) {
 	}
 	if executor.requests[0].Cases[0].ExpectedOutput != "" || executor.requests[0].Cases[0].CompareOutput || executor.requests[0].Cases[0].TokenExpectedSha256 != "615f69ed4e249a34955fc08be20fc324c06462f6ae8b817d22280505adca9209" || !executor.requests[0].StopOnFailure {
 		t.Fatalf("token expected output crossed sandbox boundary: %+v", executor.requests[0].Cases[0])
+	}
+}
+
+func TestBatchBundlePipelineRechecksTokenVerdictFromRetainedHash(t *testing.T) {
+	artifact := exactArtifact(1)
+	artifact.manifest.Checker = bundle.CheckerToken
+	executor := &batchExecutorStub{events: []*sandboxpb.ExecuteBatchV1Event{
+		{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT, CaseId: "case-1", Result: &sandboxpb.ExecuteResponse{Status: "Accepted", Stdout: "wrong"}},
+		{Kind: sandboxpb.ExecuteBatchV1Event_COMPLETED},
+	}}
+	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a"}}, executor, 1)
+
+	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validExecutionConfig(), artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != callback.StatusWrongAnswer {
+		t.Fatalf("result=%+v, want local hash-only Wrong Answer", result)
 	}
 }
 
