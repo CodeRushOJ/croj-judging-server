@@ -11,11 +11,50 @@ import (
 	sandboxpb "github.com/CodeRushOJ/croj-judging-server/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/proto"
 )
 
 var ErrClientClosed = errors.New("sandbox client is closed")
+var ErrInvalidBatchStream = errors.New("invalid sandbox batch stream")
 
 const maxBatchMessageBytesV1 = 64 << 20
+const maxBatchResponseBytesV1 = 32 << 20
+
+type batchStreamGuard struct {
+	maxEvents int
+	maxBytes  int
+	events    int
+	bytes     int
+	terminal  bool
+}
+
+func (guard *batchStreamGuard) observe(event *sandboxpb.ExecuteBatchV1Event) error {
+	if event == nil {
+		return fmt.Errorf("%w: nil event", ErrInvalidBatchStream)
+	}
+	if guard.terminal {
+		return fmt.Errorf("%w: event after terminal", ErrInvalidBatchStream)
+	}
+	guard.events++
+	guard.bytes += proto.Size(event)
+	if guard.events > guard.maxEvents {
+		return fmt.Errorf("%w: event count exceeds %d", ErrInvalidBatchStream, guard.maxEvents)
+	}
+	if guard.bytes > guard.maxBytes {
+		return fmt.Errorf("%w: event bytes exceed %d", ErrInvalidBatchStream, guard.maxBytes)
+	}
+	if event.Kind == sandboxpb.ExecuteBatchV1Event_COMPLETED || event.Kind == sandboxpb.ExecuteBatchV1Event_COMPILE_ERROR {
+		guard.terminal = true
+	}
+	return nil
+}
+
+func (guard *batchStreamGuard) finish() error {
+	if !guard.terminal {
+		return fmt.Errorf("%w: terminal event is missing", ErrInvalidBatchStream)
+	}
+	return nil
+}
 
 // Client owns one reusable gRPC connection per ready sandbox endpoint.
 type Client struct {
@@ -126,13 +165,20 @@ func (c *Client) ExecuteBatch(
 		return nil, fmt.Errorf("start batch on sandbox %s: %w", address, err)
 	}
 	events := make([]*sandboxpb.ExecuteBatchV1Event, 0, len(request.Cases)+1)
+	guard := batchStreamGuard{maxEvents: len(request.Cases) + 1, maxBytes: maxBatchResponseBytesV1}
 	for {
 		event, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
+			if err := guard.finish(); err != nil {
+				return nil, err
+			}
 			return events, nil
 		}
 		if err != nil {
 			return nil, fmt.Errorf("receive batch from sandbox %s: %w", address, err)
+		}
+		if err := guard.observe(event); err != nil {
+			return nil, err
 		}
 		events = append(events, event)
 	}

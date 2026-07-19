@@ -42,6 +42,8 @@
 - 正常结束但事件畸形的 batch 流不再换 Endpoint 重编译，只将传输层 `Unavailable`/`ResourceExhausted` 视为可切换容量故障
 - token checker 使用 hash-only expected 在 sandbox 内恢复首错早停，并继续在 judging 侧用原始 expected 复核
 - batch 客户端显式设置有界 64 MiB 收发上限，配合 sandbox 有界编译诊断避免大响应被误判为容量重试
+- batch 请求按 case 增量执行 64 MiB wire-size 检查，响应流在线限制为 `case 数 + 1` 个事件和 32 MiB 累计 protobuf 数据，且要求终结事件
+- 整批 failover 记录已尝试 endpoint，EndpointSlice 更新与并发轮询时也不会在一次逻辑判题中重复选中同一 sandbox
 
 ### Known limitations
 
