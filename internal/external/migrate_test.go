@@ -83,8 +83,12 @@ func TestDurableJobFencingMigrationAddsTenantBoundLeaseTokens(t *testing.T) {
 	for _, contract := range []string{
 		"add column lease_token binary(32)",
 		"add column tenant_id bigint unsigned",
+		"failure_code = 'migration_reclaim'",
+		"set status = 'queued'",
 		"unique key uk_external_attempt_id_tenant (id, tenant_id)",
 		"foreign key (job_id, tenant_id) references t_external_job(id, tenant_id)",
+		"constraint chk_external_job_active_lease",
+		"constraint chk_external_attempt_active_lease",
 	} {
 		if !strings.Contains(sql, contract) {
 			t.Errorf("migration is missing contract %q", contract)

@@ -10,10 +10,34 @@ JOIN t_external_job AS job ON job.id = attempt_row.job_id
 SET attempt_row.tenant_id = job.tenant_id
 WHERE attempt_row.tenant_id IS NULL;
 -- migrate:split
+UPDATE t_external_job_attempt
+SET status = 'EXPIRED',
+    finished_at = COALESCE(finished_at, CURRENT_TIMESTAMP(3)),
+    failure_code = 'MIGRATION_RECLAIM'
+WHERE status = 'RUNNING';
+-- migrate:split
+UPDATE t_external_job
+SET status = 'QUEUED',
+    worker_id = NULL,
+    lease_token = NULL,
+    lease_until = NULL,
+    next_attempt_at = CURRENT_TIMESTAMP(3),
+    failure_code = 'MIGRATION_RECLAIM'
+WHERE status = 'RUNNING';
+-- migrate:split
 ALTER TABLE t_external_job_attempt
     MODIFY COLUMN tenant_id BIGINT UNSIGNED NOT NULL,
     ADD UNIQUE KEY uk_external_attempt_id_tenant (id, tenant_id),
     ADD KEY idx_external_attempt_tenant (tenant_id, started_at, id),
     DROP FOREIGN KEY fk_external_attempt_job,
     ADD CONSTRAINT fk_external_attempt_job_tenant
-        FOREIGN KEY (job_id, tenant_id) REFERENCES t_external_job(id, tenant_id);
+        FOREIGN KEY (job_id, tenant_id) REFERENCES t_external_job(id, tenant_id),
+    ADD CONSTRAINT chk_external_attempt_active_lease
+        CHECK (status <> 'RUNNING' OR lease_token IS NOT NULL);
+-- migrate:split
+ALTER TABLE t_external_job
+    ADD CONSTRAINT chk_external_job_active_lease
+        CHECK (
+            status <> 'RUNNING' OR
+            (worker_id IS NOT NULL AND lease_token IS NOT NULL AND lease_until IS NOT NULL)
+        );

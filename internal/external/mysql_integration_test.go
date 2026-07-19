@@ -34,6 +34,7 @@ func openMySQLIntegration(t *testing.T) *sql.DB {
 
 func TestApplyMigrationsOnMySQL84IsReplaySafe(t *testing.T) {
 	database := openMySQLIntegration(t)
+	resetMySQLIntegrationSchema(t, database)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := ApplyMigrations(ctx, database); err != nil {
@@ -59,5 +60,119 @@ WHERE table_schema = DATABASE() AND
 	}
 	if columnCount != 3 {
 		t.Fatalf("durable fencing columns = %d", columnCount)
+	}
+	var constraintCount int
+	if err := database.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM information_schema.table_constraints
+WHERE constraint_schema = DATABASE() AND constraint_type = 'CHECK'
+  AND constraint_name IN ('chk_external_job_active_lease', 'chk_external_attempt_active_lease')`).Scan(&constraintCount); err != nil {
+		t.Fatal(err)
+	}
+	if constraintCount != 2 {
+		t.Fatalf("active lease constraints = %d", constraintCount)
+	}
+}
+
+func TestDurableFencingMigrationRecoversLegacyRunningRows(t *testing.T) {
+	database := openMySQLIntegration(t)
+	resetMySQLIntegrationSchema(t, database)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	migrations, err := Migrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection, err := database.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := applyMigrations(ctx, sqlMigrationConnection{connection: connection}, migrations[:2]); err != nil {
+		connection.Close()
+		t.Fatal(err)
+	}
+	if err := connection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	policy := `{"maxQueuedJobs":4,"maxRunningJobs":1,"maxSourceBytes":1024,"maxRetainedBundles":4,"dailyExecutionMillis":1000,"maxInfrastructureTries":3}`
+	tenantResult, err := database.ExecContext(ctx, `
+INSERT INTO t_external_tenant(external_id, name, status, policy_json)
+VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaa', 'legacy tenant', 'ACTIVE', ?)`, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tenantID, _ := tenantResult.LastInsertId()
+	bundleResult, err := database.ExecContext(ctx, `
+INSERT INTO t_external_bundle(
+    external_id, tenant_id, sha256, object_key, size_bytes, case_count,
+    manifest_version, manifest_json, ready_at
+) VALUES ('bbbbbbbbbbbbbbbbbbbbbbbbbb', ?, UNHEX(SHA2('legacy-bundle', 256)),
+          'external/legacy.zip', 1, 1, 1, JSON_OBJECT('schemaVersion', 1), NOW(3))`, tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundleID, _ := bundleResult.LastInsertId()
+	sourceResult, err := database.ExecContext(ctx, `
+INSERT INTO t_external_source_object(
+    external_id, tenant_id, object_key, source_sha256, source_size_bytes,
+    encryption_key_version, encryption_nonce
+) VALUES ('cccccccccccccccccccccccccc', ?, 'external/legacy-source.bin',
+          UNHEX(SHA2('legacy-source', 256)), 1, 1, X'000000000000000000000000')`, tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceID, _ := sourceResult.LastInsertId()
+	jobResult, err := database.ExecContext(ctx, `
+INSERT INTO t_external_job(
+    external_id, tenant_id, bundle_id, source_object_id, status, language_id,
+    request_hash, attempt_no, worker_id, lease_until, next_attempt_at, started_at
+) VALUES ('dddddddddddddddddddddddddd', ?, ?, ?, 'RUNNING', 'cpp20',
+          UNHEX(SHA2('legacy-request', 256)), 1, 'legacy-worker',
+          DATE_ADD(NOW(3), INTERVAL 1 HOUR), NOW(3), NOW(3))`, tenantID, bundleID, sourceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobID, _ := jobResult.LastInsertId()
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO t_external_job_attempt(job_id, attempt_no, worker_id, status, lease_until)
+VALUES (?, 1, 'legacy-worker', 'RUNNING', DATE_ADD(NOW(3), INTERVAL 1 HOUR))`, jobID); err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyMigrations(ctx, database); err != nil {
+		t.Fatal(err)
+	}
+	var jobStatus, jobFailure string
+	var workerID, leaseUntil sql.NullString
+	if err := database.QueryRowContext(ctx, `
+SELECT status, failure_code, worker_id, CAST(lease_until AS CHAR)
+FROM t_external_job WHERE id = ?`, jobID).Scan(&jobStatus, &jobFailure, &workerID, &leaseUntil); err != nil {
+		t.Fatal(err)
+	}
+	if jobStatus != "QUEUED" || jobFailure != "MIGRATION_RECLAIM" || workerID.Valid || leaseUntil.Valid {
+		t.Fatalf("migrated job status=%s failure=%s worker=%v lease=%v", jobStatus, jobFailure, workerID, leaseUntil)
+	}
+	var attemptStatus, attemptFailure string
+	var attemptTenantID uint64
+	if err := database.QueryRowContext(ctx, `
+SELECT status, failure_code, tenant_id FROM t_external_job_attempt WHERE job_id = ?`, jobID).
+		Scan(&attemptStatus, &attemptFailure, &attemptTenantID); err != nil {
+		t.Fatal(err)
+	}
+	if attemptStatus != "EXPIRED" || attemptFailure != "MIGRATION_RECLAIM" || attemptTenantID != uint64(tenantID) {
+		t.Fatalf("migrated attempt status=%s failure=%s tenant=%d", attemptStatus, attemptFailure, attemptTenantID)
+	}
+}
+
+func resetMySQLIntegrationSchema(t *testing.T, database *sql.DB) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for _, table := range []string{
+		"t_external_webhook_outbox", "t_external_job_attempt", "t_external_idempotency",
+		"t_external_job", "t_external_source_object", "t_external_callback", "t_external_bundle",
+		"t_external_api_key", "t_external_tenant", "t_judge_schema_history",
+	} {
+		if _, err := database.ExecContext(ctx, "DROP TABLE IF EXISTS "+table); err != nil {
+			t.Fatalf("drop %s: %v", table, err)
+		}
 	}
 }
