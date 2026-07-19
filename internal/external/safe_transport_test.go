@@ -2,6 +2,7 @@ package external
 
 import (
 	"context"
+	"errors"
 	"net/netip"
 	"testing"
 	"time"
@@ -25,16 +26,24 @@ func TestResolvePublicCallbackRejectsPrivateReservedAndMixedDNS(t *testing.T) {
 	for _, raw := range privateAddresses {
 		t.Run(raw, func(t *testing.T) {
 			_, err := resolvePublicCallback(context.Background(), resolverStub{addresses: []netip.Addr{netip.MustParseAddr(raw)}}, "hooks.example.com")
-			if err == nil {
-				t.Fatal("private or reserved callback address was accepted")
+			if !errors.Is(err, ErrUnsafeCallbackDestination) {
+				t.Fatalf("private or reserved callback address error=%v", err)
 			}
 		})
 	}
 	_, err := resolvePublicCallback(context.Background(), resolverStub{addresses: []netip.Addr{
 		netip.MustParseAddr("8.8.8.8"), netip.MustParseAddr("127.0.0.1"),
 	}}, "hooks.example.com")
-	if err == nil {
-		t.Fatal("mixed public/private DNS answer was accepted")
+	if !errors.Is(err, ErrUnsafeCallbackDestination) {
+		t.Fatalf("mixed public/private DNS answer error=%v", err)
+	}
+}
+
+func TestSafeCallbackResolverOutageRemainsRetryable(t *testing.T) {
+	want := errors.New("temporary resolver outage")
+	_, err := resolvePublicCallback(context.Background(), resolverStub{err: want}, "hooks.example.com")
+	if !errors.Is(err, want) || errors.Is(err, ErrUnsafeCallbackDestination) {
+		t.Fatalf("resolver outage classification changed: %v", err)
 	}
 }
 
