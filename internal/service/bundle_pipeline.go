@@ -73,13 +73,10 @@ func (pipeline *BundlePipeline) ExecuteArtifact(
 		summaries = append(summaries, fmt.Sprintf("case=%s sandboxStatus=%s status=%s", testCase.ID, response.Status, caseStatus))
 		result.Stderr = callback.TruncateUTF16(strings.Join(summaries, ";"), 65_536)
 		if caseStatus == callback.StatusCompileError {
-			result.CompileError = callback.TruncateUTF16(strings.TrimSpace(response.CompileError), 32_768)
-			if result.CompileError == "" {
-				result.CompileError = callback.TruncateUTF16(firstDiagnostic(response.Error, response.Stderr), 32_768)
-			}
-			if result.CompileError == "" {
-				result.CompileError = "compiler failed without diagnostics"
-			}
+			// A sandbox has received source, hidden stdin and expected output. Its
+			// diagnostic fields therefore cross an untrusted confidentiality
+			// boundary and must never be forwarded to the callback.
+			result.CompileError = "compilation failed; diagnostics redacted"
 		}
 		if caseStatus != callback.StatusAccepted {
 			return result, nil
@@ -97,6 +94,8 @@ func (pipeline *BundlePipeline) executeCase(
 	input string,
 	expected string,
 ) (*sandboxpb.ExecuteResponse, bool, error) {
+	var lastRetryableError error
+	receivedInvalidResponse := false
 	for attempt := 0; attempt < pipeline.maxInfraAttempts; attempt++ {
 		address, err := pipeline.selector.SelectSandbox()
 		if err != nil {
@@ -117,17 +116,23 @@ func (pipeline *BundlePipeline) executeCase(
 		if err != nil {
 			code := status.Code(err)
 			if code == codes.Unavailable || code == codes.ResourceExhausted {
+				lastRetryableError = err
 				continue
 			}
 			return nil, false, fmt.Errorf("execute hidden case: %w", err)
 		}
 		if response == nil {
+			receivedInvalidResponse = true
 			continue
 		}
 		if isKnownContestantStatus(response.Status) {
 			return response, false, nil
 		}
 		// Sandbox Error and every unknown status are infrastructure failures.
+		receivedInvalidResponse = true
+	}
+	if lastRetryableError != nil && !receivedInvalidResponse {
+		return nil, false, fmt.Errorf("execute hidden case after %d endpoint attempts: %w", pipeline.maxInfraAttempts, lastRetryableError)
 	}
 	return nil, true, nil
 }

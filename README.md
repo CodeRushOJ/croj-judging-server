@@ -24,7 +24,7 @@ flowchart LR
 
 发现器只读取带 `kubernetes.io/service-name=croj-sandbox` 标签的 EndpointSlice，只保留 `Ready=true` 且非 `Terminating` 的 TCP 地址。Kubernetes API 暂时失败时，调度器保留最后一次成功快照；API 成功返回空集合时立即停止分配，避免继续调用已删除 Pod。
 
-每个 endpoint 复用一个 gRPC `ClientConn`；连接缓存同时受最大容量和空闲 TTL 约束。每个 case 的 `Unavailable`、`ResourceExhausted`、`Sandbox Error` 或未知状态会在有界次数内换下一个 Ready endpoint；CE/WA/TLE/MLE/RE/OLE 等选手终态不重试。OLE 在 callback v1 暂映射为 `RUNTIME_ERROR`，正式枚举由 Issue #13 跟进。
+每个 endpoint 复用一个 gRPC `ClientConn`；连接缓存同时受最大容量和空闲 TTL 约束。每个 case 的 `Unavailable`、`ResourceExhausted`、`Sandbox Error` 或未知状态会在有界次数内换下一个 Ready endpoint。若全部尝试都是 `Unavailable`/`ResourceExhausted`，服务保留原 gRPC code 并交给 RocketMQ 重试，不会把短暂过载发布成终态 `SYSTEM_ERROR`；sandbox 已返回但内容为空、状态未知或为 `Sandbox Error` 时才按损坏的基础设施响应终结。CE/WA/TLE/MLE/RE/OLE 等选手终态不重试。OLE 在 callback v1 暂映射为 `RUNTIME_ERROR`，正式枚举由 Issue #13 跟进。
 
 消息必须是严格的 `SubmissionRequested` v1 JSON：
 
@@ -52,6 +52,8 @@ flowchart LR
 ```
 
 仅支持 `ACM` 的 `exact` 与 `token`。SPJ/OI 会明确返回 `SYSTEM_ERROR`，由 Issue #12 跟进。`exact` 与 sandbox 保持相同规则：CRLF/CR 统一为 LF，每行 `TrimSpace` 后再移除整体首尾空白；`token` 在 judging 侧按 Unicode whitespace 分词比较。case 按 manifest 顺序执行，首个选手错误早停，最终时间/内存取所有已完成 case 的最大值。
+
+隐藏包路径把 sandbox 视为不可信边界：callback 不转发 stdout、hidden input/output 或 sandbox 诊断。编译错误仅返回固定的 `compilation failed; diagnostics redacted`；后续若要恢复安全的编译诊断，必须由独立的结构化编译阶段提供，不允许从已接触 hidden case 的响应中透传自由文本。
 
 读取 ZIP 前会拒绝未知字段、重复 ID/路径、绝对路径、反斜杠、路径穿越、符号链接、非普通文件、加密/未知压缩方法、zip bomb、超量文件和解压大小越界。文件不会解压到目录。`WriteDeterministicArchive` 可生成固定时间戳、固定权限、排序 entry 的可复现 artifact，并返回应写入数据库的规范 manifest JSON。
 
@@ -111,6 +113,8 @@ docker run --rm \
   -w /workspace golang:1.26.3 \
   go test -race ./...
 ```
+
+`internal/integration/judge_sandbox_contract_test.go` 使用一次性的 fake Kubernetes API、真实 TCP gRPC server 和 HTTP callback 验证完整进程内契约：EndpointSlice churn、过载换节点、不可变 ZIP/SHA-256、隐藏 case 执行和 callback 脱敏。测试不要求也不会启动持久集群或服务。
 
 静态检查和构建：
 

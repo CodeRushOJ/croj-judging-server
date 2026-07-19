@@ -19,6 +19,7 @@
 - 增加 S3/MinIO 有界流式下载、size/SHA-256 校验及原子发布。
 - 增加 checksum-keyed 磁盘缓存、并发下载合并、命中校验、损坏修复、TTL/LRU 和 restart orphan 清理。
 - 增加 ACM 多 case 顺序执行、选手错误早停、最大资源聚合与基础设施故障有界换 endpoint。
+- 增加 fake Kubernetes API + 真实 TCP gRPC + HTTP callback 的跨组件契约测试，覆盖 EndpointSlice churn、过载换节点、bundle digest fail-closed 与 hidden payload 脱敏。
 
 ### Changed
 
@@ -30,6 +31,8 @@
 - callback 文本按后端 Java UTF-16 code unit 边界截断和校验，非 BMP 字符不会导致合法 Go 载荷被后端永久拒绝。
 - 判题从单次空 stdin 兼容请求切换为 problem-version 固定的隐藏测试包；缺失、损坏、SPJ/OI 均明确发布 `SYSTEM_ERROR`。
 - `Output Limit Exceeded` 在 callback v1 暂映射为 `RUNTIME_ERROR` 且不重试，等待 Issue #13 的正式枚举。
+- 全部 endpoint 均返回 `Unavailable`/`ResourceExhausted` 时保留 gRPC 状态交由 RocketMQ 重试，不再错误发布终态 `SYSTEM_ERROR`。
+- 隐藏包判题不再透传 sandbox 的自由文本编译诊断，防止异常 sandbox 通过 callback 回显源码或 hidden input/output。
 
 ### Known limitations
 

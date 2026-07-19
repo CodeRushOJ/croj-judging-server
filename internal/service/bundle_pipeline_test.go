@@ -125,6 +125,34 @@ func TestBundlePipelineDoesNotPublishHiddenContents(t *testing.T) {
 	}
 }
 
+func TestBundlePipelineRedactsUntrustedCompileDiagnostics(t *testing.T) {
+	artifact := exactArtifact(1)
+	artifact.contents[artifact.manifest.Cases[0].Input] = "hidden-input-secret"
+	artifact.contents[artifact.manifest.Cases[0].Output] = "hidden-output-secret"
+	submission := validBundleSubmission()
+	submission.Code = "contestant-source-secret"
+	executor := &sequenceExecutor{responses: []*sandboxpb.ExecuteResponse{{
+		Status:       "Compile Error",
+		CompileError: submission.Code + " hidden-input-secret hidden-output-secret",
+		Stderr:       "hidden-output-secret",
+		Error:        "hidden-input-secret",
+	}}}
+	pipeline := NewBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a"}}, executor, 1)
+	result, err := pipeline.ExecuteArtifact(context.Background(), submission, validExecutionConfig(), artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != callback.StatusCompileError || result.CompileError != "compilation failed; diagnostics redacted" {
+		t.Fatalf("result = %+v", result)
+	}
+	serialized := result.Stdout + result.Stderr + result.CompileError
+	for _, secret := range []string{submission.Code, "hidden-input-secret", "hidden-output-secret"} {
+		if strings.Contains(serialized, secret) {
+			t.Fatalf("compile callback leaked %q: %+v", secret, result)
+		}
+	}
+}
+
 func TestBundlePipelineStopsAtFirstContestantVerdict(t *testing.T) {
 	artifact := exactArtifact(2)
 	executor := &sequenceExecutor{responses: []*sandboxpb.ExecuteResponse{
@@ -194,6 +222,29 @@ func TestBundlePipelineReturnsSystemErrorAfterUnknownStatusLimit(t *testing.T) {
 	}
 	if result.Status != callback.StatusSystemError || len(executor.requests) != 2 {
 		t.Fatalf("result=%+v calls=%d", result, len(executor.requests))
+	}
+}
+
+func TestBundlePipelineKeepsExhaustedTransportFailuresRetryable(t *testing.T) {
+	for _, code := range []codes.Code{codes.ResourceExhausted, codes.Unavailable} {
+		t.Run(code.String(), func(t *testing.T) {
+			artifact := exactArtifact(1)
+			executor := &sequenceExecutor{
+				responses: []*sandboxpb.ExecuteResponse{nil, nil},
+				errors: []error{
+					status.Error(code, "sandbox temporarily unavailable"),
+					status.Error(code, "sandbox temporarily unavailable"),
+				},
+			}
+			pipeline := NewBundlePipeline(&sequenceSelector{endpoints: []string{"a", "b"}}, executor, 2)
+			result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validExecutionConfig(), artifact)
+			if status.Code(err) != code {
+				t.Fatalf("error = %v, want retryable gRPC code %s; result=%+v", err, code, result)
+			}
+			if len(executor.requests) != 2 {
+				t.Fatalf("calls = %d, want bounded endpoint failover before retry", len(executor.requests))
+			}
+		})
 	}
 }
 
