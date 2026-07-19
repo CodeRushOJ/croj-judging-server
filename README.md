@@ -4,7 +4,7 @@ Go 判题编排服务，负责消费 `submission-topic`、读取提交快照、�
 
 > 当前状态：Kubernetes EndpointSlice 发现、版本化消息、认证幂等结果回调和不可变 ACM 隐藏测试包链路已经接通。上线 exact checker 前必须先合入 [`croj-sandbox#10`](https://github.com/CodeRushOJ/croj-sandbox/issues/10) 的日志脱敏修复，否则旧 sandbox 会把 WA 的 expected/actual 写入 Pod 日志。
 
-面向外部 OJ 的版本化异步 REST 适配器正在 Draft PR #17 中实施。已有切片包括 RFC 9457 错误、请求 ID、不透明 API Key 的 peppered HMAC 验证与 scope、`GET /api/v1/capabilities`、Judge 自有 MySQL 迁移以及租户/密钥预置基础。在 job lease、bundle upload、webhook 和 E2E 门禁完成前，该 HTTP 端口不标记为可发布。
+面向外部 OJ 的版本化异步 REST 适配器正在 Draft PR #17 中实施。已有切片包括 RFC 9457 错误、请求 ID、不透明 API Key 的 peppered HMAC 验证与 scope、`GET /api/v1/capabilities`、Judge 自有 MySQL 迁移、租户/密钥预置，以及 `POST /api/v1/judge-jobs`、任务列表/详情/取消的脱敏 HTTP 合约和 lease/attempt 状态机。在 MySQL job repository、worker、webhook 和 E2E 门禁完成前，该 HTTP 端口不标记为可发布。
 
 ## 架构
 
