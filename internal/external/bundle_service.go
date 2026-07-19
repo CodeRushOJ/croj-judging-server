@@ -21,6 +21,8 @@ var (
 	ErrBundleNotFound      = errors.New("immutable bundle was not found")
 	ErrIdempotencyConflict = errors.New("idempotency key was reused with different content")
 	ErrInvalidIdempotency  = errors.New("idempotency key is invalid")
+	ErrBundlePublishing    = errors.New("immutable bundle publication is in progress")
+	ErrBundleAbandoned     = errors.New("immutable bundle publication was abandoned")
 )
 
 const maxExternalBundleCasesV1 = 256
@@ -36,41 +38,72 @@ type BundleMetadata struct {
 
 type BundleUploadLookup struct {
 	Found       bool
-	Ready       bool
+	Status      BundlePublicationStatus
 	RequestHash [sha256.Size]byte
+	StagingKey  string
 	Metadata    BundleMetadata
 }
+
+type BundlePublicationStatus string
+
+const (
+	BundlePublicationPending    BundlePublicationStatus = "PENDING"
+	BundlePublicationPublishing BundlePublicationStatus = "PUBLISHING"
+	BundlePublicationReady      BundlePublicationStatus = "READY"
+	BundlePublicationAbandoned  BundlePublicationStatus = "ABANDONED"
+)
 
 type BundleCommitInput struct {
 	TenantID             string
 	IdempotencyDigest    [sha256.Size]byte
 	RequestHash          [sha256.Size]byte
 	ObjectKey            string
+	StagingObjectKey     string
 	ManifestJSON         []byte
 	Metadata             BundleMetadata
 	IdempotencyExpiresAt time.Time
 }
 
 type BundleCommitResult struct {
-	Metadata BundleMetadata
-	Replay   bool
-	Ready    bool
+	Metadata   BundleMetadata
+	Replay     bool
+	Status     BundlePublicationStatus
+	StagingKey string
+}
+
+type BundlePublicationClaim struct {
+	TenantID     string
+	BundleID     string
+	ObjectKey    string
+	StagingKey   string
+	RequestHash  [sha256.Size]byte
+	SizeBytes    int64
+	LeaseToken   string
+	AttemptCount int
 }
 
 type BundleRepository interface {
 	FindBundleUpload(context.Context, string, [sha256.Size]byte) (BundleUploadLookup, error)
 	CommitBundleUpload(context.Context, BundleCommitInput) (BundleCommitResult, error)
-	MarkBundleReady(context.Context, string, string, [sha256.Size]byte) error
+	ClaimBundlePublication(context.Context, string, string, string, time.Time, time.Time) (BundlePublicationClaim, bool, error)
+	ClaimNextBundlePublication(context.Context, string, time.Time, time.Time) (BundlePublicationClaim, bool, error)
+	CompleteBundlePublication(context.Context, BundlePublicationClaim, time.Time) error
+	FailBundlePublication(context.Context, BundlePublicationClaim, string, time.Time, int) (bool, error)
+	SweepUnrecoverableBundlePublications(context.Context, time.Time, int) (int64, error)
 	FindBundle(context.Context, string, string) (BundleMetadata, error)
 }
 
 type BundleServiceConfig struct {
-	TempDir           string
-	MaxUploadBytes    int64
-	ArchiveLimits     bundle.ArchiveLimits
-	IdempotencyTTL    time.Duration
-	IdempotencyPepper []byte
-	Random            io.Reader
+	TempDir             string
+	MaxUploadBytes      int64
+	ArchiveLimits       bundle.ArchiveLimits
+	IdempotencyTTL      time.Duration
+	IdempotencyPepper   []byte
+	PublicationLease    time.Duration
+	PublicationRetry    time.Duration
+	MaxPublishAttempts  int
+	PendingAbandonAfter time.Duration
+	Random              io.Reader
 }
 
 type BundleService struct {
@@ -98,6 +131,20 @@ func NewBundleService(repository BundleRepository, store BundleObjectStore, conf
 	}
 	if config.TempDir == "" {
 		config.TempDir = os.TempDir()
+	}
+	if config.PublicationLease <= 0 {
+		config.PublicationLease = time.Minute
+	} else if config.PublicationLease < 2*time.Second {
+		return nil, fmt.Errorf("bundle publication lease must be at least two seconds")
+	}
+	if config.PublicationRetry <= 0 {
+		config.PublicationRetry = 5 * time.Second
+	}
+	if config.MaxPublishAttempts <= 0 {
+		config.MaxPublishAttempts = 8
+	}
+	if config.PendingAbandonAfter <= 0 {
+		config.PendingAbandonAfter = 24 * time.Hour
 	}
 	config.IdempotencyPepper = append([]byte(nil), config.IdempotencyPepper...)
 	return &BundleService{repository: repository, store: store, config: config, now: time.Now}, nil
@@ -159,50 +206,103 @@ func (service *BundleService) Upload(ctx context.Context, tenantID, idempotencyK
 		if lookup.RequestHash != requestHash {
 			return BundleMetadata{}, false, ErrIdempotencyConflict
 		}
-		if !lookup.Ready {
-			objectKey := bundleObjectKey(tenantID, requestHash)
-			if err := service.store.Publish(ctx, objectKey, filename, written, requestHash); err != nil {
-				return BundleMetadata{}, false, fmt.Errorf("reconcile immutable bundle object: %w", err)
-			}
-			if err := service.repository.MarkBundleReady(ctx, tenantID, lookup.Metadata.BundleID, requestHash); err != nil {
-				return BundleMetadata{}, false, fmt.Errorf("mark reconciled immutable bundle ready: %w", err)
-			}
+		switch lookup.Status {
+		case BundlePublicationReady:
+			return lookup.Metadata, true, nil
 		}
-		return lookup.Metadata, true, nil
+		if !bundlePublicationNeedsFreshStaging(lookup.Status, lookup.StagingKey) {
+			if err := service.publishOwnedBundle(ctx, tenantID, lookup.Metadata, requestHash); err != nil {
+				return BundleMetadata{}, false, err
+			}
+			return lookup.Metadata, true, nil
+		}
 	}
 
 	digestHex := hex.EncodeToString(requestHash[:])
 	objectKey := bundleObjectKey(tenantID, requestHash)
+	uploadID, err := generateExternalID(service.config.Random)
+	if err != nil {
+		return BundleMetadata{}, false, err
+	}
 	bundleID, err := generateExternalID(service.config.Random)
 	if err != nil {
 		return BundleMetadata{}, false, err
 	}
+	stagingKey := stagingBundleObjectKey(tenantID, uploadID, requestHash)
+	if err := service.store.Stage(ctx, stagingKey, filename, written, requestHash); err != nil {
+		return BundleMetadata{}, false, fmt.Errorf("stage immutable bundle object: %w", err)
+	}
 	now := service.now().UTC()
 	result, err := service.repository.CommitBundleUpload(ctx, BundleCommitInput{
 		TenantID: tenantID, IdempotencyDigest: idempotencyDigest, RequestHash: requestHash,
-		ObjectKey: objectKey, ManifestJSON: manifestJSON,
+		ObjectKey: objectKey, StagingObjectKey: stagingKey, ManifestJSON: manifestJSON,
 		Metadata:             BundleMetadata{BundleID: bundleID, SHA256: digestHex, SizeBytes: written, CaseCount: len(manifest.Cases), ManifestVersion: manifest.SchemaVersion, CreatedAt: now},
 		IdempotencyExpiresAt: now.Add(service.config.IdempotencyTTL),
 	})
 	if err != nil {
+		if errors.Is(err, ErrIdempotencyConflict) || errors.Is(err, ErrBundleNotFound) {
+			_ = service.store.Discard(context.Background(), stagingKey)
+		}
 		return BundleMetadata{}, false, err
 	}
-	if !result.Ready {
-		// Ownership remains hidden until the complete object is atomically
-		// published. A failed publish is safely repaired by the same idempotent
-		// upload without ever exposing pending metadata or an unowned object.
-		if err := service.store.Publish(ctx, objectKey, filename, written, requestHash); err != nil {
-			return BundleMetadata{}, false, fmt.Errorf("publish owned immutable bundle object: %w", err)
-		}
-		if err := service.repository.MarkBundleReady(ctx, tenantID, result.Metadata.BundleID, requestHash); err != nil {
-			return BundleMetadata{}, false, fmt.Errorf("mark immutable bundle ready: %w", err)
-		}
+	if result.StagingKey != stagingKey {
+		_ = service.store.Discard(context.Background(), stagingKey)
+	}
+	if result.Status == BundlePublicationReady {
+		return result.Metadata, result.Replay, nil
+	}
+	if result.Status == BundlePublicationAbandoned {
+		return BundleMetadata{}, false, ErrBundleAbandoned
+	}
+	if err := service.publishOwnedBundle(ctx, tenantID, result.Metadata, requestHash); err != nil {
+		return BundleMetadata{}, false, err
 	}
 	return result.Metadata, result.Replay, nil
 }
 
+func (service *BundleService) publishOwnedBundle(ctx context.Context, tenantID string, metadata BundleMetadata, digest [sha256.Size]byte) error {
+	leaseToken, err := generateExternalID(service.config.Random)
+	if err != nil {
+		return err
+	}
+	now := service.now().UTC()
+	claim, claimed, err := service.repository.ClaimBundlePublication(ctx, tenantID, metadata.BundleID, leaseToken, now, now.Add(service.config.PublicationLease))
+	if err != nil {
+		return err
+	}
+	if !claimed {
+		if _, findErr := service.repository.FindBundle(ctx, tenantID, metadata.BundleID); findErr == nil {
+			return nil
+		}
+		return ErrBundlePublishing
+	}
+	if claim.RequestHash != digest {
+		return fmt.Errorf("claimed bundle digest does not match upload")
+	}
+	promotionContext, cancelPromotion := context.WithTimeout(ctx, service.config.PublicationLease/2)
+	defer cancelPromotion()
+	if err := service.store.Promote(promotionContext, claim.StagingKey, claim.ObjectKey, claim.SizeBytes, claim.RequestHash); err != nil {
+		nextAttempt := now.Add(service.config.PublicationRetry)
+		_, _ = service.repository.FailBundlePublication(context.Background(), claim, "OBJECT_PROMOTION_FAILED", nextAttempt, service.config.MaxPublishAttempts)
+		return fmt.Errorf("promote immutable bundle object: %w", err)
+	}
+	if err := service.repository.CompleteBundlePublication(ctx, claim, service.now().UTC()); err != nil {
+		return fmt.Errorf("complete immutable bundle publication: %w", err)
+	}
+	_ = service.store.Discard(context.Background(), claim.StagingKey)
+	return nil
+}
+
 func bundleObjectKey(tenantID string, digest [sha256.Size]byte) string {
 	return path.Join("external", tenantID, "sha256", hex.EncodeToString(digest[:])+".zip")
+}
+
+func stagingBundleObjectKey(tenantID, uploadID string, digest [sha256.Size]byte) string {
+	return path.Join("external", tenantID, "staging", uploadID, hex.EncodeToString(digest[:])+".zip")
+}
+
+func bundlePublicationNeedsFreshStaging(status BundlePublicationStatus, stagingKey string) bool {
+	return status == BundlePublicationAbandoned || stagingKey == ""
 }
 
 func (service *BundleService) Get(ctx context.Context, tenantID, bundleID string) (BundleMetadata, error) {

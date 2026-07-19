@@ -63,8 +63,14 @@ func TestEmbeddedMigrationsDefineTheCompleteJudgeOwnedSchema(t *testing.T) {
 	if strings.Contains(sql, "source_code") || strings.Contains(sql, "api_key_plaintext") || strings.Contains(sql, "callback_secret_plaintext") {
 		t.Fatal("migration must not persist source or credential plaintext")
 	}
-	if !strings.Contains(strings.ToLower(migrations[1].SQL), "ready_at") {
-		t.Fatal("bundle readiness migration is missing ready_at")
+	publicationSQL := strings.ToLower(migrations[1].SQL)
+	for _, contract := range []string{"publication_status", "staging_object_key", "publish_lease_token", "publish_lease_until", "publish_attempt_count", "publish_next_attempt_at", "publish_last_error_code", "publish_abandoned_at", "ready_at"} {
+		if !strings.Contains(publicationSQL, contract) {
+			t.Errorf("bundle publication migration is missing %s", contract)
+		}
+	}
+	if strings.Contains(publicationSQL, "update t_external_bundle") || strings.Contains(publicationSQL, "set ready_at = created_at") {
+		t.Fatal("legacy bundle rows must not be promoted to READY without remote verification")
 	}
 }
 
@@ -113,8 +119,8 @@ func TestApplyMigrationsUsesAnAdvisoryLockAndRecordsChecksums(t *testing.T) {
 	if !connection.locked || !connection.released {
 		t.Fatalf("migration lock lifecycle: locked=%v released=%v", connection.locked, connection.released)
 	}
-	if len(connection.executions) != 14 {
-		t.Fatalf("executions = %d, want history DDL + 9 schema DDL + ready migration DDL/backfill + two history inserts", len(connection.executions))
+	if len(connection.executions) != 13 {
+		t.Fatalf("executions = %d, want history DDL + 9 schema DDL + publication migration DDL + two history inserts", len(connection.executions))
 	}
 	if !strings.Contains(strings.ToLower(connection.executions[0].query), "create table if not exists t_judge_schema_history") {
 		t.Fatalf("first execution = %s", connection.executions[0].query)

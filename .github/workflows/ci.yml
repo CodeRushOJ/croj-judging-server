@@ -40,3 +40,34 @@ jobs:
         run: CGO_ENABLED=0 go build -trimpath -o /tmp/judging-server ./cmd
       - name: Build container image
         run: docker build -t coderushoj/judging-server:ci .
+
+  mysql84-bundle-integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      mysql:
+        image: mysql@sha256:c592c15aaf4a1961e15d82eb31ea5987dda862d1c4b1e93424438c0e91dc1f8d
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+          MYSQL_DATABASE: croj_bundle_ci
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot --silent"
+          --health-interval=2s
+          --health-timeout=5s
+          --health-retries=30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: 1.26.3
+          cache: true
+      - name: Run immutable bundle integration on MySQL 8.4
+        env:
+          EXTERNAL_JUDGE_MYSQL_TEST_DSN: root:@tcp(127.0.0.1:3306)/croj_bundle_ci?parseTime=true&multiStatements=true
+        run: go test -race -count=1 -run '^TestExternalBundleSQLRepositoryIntegration$' ./internal/integration
+      - name: Verify bundle MySQL CI contract
+        run: bash scripts/ci/test-bundle-mysql84-contract.sh

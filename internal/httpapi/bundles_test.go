@@ -186,13 +186,15 @@ func TestBundleUploadBoundsTheWholeMultipartEnvelope(t *testing.T) {
 
 func TestBundleUploadMapsBoundedAndIdempotencyFailures(t *testing.T) {
 	for name, test := range map[string]struct {
-		err  error
-		want int
+		err       error
+		want      int
+		wantRetry bool
 	}{
 		"too large":         {err: external.ErrBundleTooLarge, want: http.StatusRequestEntityTooLarge},
 		"invalid ZIP":       {err: external.ErrInvalidBundle, want: http.StatusBadRequest},
 		"key conflict":      {err: external.ErrIdempotencyConflict, want: http.StatusConflict},
 		"store unavailable": {err: errors.New("minio unavailable"), want: http.StatusServiceUnavailable},
+		"publishing":        {err: external.ErrBundlePublishing, want: http.StatusServiceUnavailable, wantRetry: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			application := &bundleApplicationStub{err: test.err}
@@ -205,6 +207,9 @@ func TestBundleUploadMapsBoundedAndIdempotencyFailures(t *testing.T) {
 			server.ServeHTTP(response, request)
 			if response.Code != test.want || !strings.Contains(response.Header().Get("Content-Type"), "application/problem+json") {
 				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			if test.wantRetry && response.Header().Get("Retry-After") == "" {
+				t.Fatal("retryable publication response omitted Retry-After")
 			}
 		})
 	}
