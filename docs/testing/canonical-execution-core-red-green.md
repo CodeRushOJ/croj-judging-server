@@ -124,3 +124,19 @@ ok github.com/CodeRushOJ/croj-judging-server/internal/external 0.169s
 $ go test -count=1 -run '^TestExternalBundleSQLRepositoryIntegration/tenant_and_platform_execution_ceilings_reject_before_publication$' ./internal/integration
 ok github.com/CodeRushOJ/croj-judging-server/internal/integration 4.850s
 ```
+
+## Continued-case aggregation review regression
+
+An Important review gap had a focused RED: with `stopOnFailure=false`, validation accepted two ordered case events but aggregation returned after the first WA and dropped the later AC.
+
+```text
+$ go test ./internal/service -run TestBatchBundlePipelineKeepsOrderedResultsWhenStopOnFailureIsDisabled -count=1
+--- FAIL: TestBatchBundlePipelineKeepsOrderedResultsWhenStopOnFailureIsDisabled
+    canonical result = {Status:WRONG_ANSWER ... Cases:[{CaseID:case-1 Status:WRONG_ANSWER ...}]}
+FAIL
+
+$ go test ./internal/service -run 'TestBatchBundlePipeline(CanonicalRequestUsesBundleLimitsAndStopPolicy|KeepsOrderedResultsWhenStopOnFailureIsDisabled|SendsAllCasesInOneCompileOnceRequest)' -count=1
+ok github.com/CodeRushOJ/croj-judging-server/internal/service 0.031s
+```
+
+Aggregation now retains every executed ordered case and preserves the first failing verdict as the overall result.

@@ -303,8 +303,10 @@ func aggregateBatchResult(
 		}
 		result.TimeUsedMillis = max(result.TimeUsedMillis, boundedMetric(event.Result.TimeUsed, 86_400_000))
 		result.MemoryUsedKB = max(result.MemoryUsedKB, boundedMetric(event.Result.MemoryUsed, 2_147_483_647))
-		result.ExitCode = int(event.Result.ExitCode)
-		result.Status = caseStatus
+		if result.Status == callback.StatusAccepted && caseStatus != callback.StatusAccepted {
+			result.Status = caseStatus
+			result.ExitCode = int(event.Result.ExitCode)
+		}
 		result.Cases = append(result.Cases, CanonicalCaseResult{
 			CaseID: event.CaseId, Status: caseStatus,
 			TimeUsedMillis: boundedMetric(event.Result.TimeUsed, 86_400_000),
@@ -315,11 +317,10 @@ func aggregateBatchResult(
 		if caseStatus == callback.StatusCompileError {
 			result.CompileError = "compilation failed; diagnostics redacted"
 		}
-		if caseStatus != callback.StatusAccepted {
-			return result
-		}
 	}
-	result.ExitCode = 0
+	if result.Status == callback.StatusAccepted {
+		result.ExitCode = 0
+	}
 	return result
 }
 
