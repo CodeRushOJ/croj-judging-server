@@ -38,7 +38,7 @@ func (reader *countingReader) Read(buffer []byte) (int, error) {
 	return count, err
 }
 
-func (application *bundleApplicationStub) Upload(_ context.Context, tenantID, key string, reader io.Reader) (external.BundleMetadata, bool, error) {
+func (application *bundleApplicationStub) UploadWithAdmission(ctx context.Context, tenantID, key string, reader io.Reader, admit external.BundleUploadAdmission) (external.BundleMetadata, bool, error) {
 	application.calls++
 	application.tenantID = tenantID
 	application.key = key
@@ -47,6 +47,9 @@ func (application *bundleApplicationStub) Upload(_ context.Context, tenantID, ke
 		return external.BundleMetadata{}, false, err
 	}
 	application.uploaded = data
+	if err := admit(ctx, int64(len(data))); err != nil {
+		return external.BundleMetadata{}, false, err
+	}
 	return application.metadata, application.replay, application.err
 }
 
@@ -94,6 +97,46 @@ func TestBundleUploadReplayReturns200(t *testing.T) {
 	server.ServeHTTP(response, request)
 	if response.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestBundleUploadChargesActualStreamedFileBytes(t *testing.T) {
+	application := &bundleApplicationStub{metadata: testBundleMetadata()}
+	quota := &writeQuotaStub{decision: external.QuotaDecision{Allowed: true}}
+	server := newBundleQuotaTestServer(t, application, quota)
+	body, contentType := multipartBody(t, []multipartValue{{name: "bundle", filename: "tests.zip", body: []byte("exact-bundle-bytes")}})
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/bundles", bytes.NewReader(body))
+	request.Header.Set("Content-Type", contentType)
+	request.Header.Set("Idempotency-Key", "upload-key-00001")
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated || quota.calls != 1 || quota.request.Kind != external.QuotaBundleUploadBytes || quota.request.Cost != int64(len("exact-bundle-bytes")) {
+		t.Fatalf("status=%d quotaCalls=%d request=%+v body=%s", response.Code, quota.calls, quota.request, response.Body.String())
+	}
+}
+
+func TestBundleUploadFailsClosedOnByteQuota(t *testing.T) {
+	for name, quota := range map[string]*writeQuotaStub{
+		"exceeded":    {decision: external.QuotaDecision{Allowed: false, RetryAfter: 1500 * time.Millisecond}},
+		"unavailable": {err: external.ErrQuotaUnavailable},
+	} {
+		t.Run(name, func(t *testing.T) {
+			application := &bundleApplicationStub{metadata: testBundleMetadata()}
+			server := newBundleQuotaTestServer(t, application, quota)
+			body, contentType := multipartBody(t, []multipartValue{{name: "bundle", filename: "tests.zip", body: []byte("zip")}})
+			request := httptest.NewRequest(http.MethodPost, "/api/v1/bundles", bytes.NewReader(body))
+			request.Header.Set("Content-Type", contentType)
+			request.Header.Set("Idempotency-Key", "upload-key-00001")
+			response := httptest.NewRecorder()
+			server.ServeHTTP(response, request)
+			want := http.StatusTooManyRequests
+			if name == "unavailable" {
+				want = http.StatusServiceUnavailable
+			}
+			if response.Code != want || response.Header().Get("Retry-After") == "" || len(application.uploaded) == 0 {
+				t.Fatalf("status=%d headers=%v uploaded=%d body=%s", response.Code, response.Header(), len(application.uploaded), response.Body.String())
+			}
+		})
 	}
 }
 
@@ -166,7 +209,9 @@ func TestBundleUploadBoundsTheWholeMultipartEnvelope(t *testing.T) {
 	application := &bundleApplicationStub{metadata: testBundleMetadata()}
 	capabilities := testCapabilities()
 	capabilities.Limits.MaxBundleBytes = 64
-	server, err := NewServer(staticAuthenticator{principal: Principal{TenantID: "tenant-7", scopes: map[Scope]struct{}{ScopeBundleWrite: {}}}}, capabilities, WithBundleApplication(application))
+	quota := &writeQuotaStub{decision: external.QuotaDecision{Allowed: true}}
+	server, err := NewServer(staticAuthenticator{principal: Principal{TenantID: "tenant-7", scopes: map[Scope]struct{}{ScopeBundleWrite: {}}}}, capabilities,
+		WithBundleApplication(application), WithBundleWriteQuota(quota, external.QuotaLimit{Capacity: 64, RefillPeriod: time.Minute}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,7 +287,21 @@ func TestBundleEndpointsRequireTheirOwnScopes(t *testing.T) {
 
 func newBundleTestServer(t *testing.T, scope Scope, application BundleApplication) *Server {
 	t.Helper()
-	server, err := NewServer(staticAuthenticator{principal: Principal{TenantID: "tenant-7", scopes: map[Scope]struct{}{scope: {}}}}, testCapabilities(), WithBundleApplication(application))
+	capabilities := testCapabilities()
+	quota := &writeQuotaStub{decision: external.QuotaDecision{Allowed: true}}
+	server, err := NewServer(staticAuthenticator{principal: Principal{TenantID: "tenant-7", scopes: map[Scope]struct{}{scope: {}}}}, capabilities,
+		WithBundleApplication(application), WithBundleWriteQuota(quota, external.QuotaLimit{Capacity: capabilities.Limits.MaxBundleBytes, RefillPeriod: time.Minute}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return server
+}
+
+func newBundleQuotaTestServer(t *testing.T, application BundleApplication, quota external.Quota) *Server {
+	t.Helper()
+	capabilities := testCapabilities()
+	server, err := NewServer(staticAuthenticator{principal: Principal{TenantID: "tenant-7", scopes: map[Scope]struct{}{ScopeBundleWrite: {}}}}, capabilities,
+		WithBundleApplication(application), WithBundleWriteQuota(quota, external.QuotaLimit{Capacity: capabilities.Limits.MaxBundleBytes, RefillPeriod: time.Minute}))
 	if err != nil {
 		t.Fatal(err)
 	}

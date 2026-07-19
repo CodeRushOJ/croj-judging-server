@@ -93,6 +93,8 @@ type BundleRepository interface {
 	FindBundle(context.Context, string, string) (BundleMetadata, error)
 }
 
+type BundleUploadAdmission func(context.Context, int64) error
+
 type BundleServiceConfig struct {
 	TempDir             string
 	MaxUploadBytes      int64
@@ -151,6 +153,10 @@ func NewBundleService(repository BundleRepository, store BundleObjectStore, conf
 }
 
 func (service *BundleService) Upload(ctx context.Context, tenantID, idempotencyKey string, source io.Reader) (BundleMetadata, bool, error) {
+	return service.UploadWithAdmission(ctx, tenantID, idempotencyKey, source, nil)
+}
+
+func (service *BundleService) UploadWithAdmission(ctx context.Context, tenantID, idempotencyKey string, source io.Reader, admit BundleUploadAdmission) (BundleMetadata, bool, error) {
 	if service == nil || source == nil || !externalIDPattern.MatchString(tenantID) {
 		return BundleMetadata{}, false, fmt.Errorf("%w: tenant and bundle stream are required", ErrInvalidBundle)
 	}
@@ -183,6 +189,11 @@ func (service *BundleService) Upload(ctx context.Context, tenantID, idempotencyK
 	}
 	if written == 0 {
 		return BundleMetadata{}, false, fmt.Errorf("%w: upload is empty", ErrInvalidBundle)
+	}
+	if admit != nil {
+		if err := admit(ctx, written); err != nil {
+			return BundleMetadata{}, false, err
+		}
 	}
 	if err := staged.Close(); err != nil {
 		return BundleMetadata{}, false, fmt.Errorf("close bundle staging file: %w", err)

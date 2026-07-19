@@ -19,12 +19,14 @@ type RequestAuthenticator interface {
 }
 
 type Server struct {
-	authenticator RequestAuthenticator
-	capabilities  Capabilities
-	jobs          JobService
-	jobWriteQuota external.Quota
-	jobWriteLimit external.QuotaLimit
-	bundles       BundleApplication
+	authenticator    RequestAuthenticator
+	capabilities     Capabilities
+	jobs             JobService
+	jobWriteQuota    external.Quota
+	jobWriteLimit    external.QuotaLimit
+	bundles          BundleApplication
+	bundleWriteQuota external.Quota
+	bundleWriteLimit external.QuotaLimit
 }
 
 func WithJobWriteQuota(quota external.Quota, jobSubmitLimit external.QuotaLimit) ServerOption {
@@ -71,6 +73,12 @@ func NewServer(authenticator RequestAuthenticator, capabilities Capabilities, op
 	}
 	if server.jobs != nil && server.jobWriteQuota == nil {
 		return nil, fmt.Errorf("write quota is required when the job service is enabled")
+	}
+	if server.bundles != nil && server.bundleWriteQuota == nil {
+		return nil, fmt.Errorf("bundle write quota is required when bundle uploads are enabled")
+	}
+	if server.bundles != nil && server.bundleWriteLimit.Capacity < capabilities.Limits.MaxBundleBytes {
+		return nil, fmt.Errorf("bundle write quota capacity must cover the maximum bundle size")
 	}
 	return server, nil
 }
