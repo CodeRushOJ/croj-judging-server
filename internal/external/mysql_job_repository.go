@@ -61,8 +61,9 @@ func (repository *MySQLJobRepository) Submit(
 	tenantExternalID string,
 	idempotencyKey string,
 	request JudgeJobRequest,
+	admit func() error,
 ) (SubmitJobResult, error) {
-	if repository == nil || !externalIDPattern.MatchString(tenantExternalID) {
+	if repository == nil || admit == nil || !externalIDPattern.MatchString(tenantExternalID) {
 		return SubmitJobResult{}, ErrExternalJobInvalid
 	}
 	keyDigest, err := DigestIdempotencyKey(idempotencyKey, repository.idempotencyPepper)
@@ -185,7 +186,7 @@ WHERE object_key = ? AND owner_token = ?`, sourceObjectKey, reservationToken); e
 	var bundleInternalID uint64
 	if err := tx.QueryRowContext(ctx, `
 SELECT id FROM t_external_bundle
-WHERE tenant_id = ? AND external_id = ? AND ready_at IS NOT NULL
+WHERE tenant_id = ? AND external_id = ? AND publication_status = 'READY' AND ready_at IS NOT NULL
   AND delete_marked_at IS NULL AND deleted_at IS NULL`,
 		tenantInternalID, request.BundleID).Scan(&bundleInternalID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -206,6 +207,9 @@ WHERE tenant_id = ? AND external_id = ? AND disabled_at IS NULL`,
 			return SubmitJobResult{}, repositoryUnavailable("read tenant callback", err)
 		}
 		callbackInternalID = sql.NullInt64{Int64: callbackID, Valid: true}
+	}
+	if err := admit(); err != nil {
+		return SubmitJobResult{}, err
 	}
 
 	objectMayExist = true
