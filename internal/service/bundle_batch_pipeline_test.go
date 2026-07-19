@@ -8,9 +8,11 @@ import (
 
 	"github.com/CodeRushOJ/croj-judging-server/internal/bundle"
 	"github.com/CodeRushOJ/croj-judging-server/internal/callback"
+	judgesandbox "github.com/CodeRushOJ/croj-judging-server/internal/sandbox"
 	sandboxpb "github.com/CodeRushOJ/croj-judging-server/proto"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 type batchExecutorStub struct {
@@ -25,6 +27,16 @@ type sequenceBatchExecutor struct {
 	errors    []error
 	requests  []*sandboxpb.ExecuteBatchV1Request
 	addresses []string
+}
+
+type countingArtifact struct {
+	*memoryArtifact
+	reads int
+}
+
+func (artifact *countingArtifact) ReadCase(testCase bundle.Case) (string, string, error) {
+	artifact.reads++
+	return artifact.memoryArtifact.ReadCase(testCase)
 }
 
 func (executor *sequenceBatchExecutor) ExecuteBatch(_ context.Context, address string, request *sandboxpb.ExecuteBatchV1Request) ([]*sandboxpb.ExecuteBatchV1Event, error) {
@@ -60,6 +72,27 @@ func TestBatchBundlePipelineRejectsOversizedBatchBeforeSandbox(t *testing.T) {
 	}
 }
 
+func TestBatchBundlePipelineStopsReadingCasesWhenWireLimitIsCrossed(t *testing.T) {
+	artifact := &countingArtifact{memoryArtifact: exactArtifact(3)}
+	executor := &batchExecutorStub{}
+	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a"}}, executor, 1)
+	pipeline.maxRequestBytes = proto.Size(&sandboxpb.ExecuteBatchV1Request{
+		Language:      validBundleSubmission().Language,
+		SourceCode:    validBundleSubmission().Code,
+		Timeout:       timeoutSeconds(validExecutionConfig().TimeLimitMillis),
+		MemoryLimit:   boundedInt32(validExecutionConfig().MemoryLimitMB),
+		StopOnFailure: true,
+	})
+
+	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validExecutionConfig(), artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != callback.StatusSystemError || artifact.reads != 1 || len(executor.requests) != 0 {
+		t.Fatalf("result=%+v reads=%d sandbox calls=%d", result, artifact.reads, len(executor.requests))
+	}
+}
+
 func (executor *batchExecutorStub) ExecuteBatch(
 	_ context.Context,
 	address string,
@@ -72,6 +105,18 @@ func (executor *batchExecutorStub) ExecuteBatch(
 
 func TestBatchBundlePipelineDoesNotRetryMalformedCompletedStream(t *testing.T) {
 	executor := &sequenceBatchExecutor{eventSets: [][]*sandboxpb.ExecuteBatchV1Event{nil, nil}}
+	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a", "sandbox-b"}}, executor, 2)
+	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validExecutionConfig(), exactArtifact(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != callback.StatusSystemError || len(executor.requests) != 1 {
+		t.Fatalf("result=%+v sandbox calls=%d, want deterministic failure without retry", result, len(executor.requests))
+	}
+}
+
+func TestBatchBundlePipelineDoesNotRetryClientRejectedStream(t *testing.T) {
+	executor := &sequenceBatchExecutor{errors: []error{judgesandbox.ErrInvalidBatchStream, nil}}
 	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a", "sandbox-b"}}, executor, 2)
 	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validExecutionConfig(), exactArtifact(1))
 	if err != nil {
@@ -135,6 +180,19 @@ func TestBatchBundlePipelinePreservesRetryableCodeAfterEndpointExhaustion(t *tes
 	_, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validExecutionConfig(), exactArtifact(1))
 	if status.Code(err) != codes.Unavailable {
 		t.Fatalf("error = %v, want Unavailable", err)
+	}
+}
+
+func TestBatchBundlePipelineNeverRetriesSameEndpointInOneAttempt(t *testing.T) {
+	executor := &sequenceBatchExecutor{errors: []error{
+		status.Error(codes.Unavailable, "gone"),
+		status.Error(codes.Unavailable, "gone"),
+		status.Error(codes.Unavailable, "gone"),
+	}}
+	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a"}}, executor, 3)
+	_, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validExecutionConfig(), exactArtifact(1))
+	if status.Code(err) != codes.Unavailable || len(executor.requests) != 1 {
+		t.Fatalf("error=%v sandbox calls=%d, want one attempt and preserved Unavailable", err, len(executor.requests))
 	}
 }
 

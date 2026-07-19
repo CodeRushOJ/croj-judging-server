@@ -28,6 +28,19 @@ func (selector *sequenceSelector) SelectSandbox() (string, error) {
 	return endpoint, nil
 }
 
+func (selector *sequenceSelector) SelectSandboxExcluding(excluded map[string]struct{}) (string, error) {
+	for range len(selector.endpoints) {
+		endpoint, err := selector.SelectSandbox()
+		if err != nil {
+			return "", err
+		}
+		if _, skip := excluded[endpoint]; !skip {
+			return endpoint, nil
+		}
+	}
+	return "", errors.New("no untried endpoint")
+}
+
 type sequenceExecutor struct {
 	responses []*sandboxpb.ExecuteResponse
 	errors    []error

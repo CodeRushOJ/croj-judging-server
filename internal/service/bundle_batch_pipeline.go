@@ -5,11 +5,13 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/CodeRushOJ/croj-judging-server/internal/bundle"
 	"github.com/CodeRushOJ/croj-judging-server/internal/callback"
+	judgesandbox "github.com/CodeRushOJ/croj-judging-server/internal/sandbox"
 	"github.com/CodeRushOJ/croj-judging-server/pkg/model"
 	sandboxpb "github.com/CodeRushOJ/croj-judging-server/proto"
 	"google.golang.org/grpc/codes"
@@ -21,6 +23,10 @@ type SandboxBatchExecutor interface {
 	ExecuteBatch(context.Context, string, *sandboxpb.ExecuteBatchV1Request) ([]*sandboxpb.ExecuteBatchV1Event, error)
 }
 
+type SandboxExcludingSelector interface {
+	SelectSandboxExcluding(map[string]struct{}) (string, error)
+}
+
 const maxSandboxBatchCasesV1 = 256
 const maxSandboxBatchRequestBytesV1 = 64 << 20
 
@@ -28,13 +34,19 @@ type BatchBundlePipeline struct {
 	selector         SandboxSelector
 	executor         SandboxBatchExecutor
 	maxInfraAttempts int
+	maxRequestBytes  int
 }
 
 func NewBatchBundlePipeline(selector SandboxSelector, executor SandboxBatchExecutor, maxInfraAttempts int) *BatchBundlePipeline {
 	if maxInfraAttempts <= 0 {
 		maxInfraAttempts = 3
 	}
-	return &BatchBundlePipeline{selector: selector, executor: executor, maxInfraAttempts: maxInfraAttempts}
+	return &BatchBundlePipeline{
+		selector:         selector,
+		executor:         executor,
+		maxInfraAttempts: maxInfraAttempts,
+		maxRequestBytes:  maxSandboxBatchRequestBytesV1,
+	}
 }
 
 func (pipeline *BatchBundlePipeline) ExecuteArtifact(
@@ -61,6 +73,13 @@ func (pipeline *BatchBundlePipeline) ExecuteArtifact(
 		StopOnFailure: true,
 		Cases:         make([]*sandboxpb.ExecuteBatchV1Case, 0, len(manifest.Cases)),
 	}
+	maxRequestBytes := pipeline.maxRequestBytes
+	if maxRequestBytes <= 0 {
+		maxRequestBytes = maxSandboxBatchRequestBytesV1
+	}
+	if proto.Size(request) > maxRequestBytes {
+		return systemErrorResult("submission exceeds sandbox batch byte limit"), nil
+	}
 	expectedOutputs := make([]string, 0, len(manifest.Cases))
 	for _, testCase := range manifest.Cases {
 		input, expected, err := artifact.ReadCase(testCase)
@@ -82,9 +101,9 @@ func (pipeline *BatchBundlePipeline) ExecuteArtifact(
 			CompareOutput:       manifest.Checker == bundle.CheckerExact,
 			TokenExpectedSha256: expectedTokenSHA256,
 		})
-	}
-	if proto.Size(request) > maxSandboxBatchRequestBytesV1 {
-		return systemErrorResult("bundle exceeds sandbox batch byte limit"), nil
+		if proto.Size(request) > maxRequestBytes {
+			return systemErrorResult("bundle exceeds sandbox batch byte limit"), nil
+		}
 	}
 	events, invalidResponse, err := pipeline.executeBatch(ctx, request)
 	if err != nil {
@@ -101,13 +120,21 @@ func (pipeline *BatchBundlePipeline) executeBatch(
 	request *sandboxpb.ExecuteBatchV1Request,
 ) ([]*sandboxpb.ExecuteBatchV1Event, bool, error) {
 	var lastRetryable error
+	attempted := make(map[string]struct{}, pipeline.maxInfraAttempts)
 	for attempt := 0; attempt < pipeline.maxInfraAttempts; attempt++ {
-		address, err := pipeline.selector.SelectSandbox()
+		address, err := pipeline.selectUntriedSandbox(attempted)
 		if err != nil {
+			if lastRetryable != nil {
+				return nil, false, fmt.Errorf("execute sandbox batch after %d distinct endpoint attempts: %w", len(attempted), lastRetryable)
+			}
 			return nil, false, fmt.Errorf("select sandbox: %w", err)
 		}
+		attempted[address] = struct{}{}
 		events, err := pipeline.executor.ExecuteBatch(ctx, address, request)
 		if err != nil {
+			if errors.Is(err, judgesandbox.ErrInvalidBatchStream) {
+				return nil, true, nil
+			}
 			code := status.Code(err)
 			if code == codes.Unavailable || code == codes.ResourceExhausted {
 				lastRetryable = err
@@ -124,6 +151,20 @@ func (pipeline *BatchBundlePipeline) executeBatch(
 		return nil, false, fmt.Errorf("execute sandbox batch after %d endpoint attempts: %w", pipeline.maxInfraAttempts, lastRetryable)
 	}
 	return nil, true, nil
+}
+
+func (pipeline *BatchBundlePipeline) selectUntriedSandbox(attempted map[string]struct{}) (string, error) {
+	if selector, ok := pipeline.selector.(SandboxExcludingSelector); ok {
+		return selector.SelectSandboxExcluding(attempted)
+	}
+	address, err := pipeline.selector.SelectSandbox()
+	if err != nil {
+		return "", err
+	}
+	if _, duplicate := attempted[address]; duplicate {
+		return "", fmt.Errorf("selector returned an already attempted sandbox endpoint")
+	}
+	return address, nil
 }
 
 func tokenOutputSHA256(output string) string {
