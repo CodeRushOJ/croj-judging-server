@@ -4,6 +4,8 @@ Go 判题编排服务，负责消费 `submission-topic`、读取提交快照、�
 
 > 当前状态：Kubernetes EndpointSlice 发现、版本化消息、认证幂等结果回调和不可变 ACM 隐藏测试包链路已经接通。上线 exact checker 前必须先合入 [`croj-sandbox#10`](https://github.com/CodeRushOJ/croj-sandbox/issues/10) 的日志脱敏修复，否则旧 sandbox 会把 WA 的 expected/actual 写入 Pod 日志。
 
+面向外部 OJ 的版本化异步 REST 适配器正在 Draft PR #17 中实施。已有切片包括 RFC 9457 错误、请求 ID、不透明 API Key 的 peppered HMAC 验证与 scope、`GET /api/v1/capabilities`、Judge 自有 MySQL 迁移以及租户/密钥预置基础。在 job lease、bundle upload、webhook 和 E2E 门禁完成前，该 HTTP 端口不标记为可发布。
+
 ## 架构
 
 ```mermaid
@@ -125,6 +127,26 @@ docker run --rm \
   -w /workspace golang:1.26.3 \
   sh -c 'go vet ./... && CGO_ENABLED=0 go build -trimpath -o /tmp/judging-server ./cmd'
 ```
+
+## 外部 OJ 租户预置（开发中）
+
+`judge-admin` 使用与运行时相同的不可变迁移和仓储，新 API Key 只在标准输出显示一次；MySQL 只保留 lookup prefix 和 `HMAC-SHA256(pepper, full-key)`。不要把 DSN、pepper 或输出的 key 写入仓库、shell history 或日志。
+
+```bash
+export JUDGE_DATABASE_DSN='judge_admin:...@tcp(127.0.0.1:3306)/coderushoj_judge?parseTime=true&charset=utf8mb4'
+export JUDGE_API_KEY_PEPPER_B64="$(openssl rand -base64 32)"
+
+go run ./cmd/judge-admin tenant create \
+  --name 'Example OJ' --max-queued 100 --max-running 4 \
+  --max-source-bytes 1048576 --max-bundles 200 \
+  --daily-execution-ms 3600000 --max-infra-tries 3
+
+go run ./cmd/judge-admin api-key create \
+  --tenant '<26-character-tenant-id>' \
+  --scopes 'capabilities:read,bundle:write,bundle:read,job:submit,job:read,job:cancel'
+```
+
+在 Kubernetes 中，DSN 和 pepper 必须来自 Secret；上面的 `export` 只是本机演示。建立租户时会执行 Judge 自有 schema 迁移，通过 MySQL advisory lock 串行化并验证已发布迁移的 SHA-256；不会修改 Backend 的 Flyway history。
 
 ## 构建镜像
 
