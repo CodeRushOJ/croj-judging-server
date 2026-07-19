@@ -7,8 +7,8 @@
 ### Added
 
 - 增加唯一 canonical language/checker registry；外部 REST 在持久化前拒绝不受 Sandbox 支持的 ID，capabilities、OpenAPI、bundle 与 compile-once gRPC 使用一致标识。
-- 增加 MySQL `CURRENT_DATE` 日执行额度账本、attempt 原子预留/实际结算/失败释放与 lease 崩溃恢复；tenant claim 使用持久公平游标和 `SKIP LOCKED`。
-- 增加终态 job/加密源码两阶段 retention：引用检查、delete token fencing、对象删除重试、独立审计和 schema v6 postcondition。
+- 增加 MySQL `CURRENT_DATE` 日执行额度账本、attempt 原子预留、case 耗时安全求和、失败释放与 lease 崩溃恢复；tenant claim 使用持久公平游标和 `SKIP LOCKED`，永久不可满足的 reservation 稳定终态失败。
+- 增加终态 job/加密源码两阶段 retention：有界幂等清理、tenant→job→source 锁序、持久 delete lease/retry-at、对象删除重试、独立审计和完整 schema v6 postcondition。
 - 增加 HTTP header/read/write/idle timeout、bundle 上传并发上限，以及轮询 `failureCode` 合约。
 
 - 增加 RocketMQ 与 durable REST worker 共用的 canonical compile-once batch execution core，按顺序保留 case 结果并统一 AC/WA/CE/TLE/MLE/RE/SE 映射。
@@ -74,6 +74,7 @@
 
 ### Fixed
 
+- bundle 上传默认 read/write deadline 从不兼容 512 MiB 上限的 30 秒调整为 15/20 分钟；启动时按最低 1 MiB/s、2 分钟 framing 余量和 5 分钟发布响应余量校验，防止对象已提交但客户端收到 EOF 后重试。
 - 正常结束但事件畸形的 batch 流不再换 Endpoint 重编译，只将传输层 `Unavailable`/`ResourceExhausted` 视为可切换容量故障
 - token checker 读取 expected 后只保留规范化 SHA-256，在 sandbox 内恢复首错早停，并在 judging 侧用同一 hash-only 规则复核
 - batch 客户端显式设置有界 64 MiB 收发上限，配合 sandbox 有界编译诊断避免大响应被误判为容量重试

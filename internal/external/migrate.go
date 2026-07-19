@@ -312,6 +312,12 @@ const executionAccountingRetentionValidationSQL = `SELECT
         WHERE table_schema = DATABASE() AND table_name = 't_external_tenant'
           AND column_name = 'last_claimed_at' AND column_type = 'datetime(3)' AND is_nullable = 'YES'
     )
+    AND COALESCE((
+        SELECT GROUP_CONCAT(column_name ORDER BY seq_in_index SEPARATOR ',')
+        FROM information_schema.statistics
+        WHERE table_schema = DATABASE() AND table_name = 't_external_tenant'
+          AND index_name = 'idx_external_tenant_fair_claim'
+    ), '') = 'status,last_claimed_at,id'
     AND EXISTS (
         SELECT 1 FROM information_schema.tables
         WHERE table_schema = DATABASE() AND table_name = 't_external_execution_daily' AND engine = 'InnoDB'
@@ -338,14 +344,89 @@ const executionAccountingRetentionValidationSQL = `SELECT
           AND column_name = 'consumed_execution_millis' AND column_type = 'bigint unsigned' AND is_nullable = 'NO'
     )
     AND EXISTS (
+        SELECT 1
+        FROM information_schema.table_constraints AS table_constraint
+        JOIN information_schema.check_constraints AS check_constraint
+          ON check_constraint.constraint_schema = table_constraint.constraint_schema
+         AND check_constraint.constraint_name = table_constraint.constraint_name
+        WHERE table_constraint.constraint_schema = DATABASE()
+          AND table_constraint.table_name = 't_external_job_attempt'
+          AND table_constraint.constraint_type = 'CHECK'
+          AND table_constraint.constraint_name = 'chk_external_attempt_accounting'
+          AND table_constraint.enforced = 'YES'
+          AND REPLACE(REPLACE(LOWER(check_constraint.check_clause), CHAR(96), ''), CHAR(92), '') =
+              '(((status = _utf8mb4''running'') and (accounting_day is not null) and (reserved_execution_millis > 0) and (consumed_execution_millis = 0)) or ((status <> _utf8mb4''running'') and (reserved_execution_millis = 0)))'
+    )
+    AND COALESCE((
+        SELECT GROUP_CONCAT(column_name ORDER BY seq_in_index SEPARATOR ',')
+        FROM information_schema.statistics
+        WHERE table_schema = DATABASE() AND table_name = 't_external_job'
+          AND index_name = 'idx_external_job_retention'
+    ), '') = 'status,completed_at,id'
+    AND EXISTS (
         SELECT 1 FROM information_schema.columns
         WHERE table_schema = DATABASE() AND table_name = 't_external_source_object'
           AND column_name = 'delete_token' AND column_type = 'binary(32)' AND is_nullable = 'YES'
     )
     AND EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = DATABASE() AND table_name = 't_external_source_object'
+          AND column_name = 'delete_lease_until' AND column_type = 'datetime(3)' AND is_nullable = 'YES'
+    )
+    AND EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = DATABASE() AND table_name = 't_external_source_object'
+          AND column_name = 'delete_next_attempt_at' AND column_type = 'datetime(3)' AND is_nullable = 'YES'
+    )
+    AND EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = DATABASE() AND table_name = 't_external_source_object'
+          AND column_name = 'delete_attempt_count' AND column_type = 'int unsigned' AND is_nullable = 'NO'
+    )
+    AND EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = DATABASE() AND table_name = 't_external_source_object'
+          AND column_name = 'delete_last_error_code' AND column_type = 'varchar(64)'
+          AND character_set_name = 'ascii' AND collation_name = 'ascii_bin' AND is_nullable = 'YES'
+    )
+    AND COALESCE((
+        SELECT GROUP_CONCAT(column_name ORDER BY seq_in_index SEPARATOR ',')
+        FROM information_schema.statistics
+        WHERE table_schema = DATABASE() AND table_name = 't_external_source_object'
+          AND index_name = 'idx_external_source_delete'
+    ), '') = 'delete_next_attempt_at,delete_lease_until,deleted_at,id'
+    AND EXISTS (
+        SELECT 1
+        FROM information_schema.table_constraints AS table_constraint
+        JOIN information_schema.check_constraints AS check_constraint
+          ON check_constraint.constraint_schema = table_constraint.constraint_schema
+         AND check_constraint.constraint_name = table_constraint.constraint_name
+        WHERE table_constraint.constraint_schema = DATABASE()
+          AND table_constraint.table_name = 't_external_source_object'
+          AND table_constraint.constraint_type = 'CHECK'
+          AND table_constraint.constraint_name = 'chk_external_source_delete_fence'
+          AND table_constraint.enforced = 'YES'
+          AND REPLACE(REPLACE(LOWER(check_constraint.check_clause), CHAR(96), ''), CHAR(92), '') =
+              '(((delete_marked_at is null) and (delete_token is null) and (delete_lease_until is null) and (delete_next_attempt_at is null)) or ((delete_marked_at is not null) and (delete_token is not null) and (delete_lease_until is not null) and (delete_next_attempt_at is not null)))'
+    )
+    AND EXISTS (
         SELECT 1 FROM information_schema.tables
         WHERE table_schema = DATABASE() AND table_name = 't_external_retention_audit' AND engine = 'InnoDB'
-    )`
+    )
+    AND COALESCE((
+        SELECT GROUP_CONCAT(column_name ORDER BY seq_in_index SEPARATOR ',')
+        FROM information_schema.statistics
+        WHERE table_schema = DATABASE() AND table_name = 't_external_retention_audit'
+          AND index_name = 'idx_external_retention_audit_tenant_time'
+    ), '') = 'tenant_id,event_at,id'
+    AND COALESCE((
+        SELECT GROUP_CONCAT(CONCAT(column_name, ':', referenced_column_name)
+                            ORDER BY ordinal_position SEPARATOR ',')
+        FROM information_schema.key_column_usage
+        WHERE constraint_schema = DATABASE() AND table_name = 't_external_retention_audit'
+          AND constraint_name = 'fk_external_retention_audit_tenant'
+          AND referenced_table_name = 't_external_tenant'
+    ), '') = 'tenant_id:id'`
 
 const tenantPolicyCeilingsValidationSQL = `SELECT NOT EXISTS (
     SELECT 1 FROM t_external_tenant

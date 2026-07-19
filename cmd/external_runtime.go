@@ -294,7 +294,12 @@ func newExternalRuntime(
 		_ = redisClient.Close()
 		return nil, err
 	}
-	workers := make([]app.Worker, 0, externalConfig.WorkerConcurrency+len(webhookWorkers)+3)
+	idempotencyRetentionWorker, err := external.NewIdempotencyRetentionWorker(jobRepository, 1000, retentionIdleDelay)
+	if err != nil {
+		_ = redisClient.Close()
+		return nil, err
+	}
+	workers := make([]app.Worker, 0, externalConfig.WorkerConcurrency+len(webhookWorkers)+4)
 	for index := 0; index < externalConfig.WorkerConcurrency; index++ {
 		workerID := externalConfig.WorkerID + "-" + strconv.Itoa(index)
 		workers = append(workers, app.NewWorker(func(ctx context.Context) error { return runner.Run(ctx, workerID, idleBackoff) }))
@@ -302,6 +307,7 @@ func newExternalRuntime(
 	workers = append(workers, webhookWorkers...)
 	workers = append(workers, app.NewWorker(reservationWorker.Run))
 	workers = append(workers, app.NewWorker(retentionWorker.Run))
+	workers = append(workers, app.NewWorker(idempotencyRetentionWorker.Run))
 	reconciler, err := external.NewBundleReconciler(bundleService)
 	if err != nil {
 		_ = redisClient.Close()
@@ -328,7 +334,9 @@ func newExternalRuntime(
 	runtime, err := app.NewRuntime(app.Config{
 		Enabled: true, ListenAddress: externalConfig.ListenAddress,
 		ReadinessTimeout: readinessTimeout, ShutdownTimeout: shutdownTimeout,
-		ReadHeaderTimeout: readHeaderTimeout, ReadTimeout: readTimeout,
+		MaximumBundleBytes:                cfg.TestBundles.MaxObjectBytes,
+		MinimumBundleUploadBytesPerSecond: externalConfig.BundleMinUploadBytesPerSecond,
+		ReadHeaderTimeout:                 readHeaderTimeout, ReadTimeout: readTimeout,
 		WriteTimeout: writeTimeout, IdleTimeout: idleTimeout,
 	}, handler, workers, probes)
 	if err != nil {

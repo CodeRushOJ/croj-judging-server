@@ -44,14 +44,16 @@ func NewWorker(run func(context.Context) error) Worker {
 }
 
 type Config struct {
-	Enabled           bool
-	ListenAddress     string
-	ReadinessTimeout  time.Duration
-	ShutdownTimeout   time.Duration
-	ReadHeaderTimeout time.Duration
-	ReadTimeout       time.Duration
-	WriteTimeout      time.Duration
-	IdleTimeout       time.Duration
+	Enabled                           bool
+	ListenAddress                     string
+	ReadinessTimeout                  time.Duration
+	ShutdownTimeout                   time.Duration
+	MaximumBundleBytes                int64
+	MinimumBundleUploadBytesPerSecond int64
+	ReadHeaderTimeout                 time.Duration
+	ReadTimeout                       time.Duration
+	WriteTimeout                      time.Duration
+	IdleTimeout                       time.Duration
 }
 
 type Runtime struct {
@@ -213,8 +215,8 @@ func normalizeHTTPTimeouts(config *Config) error {
 		maximum  time.Duration
 	}{
 		{&config.ReadHeaderTimeout, "read header", 5 * time.Second, time.Minute},
-		{&config.ReadTimeout, "read", 30 * time.Second, 10 * time.Minute},
-		{&config.WriteTimeout, "write", 30 * time.Second, 10 * time.Minute},
+		{&config.ReadTimeout, "read", 15 * time.Minute, 30 * time.Minute},
+		{&config.WriteTimeout, "write", 20 * time.Minute, 40 * time.Minute},
 		{&config.IdleTimeout, "idle", 60 * time.Second, 10 * time.Minute},
 	}
 	for _, item := range defaults {
@@ -224,6 +226,27 @@ func normalizeHTTPTimeouts(config *Config) error {
 		if *item.value < 0 || *item.value > item.maximum {
 			return fmt.Errorf("external REST %s timeout is invalid", item.name)
 		}
+	}
+	if config.MaximumBundleBytes < 0 || config.MinimumBundleUploadBytesPerSecond < 0 {
+		return fmt.Errorf("external REST bundle upload size and minimum rate are invalid")
+	}
+	if config.MaximumBundleBytes == 0 {
+		return nil
+	}
+	if config.MinimumBundleUploadBytesPerSecond == 0 {
+		config.MinimumBundleUploadBytesPerSecond = 1 << 20
+	}
+	transferSeconds := config.MaximumBundleBytes / config.MinimumBundleUploadBytesPerSecond
+	if config.MaximumBundleBytes%config.MinimumBundleUploadBytesPerSecond != 0 {
+		transferSeconds++
+	}
+	const requestFramingAllowance = 2 * time.Minute
+	if config.ReadTimeout < requestFramingAllowance || transferSeconds > int64((config.ReadTimeout-requestFramingAllowance)/time.Second) {
+		return fmt.Errorf("external REST read timeout cannot receive the maximum bundle at the minimum upload rate")
+	}
+	const publicationResponseAllowance = 5 * time.Minute
+	if config.WriteTimeout-config.ReadTimeout < publicationResponseAllowance {
+		return fmt.Errorf("external REST write timeout must preserve the publication response allowance")
 	}
 	return nil
 }

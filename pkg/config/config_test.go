@@ -81,6 +81,7 @@ sandbox-discovery:
 	t.Setenv("EXTERNAL_API_READ_TIMEOUT", "45s")
 	t.Setenv("EXTERNAL_API_WRITE_TIMEOUT", "50s")
 	t.Setenv("EXTERNAL_API_IDLE_TIMEOUT", "70s")
+	t.Setenv("EXTERNAL_BUNDLE_MIN_UPLOAD_BYTES_PER_SECOND", "1048576")
 	t.Setenv("EXTERNAL_BUNDLE_UPLOAD_CONCURRENCY", "7")
 	t.Setenv("EXTERNAL_SOURCE_RETENTION", "1080h")
 	t.Setenv("EXTERNAL_RETENTION_IDLE_DELAY", "2m")
@@ -120,6 +121,7 @@ sandbox-discovery:
 		config.ExternalAPI.CallbackKeysJSON != `{"2":"callback-key"}` || config.ExternalAPI.WebhookWorkerConcurrency != 4 ||
 		config.ExternalAPI.ReadHeaderTimeout != "4s" || config.ExternalAPI.ReadTimeout != "45s" ||
 		config.ExternalAPI.WriteTimeout != "50s" || config.ExternalAPI.IdleTimeout != "70s" ||
+		config.ExternalAPI.BundleMinUploadBytesPerSecond != 1048576 ||
 		config.ExternalAPI.BundleUploadConcurrency != 7 || config.ExternalAPI.SourceRetention != "1080h" ||
 		config.ExternalAPI.RetentionIdleDelay != "2m" || config.ExternalAPI.RetentionDeleteTimeout != "20s" {
 		t.Fatalf("external secret/runtime overrides not applied: %+v", config.ExternalAPI)

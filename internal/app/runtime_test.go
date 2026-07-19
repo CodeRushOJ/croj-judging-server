@@ -160,13 +160,23 @@ func healthyProductionProbes() map[string]Probe {
 }
 
 func TestRuntimeAppliesAndValidatesHTTPTimeouts(t *testing.T) {
-	runtime, err := NewRuntime(Config{Enabled: true, ListenAddress: "127.0.0.1:0", ShutdownTimeout: time.Second}, http.NotFoundHandler(), nil, healthyProductionProbes())
+	runtime, err := NewRuntime(Config{
+		Enabled: true, ListenAddress: "127.0.0.1:0", ShutdownTimeout: time.Second,
+		MaximumBundleBytes: 512 << 20, MinimumBundleUploadBytesPerSecond: 1 << 20,
+	}, http.NotFoundHandler(), nil, healthyProductionProbes())
 	if err != nil {
 		t.Fatal(err)
 	}
 	server := runtime.httpServer()
-	if server.ReadHeaderTimeout != 5*time.Second || server.ReadTimeout != 30*time.Second || server.WriteTimeout != 30*time.Second || server.IdleTimeout != 60*time.Second {
+	if server.ReadHeaderTimeout != 5*time.Second || server.ReadTimeout != 15*time.Minute || server.WriteTimeout != 20*time.Minute || server.IdleTimeout != 60*time.Second {
 		t.Fatalf("HTTP timeouts = header:%s read:%s write:%s idle:%s", server.ReadHeaderTimeout, server.ReadTimeout, server.WriteTimeout, server.IdleTimeout)
+	}
+	maximumBundleTransfer := time.Duration((runtime.config.MaximumBundleBytes+runtime.config.MinimumBundleUploadBytesPerSecond-1)/runtime.config.MinimumBundleUploadBytesPerSecond) * time.Second
+	if server.ReadTimeout < maximumBundleTransfer {
+		t.Fatalf("read timeout %s cannot receive the maximum bundle at the supported minimum rate in %s", server.ReadTimeout, maximumBundleTransfer)
+	}
+	if server.WriteTimeout-server.ReadTimeout < 5*time.Minute {
+		t.Fatalf("post-read response allowance = %s, want at least 5m", server.WriteTimeout-server.ReadTimeout)
 	}
 
 	_, err = NewRuntime(Config{
@@ -175,5 +185,28 @@ func TestRuntimeAppliesAndValidatesHTTPTimeouts(t *testing.T) {
 	}, http.NotFoundHandler(), nil, healthyProductionProbes())
 	if err == nil {
 		t.Fatal("negative idle timeout accepted")
+	}
+}
+
+func TestRuntimeRejectsDeadlinesThatCannotFinishANearMaximumSlowUpload(t *testing.T) {
+	base := Config{
+		Enabled: true, ListenAddress: "127.0.0.1:0", ShutdownTimeout: time.Second,
+		MaximumBundleBytes: 512 << 20, MinimumBundleUploadBytesPerSecond: 1 << 20,
+		ReadHeaderTimeout: 5 * time.Second, IdleTimeout: time.Minute,
+	}
+	base.ReadTimeout = 8*time.Minute + 31*time.Second
+	base.WriteTimeout = 20 * time.Minute
+	if _, err := NewRuntime(base, http.NotFoundHandler(), nil, healthyProductionProbes()); err == nil || !strings.Contains(err.Error(), "minimum upload rate") {
+		t.Fatalf("near-maximum slow upload read deadline error = %v", err)
+	}
+	base.ReadTimeout = 10*time.Minute + 31*time.Second
+	if _, err := NewRuntime(base, http.NotFoundHandler(), nil, healthyProductionProbes()); err == nil || !strings.Contains(err.Error(), "minimum upload rate") {
+		t.Fatalf("multipart/header allowance below two minutes was accepted: %v", err)
+	}
+
+	base.ReadTimeout = 15 * time.Minute
+	base.WriteTimeout = 19*time.Minute + 59*time.Second
+	if _, err := NewRuntime(base, http.NotFoundHandler(), nil, healthyProductionProbes()); err == nil || !strings.Contains(err.Error(), "publication response allowance") {
+		t.Fatalf("post-read publication deadline error = %v", err)
 	}
 }

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/CodeRushOJ/croj-judging-server/internal/external"
+	"github.com/CodeRushOJ/croj-judging-server/internal/judgecontract"
 	"github.com/getkin/kin-openapi/openapi3"
 	"gopkg.in/yaml.v3"
 )
@@ -41,6 +42,46 @@ func TestOpenAPIContractLoadsAndValidates(t *testing.T) {
 	if document.OpenAPI != "3.1.0" {
 		t.Fatalf("openapi version = %q, want 3.1.0", document.OpenAPI)
 	}
+}
+
+func TestOpenAPILanguageAndCheckerEnumsExactlyMatchCanonicalV1Registry(t *testing.T) {
+	document := loadOpenAPIContract(t)
+	submit := document.Components.Schemas["SubmitJobRequest"].Value
+	gotLanguages := stringEnumValues(t, submit.Properties["language"].Value.Enum)
+	wantLanguages := make([]string, 0, len(judgecontract.CanonicalLanguages()))
+	for _, language := range judgecontract.CanonicalLanguages() {
+		wantLanguages = append(wantLanguages, language.PublicID)
+	}
+	if !reflect.DeepEqual(gotLanguages, wantLanguages) {
+		t.Fatalf("SubmitJobRequest.language enum = %v, want %v", gotLanguages, wantLanguages)
+	}
+	capabilityLanguage := document.Components.Schemas["LanguageCapability"].Value.Properties["id"].Value
+	if got := stringEnumValues(t, capabilityLanguage.Enum); !reflect.DeepEqual(got, wantLanguages) {
+		t.Fatalf("LanguageCapability.id enum = %v, want %v", got, wantLanguages)
+	}
+
+	capabilities := document.Components.Schemas["Capabilities"].Value
+	gotCheckers := stringEnumValues(t, capabilities.Properties["checkers"].Value.Items.Value.Enum)
+	wantCheckers := make([]string, 0, len(judgecontract.CanonicalCheckers()))
+	for _, checker := range judgecontract.CanonicalCheckers() {
+		wantCheckers = append(wantCheckers, string(checker))
+	}
+	if !reflect.DeepEqual(gotCheckers, wantCheckers) {
+		t.Fatalf("Capabilities.checkers enum = %v, want %v", gotCheckers, wantCheckers)
+	}
+}
+
+func stringEnumValues(t *testing.T, values []any) []string {
+	t.Helper()
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		item, ok := value.(string)
+		if !ok {
+			t.Fatalf("enum contains non-string value %#v", value)
+		}
+		result = append(result, item)
+	}
+	return result
 }
 
 func TestOpenAPIOperationsMatchLiveHTTPHandlers(t *testing.T) {

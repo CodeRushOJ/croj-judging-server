@@ -198,3 +198,21 @@ func TestMySQLJobServiceExposesStableFailureCodeWithoutInternals(t *testing.T) {
 		t.Fatalf("failureCode = %q", view.FailureCode)
 	}
 }
+
+func TestMySQLJobServiceHidesFailureCodeOutsideFailedState(t *testing.T) {
+	repository := &durableJobRepositoryStub{getResult: external.ExternalJobRecord{
+		ExternalID: "aaaaaaaaaaaaaaaaaaaaaaaaaa", Status: external.JobStatusQueued,
+		CreatedAt: time.Now(), FailureCode: "MIGRATION_ACCOUNTING_RECLAIM",
+	}}
+	service, err := NewMySQLJobService(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := service.Get(context.Background(), "bbbbbbbbbbbbbbbbbbbbbbbbbb", repository.getResult.ExternalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.FailureCode != "" {
+		t.Fatalf("queued job leaked historical failureCode = %q", view.FailureCode)
+	}
+}

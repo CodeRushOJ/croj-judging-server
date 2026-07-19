@@ -39,7 +39,7 @@ WHERE status = 'RUNNING';
 -- migrate:split
 UPDATE t_external_job
 SET status = 'QUEUED', worker_id = NULL, lease_token = NULL, lease_until = NULL,
-    next_attempt_at = CURRENT_TIMESTAMP(3), failure_code = 'MIGRATION_ACCOUNTING_RECLAIM'
+    next_attempt_at = CURRENT_TIMESTAMP(3), failure_code = NULL
 WHERE status = 'RUNNING';
 -- migrate:split
 -- migrate:replay-errors 3822
@@ -60,7 +60,15 @@ ALTER TABLE t_external_source_object
 -- migrate:split
 -- migrate:replay-errors 1060
 ALTER TABLE t_external_source_object
-    ADD COLUMN delete_attempt_count INT UNSIGNED NOT NULL DEFAULT 0 AFTER delete_token;
+    ADD COLUMN delete_lease_until DATETIME(3) NULL AFTER delete_token;
+-- migrate:split
+-- migrate:replay-errors 1060
+ALTER TABLE t_external_source_object
+    ADD COLUMN delete_next_attempt_at DATETIME(3) NULL AFTER delete_lease_until;
+-- migrate:split
+-- migrate:replay-errors 1060
+ALTER TABLE t_external_source_object
+    ADD COLUMN delete_attempt_count INT UNSIGNED NOT NULL DEFAULT 0 AFTER delete_next_attempt_at;
 -- migrate:split
 -- migrate:replay-errors 1060
 ALTER TABLE t_external_source_object
@@ -68,14 +76,14 @@ ALTER TABLE t_external_source_object
 -- migrate:split
 -- migrate:replay-errors 1061
 ALTER TABLE t_external_source_object
-    ADD KEY idx_external_source_delete(delete_marked_at, deleted_at, id);
+    ADD KEY idx_external_source_delete(delete_next_attempt_at, delete_lease_until, deleted_at, id);
 -- migrate:split
 -- migrate:replay-errors 3822
 ALTER TABLE t_external_source_object
     ADD CONSTRAINT chk_external_source_delete_fence
         CHECK (
-            (delete_marked_at IS NULL AND delete_token IS NULL)
-            OR (delete_marked_at IS NOT NULL AND delete_token IS NOT NULL)
+            (delete_marked_at IS NULL AND delete_token IS NULL AND delete_lease_until IS NULL AND delete_next_attempt_at IS NULL)
+            OR (delete_marked_at IS NOT NULL AND delete_token IS NOT NULL AND delete_lease_until IS NOT NULL AND delete_next_attempt_at IS NOT NULL)
         );
 -- migrate:split
 CREATE TABLE IF NOT EXISTS t_external_retention_audit (
