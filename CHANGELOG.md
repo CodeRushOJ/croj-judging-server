@@ -6,6 +6,7 @@
 
 ### Added
 
+- 增加外部 OJ 异步 REST 的 OpenAPI 3.1 契约、可复制 curl 与 Draft 接入入口；`kin-openapi` 固定版本契约测试会校验规范、真实 handler 路由/状态/header、严格 DTO examples 和公开响应脱敏。
 - 增加面向外部 OJ 的异步 REST v1 基础：RFC 9457 错误、request ID、scope 鉴权和 capabilities 端点。
 - 增加 Judge 自有 MySQL schema 的嵌入式迁移、advisory lock、checksum drift 拒绝及租户隔离数据结构。
 - 增加不透明 256-bit API Key 生成、peppered HMAC 存储、严格 scope 加载与 `judge-admin` 租户/密钥预置命令。
