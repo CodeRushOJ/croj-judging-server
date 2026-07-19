@@ -18,7 +18,7 @@ var ErrClientClosed = errors.New("sandbox client is closed")
 var ErrInvalidBatchStream = errors.New("invalid sandbox batch stream")
 
 const maxBatchMessageBytesV1 = 64 << 20
-const maxBatchResponseBytesV1 = 32 << 20
+const maxBatchResponseBytesV1 = maxBatchMessageBytesV1
 
 type batchStreamGuard struct {
 	maxEvents int
