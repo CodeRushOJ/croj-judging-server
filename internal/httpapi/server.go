@@ -24,6 +24,7 @@ type Server struct {
 	jobs          JobService
 	jobWriteQuota external.Quota
 	jobWriteLimit external.QuotaLimit
+	bundles       BundleApplication
 }
 
 func WithJobWriteQuota(quota external.Quota, jobSubmitLimit external.QuotaLimit) ServerOption {
@@ -51,7 +52,6 @@ func WithJobService(service JobService) ServerOption {
 		return nil
 	}
 }
-
 func NewServer(authenticator RequestAuthenticator, capabilities Capabilities, options ...ServerOption) (*Server, error) {
 	if authenticator == nil {
 		return nil, fmt.Errorf("request authenticator is required")
@@ -81,6 +81,10 @@ func (server *Server) ServeHTTP(response http.ResponseWriter, request *http.Requ
 	switch {
 	case request.URL.Path == "/api/v1/capabilities":
 		server.handleCapabilities(response, request, requestID)
+	case server.bundles != nil && request.URL.Path == "/api/v1/bundles":
+		server.serveBundleCollection(response, request, requestID)
+	case server.bundles != nil && strings.HasPrefix(request.URL.Path, "/api/v1/bundles/"):
+		server.serveBundleMetadata(response, request, requestID)
 	case server.jobs != nil && (request.URL.Path == "/api/v1/judge-jobs" || strings.HasPrefix(request.URL.Path, "/api/v1/judge-jobs/")):
 		server.handleJobs(response, request, requestID)
 	default:
