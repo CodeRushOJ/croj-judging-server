@@ -43,9 +43,10 @@ func TestWebhookDeliverySignsExactBodyAndRequiredHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	deliverer.now = func() time.Time { return now }
 	disposition, err := deliverer.Deliver(context.Background(), WebhookDelivery{
 		EventID: "ceirceirceirceirceirceirce", DestinationURL: "https://oj.example.com/hooks/croj",
-		Secret: secret, OccurredAt: now, Body: body,
+		Secret: secret, Body: body,
 	})
 	if err != nil || disposition != WebhookDelivered || string(captured) != string(body) {
 		t.Fatalf("disposition=%q err=%v captured=%q", disposition, err, captured)
@@ -105,7 +106,29 @@ func TestWebhookDeliveryRejectsUnsafeOrSecretLeakingInputs(t *testing.T) {
 func validWebhookDelivery() WebhookDelivery {
 	return WebhookDelivery{
 		EventID: "ceirceirceirceirceirceirce", DestinationURL: "https://oj.example.com/hook",
-		Secret:     []byte("0123456789abcdef0123456789abcdef"),
-		OccurredAt: time.Date(2026, 7, 19, 12, 34, 56, 0, time.UTC), Body: []byte(`{"ok":true}`),
+		Secret: []byte("0123456789abcdef0123456789abcdef"), Body: []byte(`{"ok":true}`),
+	}
+}
+
+func TestWebhookRetrySignatureUsesFreshAttemptTimestamp(t *testing.T) {
+	var timestamps []string
+	deliverer, err := NewWebhookDeliverer(webhookDoerFunc(func(request *http.Request) (*http.Response, error) {
+		timestamps = append(timestamps, request.Header.Get("X-CROJ-Timestamp"))
+		return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: io.NopCloser(strings.NewReader(""))}, nil
+	}), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	deliverer.now = func() time.Time { return now }
+	if _, err := deliverer.Deliver(context.Background(), validWebhookDelivery()); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(10 * time.Minute)
+	if _, err := deliverer.Deliver(context.Background(), validWebhookDelivery()); err != nil {
+		t.Fatal(err)
+	}
+	if len(timestamps) != 2 || timestamps[0] == timestamps[1] {
+		t.Fatalf("retry signatures reused stale timestamps: %v", timestamps)
 	}
 }
