@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -182,14 +183,10 @@ func main() {
 	if legacyScheduler != nil {
 		go legacyScheduler.Run(ctx, refreshInterval)
 	}
+	var externalDone <-chan error
 	if cfg.ExternalAPI.Enabled {
-		go func() {
-			fmt.Printf("Starting external REST API on %s...\n", cfg.ExternalAPI.ListenAddress)
-			if err := external.runtime.Run(ctx); err != nil {
-				log.Printf("External runtime error: %v", err)
-				cancel()
-			}
-		}()
+		fmt.Printf("Starting external REST API on %s...\n", cfg.ExternalAPI.ListenAddress)
+		externalDone = startExternalRuntime(ctx, external.runtime, cancel)
 	}
 
 	go func() {
@@ -215,6 +212,12 @@ func main() {
 	}
 
 	fmt.Println("Shutting down server...")
+	if externalDone != nil {
+		if err := <-externalDone; err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("External runtime error: %v", err)
+		}
+		fmt.Println("External durable workers and REST API stopped.")
+	}
 
 	// 关闭消费者
 	if err := rocketmqConsumer.Shutdown(); err != nil {

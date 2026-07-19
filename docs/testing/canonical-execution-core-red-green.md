@@ -140,3 +140,27 @@ ok github.com/CodeRushOJ/croj-judging-server/internal/service 0.031s
 ```
 
 Aggregation now retains every executed ordered case and preserves the first failing verdict as the overall result.
+
+## Spec-review lifecycle regressions
+
+Independent spec review found that claim monitoring began after source/bundle I/O and that `main` did not join the external runtime before shared-client teardown. Both received focused RED tests:
+
+```text
+$ go test ./internal/worker -run TestRunnerHeartbeatsWhileBundleProviderIsBlocked -count=1
+--- FAIL: TestRunnerHeartbeatsWhileBundleProviderIsBlocked
+    claim was not heartbeated while bundle I/O was blocked
+FAIL
+
+$ go test ./cmd -run TestStartExternalRuntimeDoneJoinsRuntimeShutdown -count=1
+cmd/external_runtime_test.go: undefined: startExternalRuntime
+FAIL github.com/CodeRushOJ/croj-judging-server/cmd [build failed]
+```
+
+Claim control now starts immediately after ownership and its child context covers fenced input load, bundle resolution and execution. The process retains a runtime completion channel, waits for durable workers/HTTP to stop, then shuts down RocketMQ and reaches deferred shared-client closure.
+
+```text
+$ go test -race ./internal/worker ./internal/app ./cmd -count=1
+ok github.com/CodeRushOJ/croj-judging-server/internal/worker 1.123s
+ok github.com/CodeRushOJ/croj-judging-server/internal/app 1.076s
+ok github.com/CodeRushOJ/croj-judging-server/cmd 1.282s
+```
