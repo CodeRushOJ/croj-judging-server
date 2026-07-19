@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -74,6 +75,19 @@ func TestWebhookDeliveryClassifiesHTTPStatusWithoutFollowingRedirects(t *testing
 				t.Fatalf("disposition=%q err=%v", disposition, err)
 			}
 		})
+	}
+}
+
+func TestWebhookDeliveryTreatsAuthorityMismatchAsPermanent(t *testing.T) {
+	deliverer, err := newWebhookDelivererForTest(webhookDoerFunc(func(*http.Request) (*http.Response, error) {
+		return nil, ErrUnsafeCallbackDestination
+	}), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disposition, err := deliverer.Deliver(context.Background(), validWebhookDelivery())
+	if disposition != WebhookPermanentFailure || !errors.Is(err, ErrUnsafeCallbackDestination) {
+		t.Fatalf("disposition=%q err=%v", disposition, err)
 	}
 }
 

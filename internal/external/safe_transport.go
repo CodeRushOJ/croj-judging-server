@@ -3,6 +3,7 @@ package external
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -13,6 +14,8 @@ import (
 	"strings"
 	"time"
 )
+
+var ErrUnsafeCallbackDestination = errors.New("unsafe callback destination")
 
 type callbackResolver interface {
 	LookupNetIP(context.Context, string, string) ([]netip.Addr, error)
@@ -108,18 +111,18 @@ func parseHTTPSDestination(raw string) (*url.URL, error) {
 func validateCallbackDestination(raw, allowedHost string, allowedPort uint16) (*url.URL, error) {
 	parsed, err := parseHTTPSDestination(raw)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", ErrUnsafeCallbackDestination, err)
 	}
 	normalizedHost := strings.ToLower(strings.TrimSuffix(allowedHost, "."))
 	if !validDNSName(normalizedHost) || strings.ToLower(strings.TrimSuffix(parsed.Hostname(), ".")) != normalizedHost {
-		return nil, fmt.Errorf("callback destination does not match the registered host")
+		return nil, fmt.Errorf("%w: callback destination does not match the registered host", ErrUnsafeCallbackDestination)
 	}
 	port := uint64(443)
 	if parsed.Port() != "" {
 		port, _ = strconv.ParseUint(parsed.Port(), 10, 16)
 	}
 	if allowedPort == 0 || port != uint64(allowedPort) {
-		return nil, fmt.Errorf("callback destination does not match the registered port")
+		return nil, fmt.Errorf("%w: callback destination does not match the registered port", ErrUnsafeCallbackDestination)
 	}
 	return parsed, nil
 }
