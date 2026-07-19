@@ -27,20 +27,20 @@ type WebhookDelivery struct {
 	EventID        string
 	DestinationURL string
 	Secret         []byte
-	OccurredAt     time.Time
 	Body           []byte
 }
 
 type WebhookDeliverer struct {
 	transport http.RoundTripper
 	timeout   time.Duration
+	now       func() time.Time
 }
 
 func NewWebhookDeliverer(transport http.RoundTripper, timeout time.Duration) (*WebhookDeliverer, error) {
 	if transport == nil || timeout <= 0 {
 		return nil, fmt.Errorf("webhook HTTP transport and positive timeout are required")
 	}
-	return &WebhookDeliverer{transport: transport, timeout: timeout}, nil
+	return &WebhookDeliverer{transport: transport, timeout: timeout, now: time.Now}, nil
 }
 
 func (deliverer *WebhookDeliverer) Deliver(ctx context.Context, delivery WebhookDelivery) (WebhookDisposition, error) {
@@ -56,7 +56,7 @@ func (deliverer *WebhookDeliverer) Deliver(ctx context.Context, delivery Webhook
 	if err != nil {
 		return WebhookPermanentFailure, fmt.Errorf("create webhook request: %w", err)
 	}
-	timestamp := strconv.FormatInt(delivery.OccurredAt.Unix(), 10)
+	timestamp := strconv.FormatInt(deliverer.now().UTC().Unix(), 10)
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("User-Agent", "CodeRushOJ-Judge-Webhook/1.0")
 	request.Header.Set("X-CROJ-Event-Id", delivery.EventID)
@@ -94,8 +94,8 @@ func validateWebhookDelivery(delivery WebhookDelivery) error {
 	if len(delivery.Secret) < sha256.Size || len(delivery.Secret) > 1024 {
 		return fmt.Errorf("webhook secret must contain 32 to 1024 bytes")
 	}
-	if delivery.OccurredAt.IsZero() || len(delivery.Body) == 0 || len(delivery.Body) > maximumWebhookBodyBytes {
-		return fmt.Errorf("webhook timestamp or body is invalid")
+	if len(delivery.Body) == 0 || len(delivery.Body) > maximumWebhookBodyBytes {
+		return fmt.Errorf("webhook body is invalid")
 	}
 	return nil
 }
