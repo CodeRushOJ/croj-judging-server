@@ -49,10 +49,10 @@ func TestApplyMigrationsOnMySQL84IsReplaySafe(t *testing.T) {
 		t.Fatalf("migration replay: %v", err)
 	}
 	var versionCount int
-	if err := database.QueryRowContext(ctx, "SELECT COUNT(*) FROM t_judge_schema_history WHERE version IN (1, 2, 3, 4, 5)").Scan(&versionCount); err != nil {
+	if err := database.QueryRowContext(ctx, "SELECT COUNT(*) FROM t_judge_schema_history WHERE version IN (1, 2, 3, 4, 5, 6)").Scan(&versionCount); err != nil {
 		t.Fatal(err)
 	}
-	if versionCount != 5 {
+	if versionCount != 6 {
 		t.Fatalf("migration versions = %d", versionCount)
 	}
 	var columnCount int
@@ -238,7 +238,7 @@ VALUES ('kkkkkkkkkkkkkkkkkkkkkkkkkk', ?, ?, UNHEX(SHA2(?, 256)), 1, 1, X'0000000
 	sourceID, _ := sourceResult.LastInsertId()
 	jobResult, err := database.ExecContext(ctx, `
 INSERT INTO t_external_job(external_id, tenant_id, bundle_id, source_object_id, callback_id, status, language_id, request_hash, next_attempt_at, completed_at)
-VALUES (?, ?, ?, ?, ?, 'FAILED', 'cpp20', UNHEX(SHA2(?, 256)), CURRENT_TIMESTAMP(3), CURRENT_TIMESTAMP(3))`, jobExternalID, tenantID, bundleID, sourceID, callbackID, jobExternalID)
+VALUES (?, ?, ?, ?, ?, 'FAILED', 'cpp', UNHEX(SHA2(?, 256)), CURRENT_TIMESTAMP(3), CURRENT_TIMESTAMP(3))`, jobExternalID, tenantID, bundleID, sourceID, callbackID, jobExternalID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -483,7 +483,7 @@ INSERT INTO t_external_source_object(
 INSERT INTO t_external_job(
     external_id, tenant_id, bundle_id, source_object_id, status, language_id,
     request_hash, attempt_no, worker_id, lease_until, next_attempt_at, started_at
-) VALUES ('dddddddddddddddddddddddddd', ?, ?, ?, 'RUNNING', 'cpp20',
+) VALUES ('dddddddddddddddddddddddddd', ?, ?, ?, 'RUNNING', 'cpp',
           UNHEX(SHA2('legacy-request', 256)), 1, 'legacy-worker',
           DATE_ADD(NOW(3), INTERVAL 1 HOUR), NOW(3), NOW(3))`, tenantID, bundleID, sourceID)
 	if err != nil {
@@ -494,7 +494,7 @@ INSERT INTO t_external_job(
 INSERT INTO t_external_job(
     external_id, tenant_id, bundle_id, source_object_id, status, language_id,
     request_hash, worker_id, lease_until, next_attempt_at, completed_at
-) VALUES ('eeeeeeeeeeeeeeeeeeeeeeeeee', ?, ?, ?, 'FAILED', 'cpp20',
+) VALUES ('eeeeeeeeeeeeeeeeeeeeeeeeee', ?, ?, ?, 'FAILED', 'cpp',
           UNHEX(SHA2('legacy-residue-request', 256)), 'stale-worker',
           DATE_ADD(NOW(3), INTERVAL 1 HOUR), NOW(3), NOW(3))`, tenantID, bundleID, sourceID)
 	if err != nil {
@@ -560,7 +560,7 @@ func resetMySQLIntegrationSchema(t *testing.T, database *sql.DB) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	for _, table := range []string{
-		"t_external_source_reservation", "t_external_webhook_outbox", "t_external_job_attempt", "t_external_idempotency",
+		"t_external_retention_audit", "t_external_execution_daily", "t_external_source_reservation", "t_external_webhook_outbox", "t_external_job_attempt", "t_external_idempotency",
 		"t_external_job", "t_external_source_object", "t_external_callback", "t_external_bundle",
 		"t_external_api_key", "t_external_tenant", "t_judge_schema_history",
 	} {

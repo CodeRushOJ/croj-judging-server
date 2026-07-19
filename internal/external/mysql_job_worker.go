@@ -115,7 +115,6 @@ func (repository *MySQLJobRepository) ClaimNext(
 		return WorkerJobClaim{}, ErrInvalidJobState
 	}
 	const maximumClaimRetries = 32
-	productiveRecovery := false
 	for attempt := 0; attempt < maximumClaimRetries; attempt++ {
 		claim, retry, err := repository.claimOne(ctx, workerID, leaseDuration)
 		if err != nil {
@@ -130,15 +129,11 @@ func (repository *MySQLJobRepository) ClaimNext(
 		if !retry {
 			return claim, nil
 		}
-		productiveRecovery = true
 		if err := waitForClaimRetry(ctx); err != nil {
 			return WorkerJobClaim{}, repositoryUnavailable("wait for worker claim recovery", err)
 		}
 	}
-	if productiveRecovery {
-		return WorkerJobClaim{}, ErrJobNotClaimable
-	}
-	return WorkerJobClaim{}, repositoryUnavailable("worker claim contention budget exhausted", ErrJobNotClaimable)
+	return WorkerJobClaim{}, ErrJobNotClaimable
 }
 
 func (repository *MySQLJobRepository) claimOne(
@@ -158,25 +153,59 @@ func (repository *MySQLJobRepository) claimOne(
 
 	var candidateTenantID uint64
 	err = tx.QueryRowContext(ctx, `
-SELECT job.tenant_id
-FROM t_external_job AS job FORCE INDEX (idx_external_job_claim)
-JOIN t_external_tenant AS tenant ON tenant.id = job.tenant_id
-WHERE (job.status = 'RUNNING' AND job.lease_until <= ?)
-   OR (tenant.status = 'ACTIVE'
-       AND JSON_TYPE(JSON_EXTRACT(tenant.policy_json, '$.maxInfrastructureTries')) = 'INTEGER'
-       AND CAST(JSON_UNQUOTE(JSON_EXTRACT(tenant.policy_json, '$.maxInfrastructureTries')) AS UNSIGNED) BETWEEN 1 AND 10
-       AND (
-       job.status = 'QUEUED' AND job.next_attempt_at <= ?
-       AND JSON_TYPE(JSON_EXTRACT(tenant.policy_json, '$.maxRunningJobs')) = 'INTEGER'
-       AND CAST(JSON_UNQUOTE(JSON_EXTRACT(tenant.policy_json, '$.maxRunningJobs')) AS UNSIGNED) > (
-           SELECT COUNT(*) FROM t_external_job AS running_job
-           WHERE running_job.tenant_id = job.tenant_id AND running_job.status = 'RUNNING'
-       )
-       )
-   )
-ORDER BY (job.status = 'RUNNING') DESC, job.next_attempt_at, job.created_at, job.id
-LIMIT 1`, leaseNow, leaseNow).Scan(&candidateTenantID)
+	SELECT tenant.id
+	FROM t_external_tenant AS tenant FORCE INDEX (idx_external_tenant_fair_claim)
+	WHERE EXISTS (
+	       SELECT 1 FROM t_external_job AS expired_job FORCE INDEX (idx_external_job_claim)
+	       WHERE expired_job.tenant_id = tenant.id AND expired_job.status = 'RUNNING'
+	         AND expired_job.lease_until <= ?
+	   ) OR (tenant.status = 'ACTIVE'
+	       AND JSON_TYPE(JSON_EXTRACT(tenant.policy_json, '$.maxInfrastructureTries')) = 'INTEGER'
+	       AND CAST(JSON_UNQUOTE(JSON_EXTRACT(tenant.policy_json, '$.maxInfrastructureTries')) AS UNSIGNED) BETWEEN 1 AND 10
+	       AND JSON_TYPE(JSON_EXTRACT(tenant.policy_json, '$.maxRunningJobs')) = 'INTEGER'
+	       AND CAST(JSON_UNQUOTE(JSON_EXTRACT(tenant.policy_json, '$.maxRunningJobs')) AS UNSIGNED) > (
+	           SELECT COUNT(*) FROM t_external_job AS running_job
+	           WHERE running_job.tenant_id = tenant.id AND running_job.status = 'RUNNING'
+	       )
+	       AND EXISTS (
+	           SELECT 1 FROM t_external_job AS queued_job FORCE INDEX (idx_external_job_claim)
+	           WHERE queued_job.tenant_id = tenant.id AND queued_job.status = 'QUEUED'
+	             AND queued_job.next_attempt_at <= ?
+	       )
+	   )
+	ORDER BY EXISTS (
+	    SELECT 1 FROM t_external_job AS recovery_job FORCE INDEX (idx_external_job_claim)
+	    WHERE recovery_job.tenant_id = tenant.id AND recovery_job.status = 'RUNNING'
+	      AND recovery_job.lease_until <= ?
+	) DESC, tenant.last_claimed_at IS NULL DESC, tenant.last_claimed_at, tenant.id
+	LIMIT 1 FOR UPDATE SKIP LOCKED`, leaseNow, leaseNow, leaseNow).Scan(&candidateTenantID)
 	if errors.Is(err, sql.ErrNoRows) {
+		var due bool
+		if err := tx.QueryRowContext(ctx, `
+	SELECT EXISTS (
+	    SELECT 1 FROM t_external_tenant AS tenant
+	    WHERE EXISTS (
+	        SELECT 1 FROM t_external_job AS expired_job
+	        WHERE expired_job.tenant_id = tenant.id AND expired_job.status = 'RUNNING'
+	          AND expired_job.lease_until <= ?
+	    ) OR (tenant.status = 'ACTIVE'
+	        AND JSON_TYPE(JSON_EXTRACT(tenant.policy_json, '$.maxRunningJobs')) = 'INTEGER'
+	        AND CAST(JSON_UNQUOTE(JSON_EXTRACT(tenant.policy_json, '$.maxRunningJobs')) AS UNSIGNED) > (
+	            SELECT COUNT(*) FROM t_external_job AS running_job
+	            WHERE running_job.tenant_id = tenant.id AND running_job.status = 'RUNNING'
+	        )
+	        AND EXISTS (
+	            SELECT 1 FROM t_external_job AS queued_job
+	            WHERE queued_job.tenant_id = tenant.id AND queued_job.status = 'QUEUED'
+	              AND queued_job.next_attempt_at <= ?
+	        )
+	    )
+	)`, leaseNow, leaseNow).Scan(&due); err != nil {
+			return WorkerJobClaim{}, false, repositoryUnavailable("check fair claim contention", err)
+		}
+		if due {
+			return WorkerJobClaim{}, true, ErrJobNotClaimable
+		}
 		return WorkerJobClaim{}, false, ErrJobNotClaimable
 	}
 	if err != nil {
@@ -203,16 +232,19 @@ LIMIT 1`, leaseNow, leaseNow).Scan(&candidateTenantID)
 	var status JobStatus
 	var attemptNo uint32
 	var cancelRequested sql.NullTime
+	var reservedExecutionMillis int64
 	err = tx.QueryRowContext(ctx, `
-SELECT id, external_id, status, attempt_no, cancel_requested_at
-FROM t_external_job FORCE INDEX (idx_external_job_claim)
-WHERE tenant_id = ? AND (
-    (? = 'ACTIVE' AND status = 'QUEUED' AND next_attempt_at <= ?) OR
-    (status = 'RUNNING' AND lease_until <= ?)
-)
-ORDER BY (status = 'RUNNING') DESC, next_attempt_at, created_at, id
-LIMIT 1 FOR UPDATE SKIP LOCKED`, candidateTenantID, tenantStatus, leaseNow, leaseNow).
-		Scan(&jobInternalID, &jobExternalID, &status, &attemptNo, &cancelRequested)
+	SELECT job.id, job.external_id, job.status, job.attempt_no, job.cancel_requested_at,
+	       COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(bundle.manifest_json, '$.limits.timeLimitMillis')) AS UNSIGNED) * bundle.case_count, ?)
+	FROM t_external_job AS job FORCE INDEX (idx_external_job_claim)
+	JOIN t_external_bundle AS bundle ON bundle.id = job.bundle_id AND bundle.tenant_id = job.tenant_id
+	WHERE job.tenant_id = ? AND (
+	    (? = 'ACTIVE' AND job.status = 'QUEUED' AND job.next_attempt_at <= ?) OR
+	    (job.status = 'RUNNING' AND job.lease_until <= ?)
+	)
+	ORDER BY (job.status = 'RUNNING') DESC, job.next_attempt_at, job.created_at, job.id
+	LIMIT 1 FOR UPDATE SKIP LOCKED`, policy.MaxTimeLimitMillis, candidateTenantID, tenantStatus, leaseNow, leaseNow).
+		Scan(&jobInternalID, &jobExternalID, &status, &attemptNo, &cancelRequested, &reservedExecutionMillis)
 	if errors.Is(err, sql.ErrNoRows) {
 		return WorkerJobClaim{}, true, ErrJobNotClaimable
 	}
@@ -284,6 +316,23 @@ WHERE id = ? AND status = 'RUNNING' AND attempt_no = ?`, leaseNow, jobInternalID
 			}
 			return WorkerJobClaim{}, true, nil
 		}
+		allowed, err := reserveDailyExecution(ctx, tx, candidateTenantID, policy.DailyExecutionMillis, reservedExecutionMillis)
+		if err != nil {
+			return WorkerJobClaim{}, false, err
+		}
+		if !allowed {
+			if _, err := tx.ExecContext(ctx, `
+	UPDATE t_external_job
+	SET status = 'QUEUED', worker_id = NULL, lease_token = NULL, lease_until = NULL,
+	    next_attempt_at = TIMESTAMP(DATE_ADD(CURRENT_DATE, INTERVAL 1 DAY))
+	WHERE id = ? AND status = 'RUNNING' AND attempt_no = ?`, jobInternalID, attemptNo); err != nil {
+				return WorkerJobClaim{}, false, repositoryUnavailable("defer recovered daily quota job", err)
+			}
+			if err := tx.Commit(); err != nil {
+				return WorkerJobClaim{}, false, repositoryUnavailable("commit recovered daily quota deferral", err)
+			}
+			return WorkerJobClaim{}, true, nil
+		}
 	} else if status == JobStatusQueued {
 		var running int
 		if err := tx.QueryRowContext(ctx,
@@ -293,6 +342,24 @@ WHERE id = ? AND status = 'RUNNING' AND attempt_no = ?`, leaseNow, jobInternalID
 		}
 		if running >= policy.MaxRunningJobs {
 			return WorkerJobClaim{}, true, ErrJobNotClaimable
+		}
+		if reservedExecutionMillis <= 0 {
+			return WorkerJobClaim{}, false, ErrExternalJobUnavailable
+		}
+		allowed, err := reserveDailyExecution(ctx, tx, candidateTenantID, policy.DailyExecutionMillis, reservedExecutionMillis)
+		if err != nil {
+			return WorkerJobClaim{}, false, err
+		}
+		if !allowed {
+			if _, err := tx.ExecContext(ctx, `
+	UPDATE t_external_job SET next_attempt_at = TIMESTAMP(DATE_ADD(CURRENT_DATE, INTERVAL 1 DAY))
+	WHERE id = ? AND status = 'QUEUED'`, jobInternalID); err != nil {
+				return WorkerJobClaim{}, false, repositoryUnavailable("defer daily quota job", err)
+			}
+			if err := tx.Commit(); err != nil {
+				return WorkerJobClaim{}, false, repositoryUnavailable("commit daily quota deferral", err)
+			}
+			return WorkerJobClaim{}, true, nil
 		}
 	} else {
 		return WorkerJobClaim{}, false, ErrJobNotClaimable
@@ -321,11 +388,15 @@ WHERE id = ? AND status = ? AND attempt_no = ?`,
 		return WorkerJobClaim{}, false, ErrJobNotClaimable
 	}
 	if _, err := tx.ExecContext(ctx, `
-INSERT INTO t_external_job_attempt(
-    tenant_id, job_id, attempt_no, worker_id, lease_token, status, lease_until, started_at
-) VALUES (?, ?, ?, ?, ?, 'RUNNING', ?, ?)`,
-		candidateTenantID, jobInternalID, newAttemptNo, workerID, leaseToken, leaseUntil, leaseNow); err != nil {
+	INSERT INTO t_external_job_attempt(
+	    tenant_id, job_id, attempt_no, worker_id, lease_token, status, lease_until,
+	    accounting_day, reserved_execution_millis, started_at
+	) VALUES (?, ?, ?, ?, ?, 'RUNNING', ?, CURRENT_DATE, ?, ?)`,
+		candidateTenantID, jobInternalID, newAttemptNo, workerID, leaseToken, leaseUntil, reservedExecutionMillis, leaseNow); err != nil {
 		return WorkerJobClaim{}, false, repositoryUnavailable("persist worker attempt", err)
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE t_external_tenant SET last_claimed_at = ? WHERE id = ?", leaseNow, candidateTenantID); err != nil {
+		return WorkerJobClaim{}, false, repositoryUnavailable("advance fair tenant cursor", err)
 	}
 	job, err := getExternalJobByInternalID(ctx, tx, jobInternalID)
 	if err != nil {
@@ -341,9 +412,13 @@ INSERT INTO t_external_job_attempt(
 }
 
 func expireAttempt(ctx context.Context, tx *sql.Tx, tenantID, jobID uint64, attemptNo uint32, now time.Time) error {
+	if err := releaseAttemptReservation(ctx, tx, tenantID, jobID, attemptNo, 0); err != nil {
+		return err
+	}
 	result, err := tx.ExecContext(ctx, `
-UPDATE t_external_job_attempt
-SET status = 'EXPIRED', lease_token = NULL, finished_at = ?, failure_code = 'LEASE_EXPIRED'
+	UPDATE t_external_job_attempt
+	SET status = 'EXPIRED', lease_token = NULL, finished_at = ?, failure_code = 'LEASE_EXPIRED',
+	    reserved_execution_millis = 0
 WHERE tenant_id = ? AND job_id = ? AND attempt_no = ? AND status = 'RUNNING'`,
 		now, tenantID, jobID, attemptNo)
 	if err != nil {
@@ -443,7 +518,7 @@ func (repository *MySQLJobRepository) Complete(
 	if err != nil {
 		return err
 	}
-	cancelled, err := lockActiveClaim(ctx, tx, claim)
+	cancelled, _, err := lockActiveClaimAndPolicy(ctx, tx, claim)
 	if err != nil {
 		return err
 	}
@@ -467,7 +542,14 @@ WHERE id = ? AND status = 'RUNNING' AND attempt_no = ? AND worker_id = ? AND lea
 	if affected, err := jobResult.RowsAffected(); err != nil || affected != 1 {
 		return ErrStaleJobClaim
 	}
-	if err := finishAttempt(ctx, tx, claim, attemptStatus, "", now); err != nil {
+	consumedMillis := result.TimeMillis
+	if cancelled {
+		consumedMillis = 0
+	}
+	if err := settleAttemptReservation(ctx, tx, claim, consumedMillis); err != nil {
+		return err
+	}
+	if err := finishAttempt(ctx, tx, claim, attemptStatus, "", consumedMillis, now); err != nil {
 		return err
 	}
 	job, err := getExternalJobByInternalID(ctx, tx, claim.Job.InternalID)
@@ -538,11 +620,14 @@ WHERE id = ? AND status = 'RUNNING' AND attempt_no = ? AND worker_id = ? AND lea
 	if affected, err := jobResult.RowsAffected(); err != nil || affected != 1 {
 		return "", ErrStaleJobClaim
 	}
+	if err := settleAttemptReservation(ctx, tx, claim, 0); err != nil {
+		return "", err
+	}
 	attemptStatus := "FAILED"
 	if cancelled {
 		attemptStatus = "CANCELLED"
 	}
-	if err := finishAttempt(ctx, tx, claim, attemptStatus, attemptFailureCode, now); err != nil {
+	if err := finishAttempt(ctx, tx, claim, attemptStatus, attemptFailureCode, 0, now); err != nil {
 		return "", err
 	}
 	if disposition != FailureRequeued {
@@ -608,17 +693,97 @@ WHERE id = ? AND tenant_id = ? AND status = 'RUNNING' AND attempt_no = ? AND wor
 	return cancelRequested.Valid, encodedPolicy, nil
 }
 
-func finishAttempt(ctx context.Context, tx *sql.Tx, claim WorkerJobClaim, status, failureCode string, now time.Time) error {
+func finishAttempt(ctx context.Context, tx *sql.Tx, claim WorkerJobClaim, status, failureCode string, consumedMillis int64, now time.Time) error {
 	result, err := tx.ExecContext(ctx, `
-UPDATE t_external_job_attempt
-SET status = ?, lease_token = NULL, finished_at = ?, failure_code = NULLIF(?, '')
-WHERE job_id = ? AND attempt_no = ? AND worker_id = ? AND lease_token = ? AND status = 'RUNNING'`,
-		status, now, failureCode, claim.Job.InternalID, claim.AttemptNo, claim.WorkerID, claim.LeaseToken)
+	UPDATE t_external_job_attempt
+	SET status = ?, lease_token = NULL, finished_at = ?, failure_code = NULLIF(?, ''),
+	    reserved_execution_millis = 0, consumed_execution_millis = ?
+	WHERE job_id = ? AND attempt_no = ? AND worker_id = ? AND lease_token = ? AND status = 'RUNNING'`,
+		status, now, failureCode, consumedMillis, claim.Job.InternalID, claim.AttemptNo, claim.WorkerID, claim.LeaseToken)
 	if err != nil {
 		return repositoryUnavailable("finish worker attempt", err)
 	}
 	if affected, err := result.RowsAffected(); err != nil || affected != 1 {
 		return ErrStaleJobClaim
+	}
+	return nil
+}
+
+func reserveDailyExecution(ctx context.Context, tx *sql.Tx, tenantID uint64, dailyLimit, reserveMillis int64) (bool, error) {
+	if dailyLimit <= 0 || reserveMillis <= 0 {
+		return false, ErrExternalJobUnavailable
+	}
+	if _, err := tx.ExecContext(ctx, `
+	INSERT INTO t_external_execution_daily(tenant_id, accounting_day)
+	VALUES (?, CURRENT_DATE)
+	ON DUPLICATE KEY UPDATE tenant_id = VALUES(tenant_id)`, tenantID); err != nil {
+		return false, repositoryUnavailable("ensure daily execution ledger", err)
+	}
+	var reserved, consumed int64
+	if err := tx.QueryRowContext(ctx, `
+	SELECT reserved_millis, consumed_millis FROM t_external_execution_daily
+	WHERE tenant_id = ? AND accounting_day = CURRENT_DATE FOR UPDATE`, tenantID).Scan(&reserved, &consumed); err != nil {
+		return false, repositoryUnavailable("lock daily execution ledger", err)
+	}
+	if reserveMillis > dailyLimit || consumed > dailyLimit-reserveMillis || reserved > dailyLimit-reserveMillis-consumed {
+		return false, nil
+	}
+	result, err := tx.ExecContext(ctx, `
+	UPDATE t_external_execution_daily SET reserved_millis = reserved_millis + ?
+	WHERE tenant_id = ? AND accounting_day = CURRENT_DATE`, reserveMillis, tenantID)
+	if err != nil {
+		return false, repositoryUnavailable("reserve daily execution", err)
+	}
+	if affected, err := result.RowsAffected(); err != nil || affected != 1 {
+		return false, repositoryUnavailable("reserve daily execution", ErrExternalJobUnavailable)
+	}
+	return true, nil
+}
+
+func releaseAttemptReservation(ctx context.Context, tx *sql.Tx, tenantID, jobID uint64, attemptNo uint32, consumedMillis int64) error {
+	var accountingDay sql.NullTime
+	var reserved int64
+	if err := tx.QueryRowContext(ctx, `
+	SELECT accounting_day, reserved_execution_millis FROM t_external_job_attempt
+	WHERE tenant_id = ? AND job_id = ? AND attempt_no = ? AND status = 'RUNNING' FOR UPDATE`, tenantID, jobID, attemptNo).
+		Scan(&accountingDay, &reserved); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrStaleJobClaim
+		}
+		return repositoryUnavailable("lock attempt execution reservation", err)
+	}
+	if !accountingDay.Valid || reserved <= 0 {
+		return ErrExternalJobUnavailable
+	}
+	if consumedMillis < 0 {
+		return ErrInvalidJobState
+	}
+	if consumedMillis > reserved {
+		consumedMillis = reserved
+	}
+	result, err := tx.ExecContext(ctx, `
+	UPDATE t_external_execution_daily
+	SET reserved_millis = reserved_millis - ?, consumed_millis = consumed_millis + ?
+	WHERE tenant_id = ? AND accounting_day = ? AND reserved_millis >= ?`, reserved, consumedMillis, tenantID, accountingDay.Time, reserved)
+	if err != nil {
+		return repositoryUnavailable("settle daily execution ledger", err)
+	}
+	if affected, err := result.RowsAffected(); err != nil || affected != 1 {
+		return repositoryUnavailable("settle daily execution ledger", ErrExternalJobUnavailable)
+	}
+	if _, err := tx.ExecContext(ctx, `
+	UPDATE t_external_job
+	SET next_attempt_at = CURRENT_TIMESTAMP(3)
+	WHERE tenant_id = ? AND status = 'QUEUED'
+	  AND next_attempt_at = TIMESTAMP(DATE_ADD(?, INTERVAL 1 DAY))`, tenantID, accountingDay.Time); err != nil {
+		return repositoryUnavailable("wake daily quota jobs after settlement", err)
+	}
+	return nil
+}
+
+func settleAttemptReservation(ctx context.Context, tx *sql.Tx, claim WorkerJobClaim, consumedMillis int64) error {
+	if err := releaseAttemptReservation(ctx, tx, claim.Job.TenantInternalID, claim.Job.InternalID, claim.AttemptNo, consumedMillis); err != nil {
+		return err
 	}
 	return nil
 }
@@ -665,7 +830,7 @@ func mysqlCurrentTime(ctx context.Context, tx *sql.Tx) (time.Time, error) {
 }
 
 func waitForClaimRetry(ctx context.Context) error {
-	timer := time.NewTimer(2 * time.Millisecond)
+	timer := time.NewTimer(10 * time.Millisecond)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():

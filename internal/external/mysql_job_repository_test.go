@@ -82,7 +82,7 @@ func TestMySQLJobRepositoryAdmissionIsIdempotentEncryptedAndTenantOwned(t *testi
 	store := newMemorySourceStore()
 	repository := newTestMySQLJobRepository(t, database, store)
 	request := JudgeJobRequest{
-		BundleID: bundleA, Language: "cpp20", SourceCode: []byte("int main(){return 0;}"),
+		BundleID: bundleA, Language: "cpp", SourceCode: []byte("int main(){return 0;}"),
 		StopOnFailure: true, CallbackID: callbackA, ClientReference: "submission-42",
 	}
 
@@ -161,7 +161,7 @@ func TestMySQLJobRepositoryRejectsPendingBundleOwnership(t *testing.T) {
 	store := newMemorySourceStore()
 	repository := newTestMySQLJobRepository(t, database, store)
 	_, err := repository.Submit(context.Background(), tenantID, "pending-bundle-key", JudgeJobRequest{
-		BundleID: bundleID, Language: "cpp20", SourceCode: []byte("int main(){}"),
+		BundleID: bundleID, Language: "cpp", SourceCode: []byte("int main(){}"),
 	})
 	if !errors.Is(err, ErrExternalJobInvalid) {
 		t.Fatalf("pending bundle submit error = %v", err)
@@ -244,7 +244,7 @@ func TestMySQLJobRepositoryAdmissionWorksWithSingleDatabaseConnection(t *testing
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	result, err := repository.Submit(ctx, tenantID, "single-connection-admission", JudgeJobRequest{
-		BundleID: bundleID, Language: "cpp20", SourceCode: []byte("int main(){}"),
+		BundleID: bundleID, Language: "cpp", SourceCode: []byte("int main(){}"),
 	})
 	if err != nil || result.Job.Status != JobStatusQueued {
 		t.Fatalf("single-connection admission result=%+v error=%v", result, err)
@@ -290,7 +290,7 @@ func TestMySQLJobRepositoryReplaySurvivesPolicyTightening(t *testing.T) {
 	bundleID := strings.Repeat("f", 26)
 	insertTenantBundleAndCallback(t, database, tenantID, bundleID, "", 3)
 	repository := newTestMySQLJobRepository(t, database, newMemorySourceStore())
-	request := JudgeJobRequest{BundleID: bundleID, Language: "cpp20", SourceCode: []byte("int main(){}")}
+	request := JudgeJobRequest{BundleID: bundleID, Language: "cpp", SourceCode: []byte("int main(){}")}
 	first, err := repository.Submit(context.Background(), tenantID, "policy-replay-key", request)
 	if err != nil {
 		t.Fatal(err)
@@ -322,7 +322,7 @@ func TestMySQLJobRepositoryListUsesStableTenantBoundCursor(t *testing.T) {
 	jobIDs := make([]string, 0, 4)
 	for index := 0; index < 4; index++ {
 		result, err := repository.Submit(context.Background(), tenantA, fmt.Sprintf("list-job-key-%04d", index), JudgeJobRequest{
-			BundleID: bundleA, Language: "cpp20", SourceCode: []byte(fmt.Sprintf("int main(){return %d;}", index)),
+			BundleID: bundleA, Language: "cpp", SourceCode: []byte(fmt.Sprintf("int main(){return %d;}", index)),
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -330,7 +330,7 @@ func TestMySQLJobRepositoryListUsesStableTenantBoundCursor(t *testing.T) {
 		jobIDs = append(jobIDs, result.Job.ExternalID)
 	}
 	if _, err := repository.Submit(context.Background(), tenantB, "list-other-tenant", JudgeJobRequest{
-		BundleID: bundleB, Language: "cpp20", SourceCode: []byte("int main(){}"),
+		BundleID: bundleB, Language: "cpp", SourceCode: []byte("int main(){}"),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -378,7 +378,7 @@ func TestMySQLJobRepositorySweepsOnlyUnreferencedSourceReservations(t *testing.T
 	store := newMemorySourceStore()
 	repository := newTestMySQLJobRepository(t, database, store)
 	accepted, err := repository.Submit(context.Background(), tenantID, "reservation-linked-key", JudgeJobRequest{
-		BundleID: bundleID, Language: "cpp20", SourceCode: []byte("int main(){}"),
+		BundleID: bundleID, Language: "cpp", SourceCode: []byte("int main(){}"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -546,7 +546,7 @@ func prepareExternalJobDatabase(t *testing.T, database *sql.DB) {
 		t.Fatal(err)
 	}
 	for _, table := range []string{
-		"t_external_webhook_outbox", "t_external_job_attempt", "t_external_idempotency",
+		"t_external_retention_audit", "t_external_execution_daily", "t_external_webhook_outbox", "t_external_job_attempt", "t_external_idempotency",
 		"t_external_job", "t_external_source_reservation", "t_external_source_object", "t_external_callback", "t_external_bundle",
 		"t_external_api_key", "t_external_tenant",
 	} {
@@ -622,9 +622,9 @@ func assertMySQLDoesNotContain(t *testing.T, database *sql.DB, plaintext string)
 	var matches int
 	query := `
 SELECT COUNT(*) FROM (
-    SELECT object_key AS value FROM t_external_source_object
-    UNION ALL SELECT client_reference FROM t_external_job
-    UNION ALL SELECT CAST(response_json AS CHAR) FROM t_external_idempotency
+    SELECT CONVERT(object_key USING utf8mb4) AS value FROM t_external_source_object
+    UNION ALL SELECT CONVERT(client_reference USING utf8mb4) FROM t_external_job
+    UNION ALL SELECT CONVERT(CAST(response_json AS CHAR) USING utf8mb4) FROM t_external_idempotency
 ) AS persisted WHERE INSTR(COALESCE(value, ''), ?) > 0`
 	if err := database.QueryRow(query, plaintext).Scan(&matches); err != nil {
 		t.Fatal(err)

@@ -14,7 +14,7 @@ func TestEmbeddedMigrationsDefineTheCompleteJudgeOwnedSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(migrations) != 5 || migrations[0].Version != 1 || migrations[0].Name != "initial_external_judge" || migrations[1].Version != 2 || migrations[1].Name != "external_bundle_ready" || migrations[2].Version != 3 || migrations[2].Name != "durable_job_fencing" || migrations[3].Version != 4 || migrations[3].Name != "tenant_policy_execution_ceilings" || migrations[4].Version != 5 || migrations[4].Name != "durable_webhook_outbox" {
+	if len(migrations) != 6 || migrations[0].Version != 1 || migrations[0].Name != "initial_external_judge" || migrations[1].Version != 2 || migrations[1].Name != "external_bundle_ready" || migrations[2].Version != 3 || migrations[2].Name != "durable_job_fencing" || migrations[3].Version != 4 || migrations[3].Name != "tenant_policy_execution_ceilings" || migrations[4].Version != 5 || migrations[4].Name != "durable_webhook_outbox" || migrations[5].Version != 6 || migrations[5].Name != "execution_accounting_retention" {
 		t.Fatalf("migrations = %+v", migrations)
 	}
 	if len(migrations[0].Checksum) != 64 {
@@ -128,7 +128,7 @@ func TestDurableWebhookMigrationDefinesFencedOutboxAndDisablesLegacyCallbacks(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(migrations) != 5 || migrations[4].Version != 5 || migrations[4].Name != "durable_webhook_outbox" {
+	if len(migrations) < 5 || migrations[4].Version != 5 || migrations[4].Name != "durable_webhook_outbox" {
 		t.Fatalf("migrations = %+v", migrations)
 	}
 	sql := strings.ToLower(migrations[4].SQL)
@@ -142,6 +142,34 @@ func TestDurableWebhookMigrationDefinesFencedOutboxAndDisablesLegacyCallbacks(t 
 		"add column dead_at datetime(3)",
 		"unique key uk_external_webhook_job (job_id)",
 		"check (status in ('pending','delivering','delivered','dead'))",
+	} {
+		if !strings.Contains(sql, contract) {
+			t.Errorf("migration is missing contract %q", contract)
+		}
+	}
+}
+
+func TestExecutionAccountingAndRetentionMigrationDefinesDurableContracts(t *testing.T) {
+	migrations, err := Migrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(migrations) != 6 || migrations[5].Version != 6 || migrations[5].Name != "execution_accounting_retention" {
+		t.Fatalf("migrations = %+v", migrations)
+	}
+	sql := strings.ToLower(migrations[5].SQL)
+	for _, contract := range []string{
+		"last_claimed_at datetime(3)",
+		"create table if not exists t_external_execution_daily",
+		"accounting_day date not null",
+		"reserved_millis bigint unsigned not null",
+		"consumed_millis bigint unsigned not null",
+		"add column accounting_day date",
+		"add column reserved_execution_millis bigint unsigned",
+		"add column consumed_execution_millis bigint unsigned",
+		"add column delete_token binary(32)",
+		"create table if not exists t_external_retention_audit",
+		"unique key uk_external_execution_daily (tenant_id, accounting_day)",
 	} {
 		if !strings.Contains(sql, contract) {
 			t.Errorf("migration is missing contract %q", contract)
@@ -209,7 +237,7 @@ func TestApplyMigrationsUsesAnAdvisoryLockAndRecordsChecksums(t *testing.T) {
 		t.Fatalf("first execution = %s", connection.executions[0].query)
 	}
 	last := connection.executions[len(connection.executions)-1]
-	if !strings.Contains(strings.ToLower(last.query), "insert into t_judge_schema_history") || fmt.Sprint(last.arguments) != fmt.Sprint([]any{5, "durable_webhook_outbox", migrations[4].Checksum}) {
+	if !strings.Contains(strings.ToLower(last.query), "insert into t_judge_schema_history") || fmt.Sprint(last.arguments) != fmt.Sprint([]any{6, "execution_accounting_retention", migrations[5].Checksum}) {
 		t.Fatalf("history execution = %#v", last)
 	}
 }

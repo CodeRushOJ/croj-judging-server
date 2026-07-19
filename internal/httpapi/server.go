@@ -26,6 +26,7 @@ type Server struct {
 	bundles          BundleApplication
 	bundleWriteQuota external.Quota
 	bundleWriteLimit external.QuotaLimit
+	bundleUploads    chan struct{}
 }
 
 func WithJobWriteQuota(quota external.Quota, jobSubmitLimit external.QuotaLimit) ServerOption {
@@ -50,6 +51,16 @@ func WithJobService(service JobService) ServerOption {
 			return fmt.Errorf("job service is required")
 		}
 		server.jobs = service
+		return nil
+	}
+}
+
+func WithBundleUploadConcurrency(maximum int) ServerOption {
+	return func(server *Server) error {
+		if maximum < 1 || maximum > 1024 {
+			return fmt.Errorf("bundle upload concurrency must be between 1 and 1024")
+		}
+		server.bundleUploads = make(chan struct{}, maximum)
 		return nil
 	}
 }
@@ -79,6 +90,9 @@ func NewServer(authenticator RequestAuthenticator, capabilities Capabilities, op
 	}
 	if server.bundles != nil && server.bundleWriteLimit.Capacity < capabilities.Limits.MaxBundleBytes {
 		return nil, fmt.Errorf("bundle write quota capacity must cover the maximum bundle size")
+	}
+	if server.bundles != nil && server.bundleUploads == nil {
+		server.bundleUploads = make(chan struct{}, 4)
 	}
 	return server, nil
 }

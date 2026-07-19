@@ -33,6 +33,14 @@ type ExternalAPIConfig struct {
 	RetryDelay               string `yaml:"retry-delay"`
 	ShutdownTimeout          string `yaml:"shutdown-timeout"`
 	ReadinessTimeout         string `yaml:"readiness-timeout"`
+	ReadHeaderTimeout        string `yaml:"read-header-timeout"`
+	ReadTimeout              string `yaml:"read-timeout"`
+	WriteTimeout             string `yaml:"write-timeout"`
+	IdleTimeout              string `yaml:"idle-timeout"`
+	BundleUploadConcurrency  int    `yaml:"bundle-upload-concurrency"`
+	SourceRetention          string `yaml:"source-retention"`
+	RetentionIdleDelay       string `yaml:"retention-idle-delay"`
+	RetentionDeleteTimeout   string `yaml:"retention-delete-timeout"`
 	RedisAddress             string `yaml:"redis-address"`
 	RedisPassword            string `yaml:"redis-password"`
 	RedisDB                  int    `yaml:"redis-db"`
@@ -166,6 +174,13 @@ func (config *Config) applyEnvironment() error {
 	overrideString(&config.ExternalAPI.RetryDelay, "EXTERNAL_WORKER_RETRY_DELAY")
 	overrideString(&config.ExternalAPI.ShutdownTimeout, "EXTERNAL_API_SHUTDOWN_TIMEOUT")
 	overrideString(&config.ExternalAPI.ReadinessTimeout, "EXTERNAL_API_READINESS_TIMEOUT")
+	overrideString(&config.ExternalAPI.ReadHeaderTimeout, "EXTERNAL_API_READ_HEADER_TIMEOUT")
+	overrideString(&config.ExternalAPI.ReadTimeout, "EXTERNAL_API_READ_TIMEOUT")
+	overrideString(&config.ExternalAPI.WriteTimeout, "EXTERNAL_API_WRITE_TIMEOUT")
+	overrideString(&config.ExternalAPI.IdleTimeout, "EXTERNAL_API_IDLE_TIMEOUT")
+	overrideString(&config.ExternalAPI.SourceRetention, "EXTERNAL_SOURCE_RETENTION")
+	overrideString(&config.ExternalAPI.RetentionIdleDelay, "EXTERNAL_RETENTION_IDLE_DELAY")
+	overrideString(&config.ExternalAPI.RetentionDeleteTimeout, "EXTERNAL_RETENTION_DELETE_TIMEOUT")
 	overrideString(&config.ExternalAPI.RedisAddress, "REDIS_ADDRESS")
 	overrideString(&config.ExternalAPI.RedisPassword, "REDIS_PASSWORD")
 	overrideString(&config.ExternalAPI.RedisQuotaPrefix, "EXTERNAL_REDIS_QUOTA_PREFIX")
@@ -185,6 +200,9 @@ func (config *Config) applyEnvironment() error {
 		return err
 	}
 	if err := overridePositiveInt(&config.ExternalAPI.WebhookWorkerConcurrency, "EXTERNAL_WEBHOOK_WORKER_CONCURRENCY"); err != nil {
+		return err
+	}
+	if err := overridePositiveInt(&config.ExternalAPI.BundleUploadConcurrency, "EXTERNAL_BUNDLE_UPLOAD_CONCURRENCY"); err != nil {
 		return err
 	}
 	if value, ok := os.LookupEnv("LEGACY_JUDGE_ENABLED"); ok {

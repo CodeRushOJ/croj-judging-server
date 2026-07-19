@@ -63,6 +63,14 @@ func (server *Server) serveBundleCollection(response http.ResponseWriter, reques
 		writeBundleProblem(response, requestID, external.ErrInvalidIdempotency)
 		return
 	}
+	select {
+	case server.bundleUploads <- struct{}{}:
+		defer func() { <-server.bundleUploads }()
+	default:
+		response.Header().Set("Retry-After", "1")
+		writeProblem(response, problemFor(http.StatusServiceUnavailable, "upload-capacity-exhausted", "Upload capacity exhausted", "Retry the bundle upload later.", requestID))
+		return
+	}
 	const multipartEnvelopeBytes = int64(1 << 20)
 	maxBundleBytes := server.capabilities.Limits.MaxBundleBytes
 	if maxBundleBytes <= 0 || maxBundleBytes > math.MaxInt64-multipartEnvelopeBytes {

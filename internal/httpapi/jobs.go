@@ -67,6 +67,7 @@ type JobView struct {
 	StatusURL       string         `json:"statusUrl,omitempty"`
 	CreatedAt       time.Time      `json:"createdAt"`
 	ClientReference string         `json:"clientReference,omitempty"`
+	FailureCode     string         `json:"failureCode,omitempty"`
 	Result          *JobResultView `json:"result,omitempty"`
 }
 

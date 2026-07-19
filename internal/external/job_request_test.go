@@ -45,7 +45,7 @@ func TestIdempotencyKeyDigestUsesASeparatePepperedHMAC(t *testing.T) {
 func TestCanonicalJobRequestHashCoversEveryMeaningfulFieldWithoutRetainingSource(t *testing.T) {
 	base := JudgeJobRequest{
 		BundleID:        "ceirceirceirceirceirceirce",
-		Language:        "cpp20",
+		Language:        "cpp",
 		SourceCode:      []byte("int main() { return 0; }"),
 		StopOnFailure:   true,
 		CallbackID:      "ceirceirceirceirceirceircf",
@@ -83,14 +83,14 @@ func TestCanonicalJobRequestHashCoversEveryMeaningfulFieldWithoutRetainingSource
 }
 
 func TestCanonicalJobRequestRejectsInvalidOrOversizeFields(t *testing.T) {
-	valid := JudgeJobRequest{BundleID: "ceirceirceirceirceirceirce", Language: "cpp20", SourceCode: []byte("x")}
+	valid := JudgeJobRequest{BundleID: "ceirceirceirceirceirceirce", Language: "cpp", SourceCode: []byte("x")}
 	tests := map[string]JudgeJobRequest{
-		"bundle":       {Language: "cpp20", SourceCode: []byte("x")},
+		"bundle":       {Language: "cpp", SourceCode: []byte("x")},
 		"language":     {BundleID: valid.BundleID, Language: "../../bin/sh", SourceCode: []byte("x")},
-		"empty source": {BundleID: valid.BundleID, Language: "cpp20"},
-		"large source": {BundleID: valid.BundleID, Language: "cpp20", SourceCode: []byte("xx")},
-		"callback":     {BundleID: valid.BundleID, Language: "cpp20", SourceCode: []byte("x"), CallbackID: "bad"},
-		"reference":    {BundleID: valid.BundleID, Language: "cpp20", SourceCode: []byte("x"), ClientReference: strings.Repeat("x", 256)},
+		"empty source": {BundleID: valid.BundleID, Language: "cpp"},
+		"large source": {BundleID: valid.BundleID, Language: "cpp", SourceCode: []byte("xx")},
+		"callback":     {BundleID: valid.BundleID, Language: "cpp", SourceCode: []byte("x"), CallbackID: "bad"},
+		"reference":    {BundleID: valid.BundleID, Language: "cpp", SourceCode: []byte("x"), ClientReference: strings.Repeat("x", 256)},
 	}
 	for name, request := range tests {
 		t.Run(name, func(t *testing.T) {

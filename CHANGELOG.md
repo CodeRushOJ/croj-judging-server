@@ -6,6 +6,11 @@
 
 ### Added
 
+- 增加唯一 canonical language/checker registry；外部 REST 在持久化前拒绝不受 Sandbox 支持的 ID，capabilities、OpenAPI、bundle 与 compile-once gRPC 使用一致标识。
+- 增加 MySQL `CURRENT_DATE` 日执行额度账本、attempt 原子预留/实际结算/失败释放与 lease 崩溃恢复；tenant claim 使用持久公平游标和 `SKIP LOCKED`。
+- 增加终态 job/加密源码两阶段 retention：引用检查、delete token fencing、对象删除重试、独立审计和 schema v6 postcondition。
+- 增加 HTTP header/read/write/idle timeout、bundle 上传并发上限，以及轮询 `failureCode` 合约。
+
 - 增加 RocketMQ 与 durable REST worker 共用的 canonical compile-once batch execution core，按顺序保留 case 结果并统一 AC/WA/CE/TLE/MLE/RE/SE 映射。
 - immutable bundle manifest 增加必填时间/内存限制；tenant policy 与 capabilities 增加对应上限，上传在平台或租户 ceiling 外 fail closed。
 - 增加 headless Kubernetes Service、`dns:///...` gRPC target 与 `round_robin` Pod endpoint 分配，手工 EndpointSlice 调度降级为 deprecated fallback。
@@ -24,7 +29,7 @@
 - 增加多副本 webhook delivery lease：MySQL 时钟、per-tenant head fairness、`FOR UPDATE SKIP LOCKED`、attempt/token fencing、崩溃重领及 stale settlement 拒绝；相同 `eventId`/body 按 at-least-once 语义重投。
 - 增加结构化 webhook outcome、完整 HTTP retry/permanent matrix、有界 `Retry-After`、指数 jitter、12 次/24 小时默认边界、`DEAD` 审计和 30 天 terminal retention。
 - 增加真实 MySQL 8.4.10 webhook 合约门禁，覆盖原子终态、lease recovery、精确 HMAC body、远端成功但 settlement 丢失后的稳定重投。
-- 将 callback/source 多版本 key ring、独立 Judge DSN、schema v5 校验与多副本 webhook worker 接入生产 lifecycle；仅启用异步 REST 时可完全跳过 Backend DB、Backend callback 与 RocketMQ。
+- 将 callback/source 多版本 key ring、独立 Judge DSN、schema v6 校验与多副本 webhook worker 接入生产 lifecycle；仅启用异步 REST 时可完全跳过 Backend DB、Backend callback 与 RocketMQ。
 - 增加 Redis 服务端时间驱动的原子令牌桶，跨 HTTP 副本统一限制租户任务提交与 bundle 实际上传字节；配额状态不确定时新写入 fail closed，已授权读请求保持可用。
 - 增加 `POST/GET /api/v1/bundles`：有界单文件 multipart 流式上传、SHA-256 内容寻址、tenant-scoped 元数据与 RFC 9457 错误。
 - 增加外部题包 ZIP 安全复用校验、case CRC/size/UTF-8 流式核验、取消/超限清理、MySQL 原子 ownership+幂等事务及并发单逻辑记录回归。

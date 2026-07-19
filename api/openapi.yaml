@@ -4,8 +4,9 @@ info:
   version: 1.0.0-beta.1
   summary: Asynchronous, tenant-isolated judging for external OJ systems
   description: |
-    This Draft contract documents the external OJ REST handlers that are already
-    implemented. This branch does not start or expose an HTTP listener.
+    This contract documents the external OJ REST handlers and durable workers.
+    The HTTP listener starts only when `EXTERNAL_API_ENABLED=true` and schema v6
+    plus its runtime dependencies pass readiness checks.
 
     Clients upload one immutable hidden-test bundle, submit an idempotent judge
     job, and poll its status URL until it reaches `SUCCEEDED`, `FAILED`, or
@@ -63,9 +64,21 @@ paths:
               example:
                 apiVersion: v1
                 languages:
-                  - id: cpp20
+                  - id: go
+                    displayName: Go
+                    runtime: go
+                  - id: cpp
                     displayName: C++ 20
-                    runtime: gcc-14
+                    runtime: gcc
+                  - id: python
+                    displayName: Python 3
+                    runtime: python3
+                  - id: java
+                    displayName: Java
+                    runtime: java
+                  - id: javascript
+                    displayName: JavaScript
+                    runtime: node
                 judgeModes: [ACM]
                 checkers: [exact, token]
                 limits:
@@ -227,7 +240,7 @@ paths:
           -H "Authorization: Bearer ${API_KEY}" \
           -H 'Content-Type: application/json' \
           -H 'Idempotency-Key: example-submit-0001' \
-          --data '{"bundleId":"aaaaaaaaaaaaaaaaaaaaaaaaaa","language":"cpp20","sourceCode":"int main(){return 0;}","stopOnFailure":true,"clientReference":"submission-42"}'
+          --data '{"bundleId":"aaaaaaaaaaaaaaaaaaaaaaaaaa","language":"cpp","sourceCode":"int main(){return 0;}","stopOnFailure":true,"clientReference":"submission-42"}'
         ```
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -239,7 +252,7 @@ paths:
               $ref: '#/components/schemas/SubmitJobRequest'
             example:
               bundleId: aaaaaaaaaaaaaaaaaaaaaaaaaa
-              language: cpp20
+              language: cpp
               sourceCode: 'int main(){return 0;}'
               stopOnFailure: true
               clientReference: submission-42
@@ -1103,6 +1116,10 @@ components:
         clientReference:
           type: string
           maxLength: 255
+        failureCode:
+          type: string
+          pattern: '^[A-Z][A-Z0-9_]{0,63}$'
+          description: Stable machine-readable reason present when the job failed before producing a result.
         result:
           $ref: '#/components/schemas/JobResultView'
     JobListPage:

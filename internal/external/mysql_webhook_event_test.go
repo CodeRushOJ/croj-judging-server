@@ -57,7 +57,7 @@ WHERE external_id = ?`, tenantID); err != nil {
 	assertPendingTerminalEvent(t, database, failed.Job.ExternalID, "judge.job.failed", JobStatusFailed)
 
 	withoutCallback, err := repository.Submit(context.Background(), tenantID, "webhook-none-0001", JudgeJobRequest{
-		BundleID: bundleID, Language: "cpp20", SourceCode: []byte("int main(){}"),
+		BundleID: bundleID, Language: "cpp", SourceCode: []byte("int main(){}"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -401,7 +401,7 @@ FROM t_external_tenant WHERE external_id = ?`, callbackID, tenantID); err != nil
 	}
 	repository := newTestMySQLJobRepository(t, database, newMemorySourceStore())
 	_, err := repository.Submit(context.Background(), tenantID, "incomplete-callback", JudgeJobRequest{
-		BundleID: bundleID, Language: "cpp20", SourceCode: []byte("int main(){}"), CallbackID: callbackID,
+		BundleID: bundleID, Language: "cpp", SourceCode: []byte("int main(){}"), CallbackID: callbackID,
 	})
 	if !errors.Is(err, ErrExternalJobInvalid) {
 		t.Fatalf("incomplete callback submit error=%v", err)
@@ -430,7 +430,7 @@ func TestMySQLSubmitLocksAdmittedCallbackUntilCommit(t *testing.T) {
 	submitResult := make(chan error, 1)
 	go func() {
 		_, err := repository.MySQLJobRepository.Submit(context.Background(), tenantID, "callback-lock-submit", JudgeJobRequest{
-			BundleID: bundleID, Language: "cpp20", SourceCode: []byte("int main(){}"), CallbackID: callbackID,
+			BundleID: bundleID, Language: "cpp", SourceCode: []byte("int main(){}"), CallbackID: callbackID,
 		}, func() error {
 			close(admitted)
 			<-release
@@ -477,7 +477,7 @@ func TestMySQLSubmitLocksAdmittedCallbackUntilCommit(t *testing.T) {
 func submitWebhookJob(t *testing.T, repository *testMySQLJobRepository, tenantID, bundleID, callbackID, key string) SubmitJobResult {
 	t.Helper()
 	job, err := repository.Submit(context.Background(), tenantID, key, JudgeJobRequest{
-		BundleID: bundleID, Language: "cpp20", SourceCode: []byte("int main(){}"),
+		BundleID: bundleID, Language: "cpp", SourceCode: []byte("int main(){}"),
 		CallbackID: callbackID, ClientReference: key,
 	})
 	if err != nil {

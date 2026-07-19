@@ -79,7 +79,7 @@ func TestSubmitJudgeJobReturns202AndNeverEchoesSource(t *testing.T) {
 		ClientReference: "submission-42",
 	}}
 	server := newJobTestServer(t, service, ScopeJobSubmit)
-	body := `{"bundleId":"ceirceirceirceirceirceircf","language":"cpp20","sourceCode":"secret source","stopOnFailure":true,"callbackId":"ceirceirceirceirceirceircg","clientReference":"submission-42"}`
+	body := `{"bundleId":"ceirceirceirceirceirceircf","language":"cpp","sourceCode":"secret source","stopOnFailure":true,"callbackId":"ceirceirceirceirceirceircg","clientReference":"submission-42"}`
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs", strings.NewReader(body))
 	request.Header.Set("Authorization", "Bearer valid")
 	request.Header.Set("Idempotency-Key", "submission-00000042")
@@ -101,9 +101,9 @@ func TestSubmitJudgeJobUsesStrictJSONAndRequiresIdempotencyKey(t *testing.T) {
 	service := &jobServiceStub{}
 	server := newJobTestServer(t, service, ScopeJobSubmit)
 	for name, test := range map[string]struct{ key, body string }{
-		"missing key":   {"", `{"bundleId":"ceirceirceirceirceirceircf","language":"cpp20","sourceCode":"x"}`},
-		"unknown field": {"submission-00000042", `{"bundleId":"ceirceirceirceirceirceircf","language":"cpp20","sourceCode":"x","limits":{"cpu":99}}`},
-		"trailing JSON": {"submission-00000042", `{"bundleId":"ceirceirceirceirceirceircf","language":"cpp20","sourceCode":"x"}{}`},
+		"missing key":   {"", `{"bundleId":"ceirceirceirceirceirceircf","language":"cpp","sourceCode":"x"}`},
+		"unknown field": {"submission-00000042", `{"bundleId":"ceirceirceirceirceirceircf","language":"cpp","sourceCode":"x","limits":{"cpu":99}}`},
+		"trailing JSON": {"submission-00000042", `{"bundleId":"ceirceirceirceirceirceircf","language":"cpp","sourceCode":"x"}{}`},
 	} {
 		t.Run(name, func(t *testing.T) {
 			request := httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs", strings.NewReader(test.body))
@@ -121,7 +121,7 @@ func TestSubmitJudgeJobUsesStrictJSONAndRequiresIdempotencyKey(t *testing.T) {
 func TestSubmitJudgeJobRejectsMultipleIdempotencyHeaders(t *testing.T) {
 	service := &jobServiceStub{}
 	server := newJobTestServer(t, service, ScopeJobSubmit)
-	request := httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs", strings.NewReader(`{"bundleId":"ceirceirceirceirceirceircf","language":"cpp20","sourceCode":"x"}`))
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs", strings.NewReader(`{"bundleId":"ceirceirceirceirceirceircf","language":"cpp","sourceCode":"x"}`))
 	request.Header.Set("Authorization", "Bearer valid")
 	request.Header.Add("Idempotency-Key", "submission-00000042")
 	request.Header.Add("Idempotency-Key", "submission-00000043")
@@ -136,7 +136,7 @@ func TestSubmitJudgeJobWireLimitAllowsWorstCaseEscapedSource(t *testing.T) {
 	service := &jobServiceStub{view: JobView{JobID: "ceirceirceirceirceirceirce", Status: JobQueued}}
 	server := newJobTestServer(t, service, ScopeJobSubmit)
 	source := strings.Repeat("\x01", 1<<20)
-	body, err := json.Marshal(SubmitJobCommand{BundleID: "ceirceirceirceirceirceircf", Language: "cpp20", SourceCode: source})
+	body, err := json.Marshal(SubmitJobCommand{BundleID: "ceirceirceirceirceirceircf", Language: "cpp", SourceCode: source})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +233,7 @@ func TestJobNotFoundIsAlways404WithoutExistenceDisclosure(t *testing.T) {
 func TestIdempotencyConflictMapsTo409(t *testing.T) {
 	service := &jobServiceStub{err: ErrIdempotencyConflict}
 	server := newJobTestServer(t, service, ScopeJobSubmit)
-	request := httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs", strings.NewReader(`{"bundleId":"ceirceirceirceirceirceircf","language":"cpp20","sourceCode":"x"}`))
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs", strings.NewReader(`{"bundleId":"ceirceirceirceirceirceircf","language":"cpp","sourceCode":"x"}`))
 	request.Header.Set("Authorization", "Bearer valid")
 	request.Header.Set("Idempotency-Key", "submission-00000042")
 	response := httptest.NewRecorder()
@@ -246,7 +246,7 @@ func TestIdempotencyConflictMapsTo409(t *testing.T) {
 func TestQueuedQuotaMapsTo429WithoutPolicyDisclosure(t *testing.T) {
 	service := &jobServiceStub{err: ErrJobQuotaExceeded}
 	server := newJobTestServer(t, service, ScopeJobSubmit)
-	request := httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs", strings.NewReader(`{"bundleId":"ceirceirceirceirceirceircf","language":"cpp20","sourceCode":"x"}`))
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs", strings.NewReader(`{"bundleId":"ceirceirceirceirceirceircf","language":"cpp","sourceCode":"x"}`))
 	request.Header.Set("Authorization", "Bearer valid")
 	request.Header.Set("Idempotency-Key", "submission-00000042")
 	response := httptest.NewRecorder()
@@ -291,7 +291,7 @@ func TestIdempotentReplayBypassesUnavailableNewWriteQuota(t *testing.T) {
 	service := &jobServiceStub{replayed: true, view: JobView{JobID: "ceirceirceirceirceirceirce", Status: JobQueued}}
 	quota := &writeQuotaStub{err: external.ErrQuotaUnavailable}
 	server := newJobQuotaTestServer(t, service, quota)
-	request := httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs", strings.NewReader(`{"bundleId":"ceirceirceirceirceirceircf","language":"cpp20","sourceCode":"same source"}`))
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs", strings.NewReader(`{"bundleId":"ceirceirceirceirceirceircf","language":"cpp","sourceCode":"same source"}`))
 	request.Header.Set("Authorization", "Bearer valid")
 	request.Header.Set("Idempotency-Key", "submission-00000042")
 	response := httptest.NewRecorder()
@@ -308,7 +308,7 @@ func TestJobServiceCannotDoubleChargeOneAdmission(t *testing.T) {
 	}
 	quota := &writeQuotaStub{decision: external.QuotaDecision{Allowed: true}}
 	server := newJobQuotaTestServer(t, service, quota)
-	request := httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs", strings.NewReader(`{"bundleId":"ceirceirceirceirceirceircf","language":"cpp20","sourceCode":"source"}`))
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs", strings.NewReader(`{"bundleId":"ceirceirceirceirceirceircf","language":"cpp","sourceCode":"source"}`))
 	request.Header.Set("Authorization", "Bearer valid")
 	request.Header.Set("Idempotency-Key", "submission-00000042")
 	response := httptest.NewRecorder()

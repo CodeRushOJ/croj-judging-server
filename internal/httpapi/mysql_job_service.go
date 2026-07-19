@@ -31,9 +31,13 @@ func (service *MySQLJobService) Submit(
 	command SubmitJobCommand,
 	admit JobAdmission,
 ) (JobView, bool, error) {
+	language, ok := external.ResolveLanguage(command.Language)
+	if !ok {
+		return JobView{}, false, ErrJobInvalid
+	}
 	var admissionErr error
 	result, err := service.repository.Submit(ctx, tenantID, idempotencyKey, external.JudgeJobRequest{
-		BundleID: command.BundleID, Language: command.Language, SourceCode: []byte(command.SourceCode),
+		BundleID: command.BundleID, Language: language.SandboxID, SourceCode: []byte(command.SourceCode),
 		StopOnFailure: command.StopOnFailure, CallbackID: command.CallbackID,
 		ClientReference: command.ClientReference,
 	}, func() error {
@@ -91,7 +95,7 @@ func publicJobView(job external.ExternalJobRecord) (JobView, error) {
 	}
 	view := JobView{
 		JobID: job.ExternalID, Status: status, CreatedAt: job.CreatedAt,
-		ClientReference: job.ClientReference,
+		ClientReference: job.ClientReference, FailureCode: job.FailureCode,
 	}
 	if job.Result != nil {
 		view.Result = &JobResultView{

@@ -77,6 +77,14 @@ sandbox-discovery:
 	t.Setenv("JUDGE_CALLBACK_KEY_VERSION", "2")
 	t.Setenv("JUDGE_CALLBACK_KEYS_JSON", `{"2":"callback-key"}`)
 	t.Setenv("EXTERNAL_WEBHOOK_WORKER_CONCURRENCY", "4")
+	t.Setenv("EXTERNAL_API_READ_HEADER_TIMEOUT", "4s")
+	t.Setenv("EXTERNAL_API_READ_TIMEOUT", "45s")
+	t.Setenv("EXTERNAL_API_WRITE_TIMEOUT", "50s")
+	t.Setenv("EXTERNAL_API_IDLE_TIMEOUT", "70s")
+	t.Setenv("EXTERNAL_BUNDLE_UPLOAD_CONCURRENCY", "7")
+	t.Setenv("EXTERNAL_SOURCE_RETENTION", "1080h")
+	t.Setenv("EXTERNAL_RETENTION_IDLE_DELAY", "2m")
+	t.Setenv("EXTERNAL_RETENTION_DELETE_TIMEOUT", "20s")
 	t.Setenv("LEGACY_JUDGE_ENABLED", "false")
 
 	config, err := LoadConfig(path)
@@ -109,7 +117,11 @@ sandbox-discovery:
 	}
 	if config.ExternalAPI.JudgeDatabaseDSN != "judge:secret@tcp(judge-mysql:3306)/coderushoj_judge" ||
 		config.ExternalAPI.SourceKeysJSON != `{"1":"source-key"}` || config.ExternalAPI.CallbackKeyVersion != "2" ||
-		config.ExternalAPI.CallbackKeysJSON != `{"2":"callback-key"}` || config.ExternalAPI.WebhookWorkerConcurrency != 4 {
+		config.ExternalAPI.CallbackKeysJSON != `{"2":"callback-key"}` || config.ExternalAPI.WebhookWorkerConcurrency != 4 ||
+		config.ExternalAPI.ReadHeaderTimeout != "4s" || config.ExternalAPI.ReadTimeout != "45s" ||
+		config.ExternalAPI.WriteTimeout != "50s" || config.ExternalAPI.IdleTimeout != "70s" ||
+		config.ExternalAPI.BundleUploadConcurrency != 7 || config.ExternalAPI.SourceRetention != "1080h" ||
+		config.ExternalAPI.RetentionIdleDelay != "2m" || config.ExternalAPI.RetentionDeleteTimeout != "20s" {
 		t.Fatalf("external secret/runtime overrides not applied: %+v", config.ExternalAPI)
 	}
 	if config.LegacyJudge.Enabled {

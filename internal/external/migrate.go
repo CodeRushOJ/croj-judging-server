@@ -290,6 +290,9 @@ func validateMigrationPostconditions(ctx context.Context, connection migrationCo
 	case migration.Version == 5 && migration.Name == "durable_webhook_outbox":
 		query = durableWebhookSchemaValidationSQL
 		description = "durable webhook schema"
+	case migration.Version == 6 && migration.Name == "execution_accounting_retention":
+		query = executionAccountingRetentionValidationSQL
+		description = "execution accounting and retention schema"
 	default:
 		return nil
 	}
@@ -302,6 +305,47 @@ func validateMigrationPostconditions(ctx context.Context, connection migrationCo
 	}
 	return nil
 }
+
+const executionAccountingRetentionValidationSQL = `SELECT
+    EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = DATABASE() AND table_name = 't_external_tenant'
+          AND column_name = 'last_claimed_at' AND column_type = 'datetime(3)' AND is_nullable = 'YES'
+    )
+    AND EXISTS (
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = DATABASE() AND table_name = 't_external_execution_daily' AND engine = 'InnoDB'
+    )
+    AND COALESCE((
+        SELECT GROUP_CONCAT(column_name ORDER BY seq_in_index SEPARATOR ',')
+        FROM information_schema.statistics
+        WHERE table_schema = DATABASE() AND table_name = 't_external_execution_daily'
+          AND index_name = 'uk_external_execution_daily' AND non_unique = 0
+    ), '') = 'tenant_id,accounting_day'
+    AND EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = DATABASE() AND table_name = 't_external_job_attempt'
+          AND column_name = 'accounting_day' AND column_type = 'date' AND is_nullable = 'YES'
+    )
+    AND EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = DATABASE() AND table_name = 't_external_job_attempt'
+          AND column_name = 'reserved_execution_millis' AND column_type = 'bigint unsigned' AND is_nullable = 'NO'
+    )
+    AND EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = DATABASE() AND table_name = 't_external_job_attempt'
+          AND column_name = 'consumed_execution_millis' AND column_type = 'bigint unsigned' AND is_nullable = 'NO'
+    )
+    AND EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = DATABASE() AND table_name = 't_external_source_object'
+          AND column_name = 'delete_token' AND column_type = 'binary(32)' AND is_nullable = 'YES'
+    )
+    AND EXISTS (
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = DATABASE() AND table_name = 't_external_retention_audit' AND engine = 'InnoDB'
+    )`
 
 const tenantPolicyCeilingsValidationSQL = `SELECT NOT EXISTS (
     SELECT 1 FROM t_external_tenant

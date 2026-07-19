@@ -467,8 +467,8 @@ type queryerSQL interface {
 }
 
 const externalJobSelect = `
-SELECT job.id, job.external_id, tenant.external_id, bundle.external_id,
-       source.external_id, source.object_key, source.source_sha256,
+SELECT job.id, job.tenant_id, job.external_id, tenant.external_id, bundle.external_id,
+       source.id, source.external_id, source.object_key, source.source_sha256,
        source.source_size_bytes, source.encryption_key_version, source.encryption_nonce,
        callback.external_id, job.status, job.language_id, job.stop_on_failure,
        job.client_reference, job.attempt_no, job.worker_id, job.lease_until,
@@ -495,8 +495,8 @@ func scanExternalJob(scanner rowScannerSQL) (ExternalJobRecord, error) {
 	var resultJSON []byte
 	var keyVersion uint64
 	if err := scanner.Scan(
-		&job.InternalID, &job.ExternalID, &job.TenantExternalID, &job.BundleExternalID,
-		&job.Source.ExternalID, &job.Source.ObjectKey, &job.Source.SHA256,
+		&job.InternalID, &job.TenantInternalID, &job.ExternalID, &job.TenantExternalID, &job.BundleExternalID,
+		&job.Source.InternalID, &job.Source.ExternalID, &job.Source.ObjectKey, &job.Source.SHA256,
 		&job.Source.SizeBytes, &keyVersion, &job.Source.Nonce,
 		&callbackID, &job.Status, &job.Language, &job.StopOnFailure,
 		&clientReference, &job.AttemptNo, &workerID, &leaseUntil,

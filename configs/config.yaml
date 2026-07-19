@@ -54,7 +54,7 @@ sandbox-discovery:
   kubeconfig: ""
 
 # Disabled by default. Enabling this listener also enables durable REST workers
-# and requires MySQL schema v5, Redis, MinIO, source/callback key rings, and DNS.
+# and requires MySQL schema v6, Redis, MinIO, source/callback key rings, and DNS.
 external-api:
   enabled: false
   listen-address: "127.0.0.1:8081"
@@ -67,6 +67,14 @@ external-api:
   retry-delay: "5s"
   shutdown-timeout: "20s"
   readiness-timeout: "2s"
+  read-header-timeout: "5s"
+  read-timeout: "30s"
+  write-timeout: "30s"
+  idle-timeout: "60s"
+  bundle-upload-concurrency: 4
+  source-retention: "720h"
+  retention-idle-delay: "1m"
+  retention-delete-timeout: "30s"
   redis-address: "coderushoj-infra-redis.coderushoj.svc:6379"
   redis-password: ""
   redis-db: 0

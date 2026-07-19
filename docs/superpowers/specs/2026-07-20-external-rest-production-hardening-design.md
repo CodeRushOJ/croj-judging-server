@@ -10,11 +10,11 @@ One registry owns every public language identifier, display name, runtime identi
 
 ## Daily execution accounting
 
-MySQL is authoritative. A daily tenant ledger is keyed by tenant and `CURRENT_DATE`, never application time. Claiming locks tenant policy and today's ledger in a documented order, recovers expired reservations, then atomically reserves the bundle time ceiling. Terminal success/failure/cancellation settles the reservation to measured execution milliseconds; abandoned expired attempts release their reservation before a replacement claim. Replays and process crashes are idempotent through attempt/job fencing.
+MySQL is authoritative. A daily tenant ledger is keyed by tenant and `CURRENT_DATE`, never application time. Claiming follows the fixed tenant → job → ledger/attempt lock order, recovers expired reservations, then atomically reserves the bundle time ceiling. Terminal success settles the reservation to measured execution milliseconds; failure/cancellation releases it, and abandoned expired attempts release their reservation before a replacement claim. Replays and process crashes are idempotent through attempt/job fencing.
 
 ## Fair scheduling
 
-Tenant rows carry a scheduler cursor. A claim first locks one eligible tenant ordered by recovery priority and least-recent service, then locks one eligible job for that tenant. The lock order is tenant then ledger then job. `SKIP LOCKED` allows concurrent workers to select different tenants. Updating the cursor in the same transaction provides bounded round-robin fairness while retaining per-tenant running ceilings.
+Tenant rows carry a scheduler cursor. A claim first locks one eligible tenant ordered by recovery priority and least-recent service, then locks one eligible job for that tenant. The lock order is tenant then job then ledger/attempt. `SKIP LOCKED` allows concurrent workers to select different tenants. Updating the cursor in the same transaction provides bounded round-robin fairness while retaining per-tenant running ceilings.
 
 ## Retention
 

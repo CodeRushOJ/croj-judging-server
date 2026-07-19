@@ -1,11 +1,12 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: coderushoj-judge-schema-v5
+  name: coderushoj-judge-schema-v6
   namespace: coderushoj
   labels:
     app.kubernetes.io/name: croj-judging-server
     app.kubernetes.io/component: schema-migration
+    coderushoj.dev/judge-schema-version: "6"
 spec:
   backoffLimit: 1
   activeDeadlineSeconds: 600
@@ -15,6 +16,7 @@ spec:
       labels:
         app.kubernetes.io/name: croj-judging-server
         app.kubernetes.io/component: schema-migration
+        coderushoj.dev/judge-schema-version: "6"
     spec:
       automountServiceAccountToken: false
       restartPolicy: Never

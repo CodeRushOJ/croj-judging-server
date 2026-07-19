@@ -134,6 +134,34 @@ func newExternalRuntime(
 	if err != nil {
 		return nil, err
 	}
+	readHeaderTimeout, err := positiveDuration(externalConfig.ReadHeaderTimeout, "external API read header")
+	if err != nil {
+		return nil, err
+	}
+	readTimeout, err := positiveDuration(externalConfig.ReadTimeout, "external API read")
+	if err != nil {
+		return nil, err
+	}
+	writeTimeout, err := positiveDuration(externalConfig.WriteTimeout, "external API write")
+	if err != nil {
+		return nil, err
+	}
+	idleTimeout, err := positiveDuration(externalConfig.IdleTimeout, "external API idle")
+	if err != nil {
+		return nil, err
+	}
+	sourceRetention, err := positiveDuration(externalConfig.SourceRetention, "external source retention")
+	if err != nil {
+		return nil, err
+	}
+	retentionIdleDelay, err := positiveDuration(externalConfig.RetentionIdleDelay, "external retention idle")
+	if err != nil {
+		return nil, err
+	}
+	retentionDeleteTimeout, err := positiveDuration(externalConfig.RetentionDeleteTimeout, "external retention delete")
+	if err != nil {
+		return nil, err
+	}
 	idempotencyTTL, err := positiveDuration(externalConfig.IdempotencyTTL, "external idempotency retention")
 	if err != nil {
 		return nil, err
@@ -142,7 +170,7 @@ func newExternalRuntime(
 	if err != nil {
 		return nil, err
 	}
-	if externalConfig.WorkerConcurrency <= 0 || strings.TrimSpace(externalConfig.WorkerID) == "" ||
+	if externalConfig.WorkerConcurrency <= 0 || externalConfig.BundleUploadConcurrency <= 0 || strings.TrimSpace(externalConfig.WorkerID) == "" ||
 		strings.TrimSpace(externalConfig.RedisAddress) == "" || externalConfig.SourceKeyVersion <= 0 || externalConfig.SourceKeyVersion > 65535 {
 		return nil, fmt.Errorf("external worker concurrency and source key version are invalid")
 	}
@@ -214,9 +242,15 @@ func newExternalRuntime(
 		_ = redisClient.Close()
 		return nil, err
 	}
+	languages := make([]httpapi.LanguageCapability, 0, len(external.CanonicalLanguages()))
+	for _, language := range external.CanonicalLanguages() {
+		languages = append(languages, httpapi.LanguageCapability{
+			ID: language.PublicID, DisplayName: language.DisplayName, Runtime: language.Runtime,
+		})
+	}
 	capabilities := httpapi.Capabilities{
-		APIVersion: "v1", Languages: []httpapi.LanguageCapability{{ID: "cpp20", DisplayName: "C++ 20", Runtime: "gcc"}},
-		JudgeModes: []string{"ACM"}, Checkers: []string{"EXACT"},
+		APIVersion: "v1", Languages: languages,
+		JudgeModes: []string{"ACM"}, Checkers: external.CanonicalCheckers(),
 		Limits: httpapi.CapabilityLimits{
 			MaxSourceBytes: external.MaximumSourceBytes, MaxBundleBytes: cfg.TestBundles.MaxObjectBytes,
 			MaxCaseBytes: cfg.TestBundles.MaxCaseBytes, MaxCaseCount: 256,
@@ -228,6 +262,7 @@ func newExternalRuntime(
 		httpapi.WithJobWriteQuota(quota, external.QuotaLimit{Capacity: externalConfig.JobSubmitCapacity, RefillPeriod: quotaRefill}),
 		httpapi.WithBundleApplication(bundleService),
 		httpapi.WithBundleWriteQuota(quota, external.QuotaLimit{Capacity: externalConfig.BundleByteCapacity, RefillPeriod: quotaRefill}),
+		httpapi.WithBundleUploadConcurrency(externalConfig.BundleUploadConcurrency),
 	)
 	if err != nil {
 		_ = redisClient.Close()
@@ -251,13 +286,22 @@ func newExternalRuntime(
 		_ = redisClient.Close()
 		return nil, err
 	}
-	workers := make([]app.Worker, 0, externalConfig.WorkerConcurrency+len(webhookWorkers)+2)
+	retentionWorker, err := external.NewSourceRetentionWorker(external.SourceRetentionWorkerConfig{
+		Repository: jobRepository, Objects: sourceObjects, Retention: sourceRetention,
+		IdleDelay: retentionIdleDelay, DeleteTimeout: retentionDeleteTimeout,
+	})
+	if err != nil {
+		_ = redisClient.Close()
+		return nil, err
+	}
+	workers := make([]app.Worker, 0, externalConfig.WorkerConcurrency+len(webhookWorkers)+3)
 	for index := 0; index < externalConfig.WorkerConcurrency; index++ {
 		workerID := externalConfig.WorkerID + "-" + strconv.Itoa(index)
 		workers = append(workers, app.NewWorker(func(ctx context.Context) error { return runner.Run(ctx, workerID, idleBackoff) }))
 	}
 	workers = append(workers, webhookWorkers...)
 	workers = append(workers, app.NewWorker(reservationWorker.Run))
+	workers = append(workers, app.NewWorker(retentionWorker.Run))
 	reconciler, err := external.NewBundleReconciler(bundleService)
 	if err != nil {
 		_ = redisClient.Close()
@@ -284,6 +328,8 @@ func newExternalRuntime(
 	runtime, err := app.NewRuntime(app.Config{
 		Enabled: true, ListenAddress: externalConfig.ListenAddress,
 		ReadinessTimeout: readinessTimeout, ShutdownTimeout: shutdownTimeout,
+		ReadHeaderTimeout: readHeaderTimeout, ReadTimeout: readTimeout,
+		WriteTimeout: writeTimeout, IdleTimeout: idleTimeout,
 	}, handler, workers, probes)
 	if err != nil {
 		_ = redisClient.Close()

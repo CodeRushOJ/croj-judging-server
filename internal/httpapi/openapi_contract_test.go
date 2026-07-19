@@ -108,7 +108,7 @@ func TestOpenAPIContractCoversLiveHandlerResponses(t *testing.T) {
 		return server, request
 	}
 	jobRequest := func(t *testing.T, service *jobServiceStub) (*Server, *http.Request) {
-		return jobRawRequest(t, service, `{"bundleId":"ceirceirceirceirceirceircf","language":"cpp20","sourceCode":"x"}`, "submission-00000042")
+		return jobRawRequest(t, service, `{"bundleId":"ceirceirceirceirceirceircf","language":"cpp","sourceCode":"x"}`, "submission-00000042")
 	}
 	bundleRequest := func(t *testing.T, application *bundleApplicationStub, quota external.Quota) (*Server, *http.Request) {
 		if quota == nil {
@@ -257,13 +257,13 @@ func TestOpenAPIContractCoversLiveHandlerResponses(t *testing.T) {
 			return jobRequest(t, &jobServiceStub{view: JobView{JobID: "ceirceirceirceirceirceirce", Status: JobQueued}, replayed: true})
 		}, 202, []string{"X-Request-Id", "Location", "Idempotent-Replay"}},
 		"job missing idempotency": {"/api/v1/judge-jobs", http.MethodPost, func(t *testing.T) (*Server, *http.Request) {
-			return jobRawRequest(t, &jobServiceStub{}, `{"bundleId":"ceirceirceirceirceirceircf","language":"cpp20","sourceCode":"x"}`)
+			return jobRawRequest(t, &jobServiceStub{}, `{"bundleId":"ceirceirceirceirceirceircf","language":"cpp","sourceCode":"x"}`)
 		}, 400, []string{"X-Request-Id"}},
 		"job repeated idempotency": {"/api/v1/judge-jobs", http.MethodPost, func(t *testing.T) (*Server, *http.Request) {
-			return jobRawRequest(t, &jobServiceStub{}, `{"bundleId":"ceirceirceirceirceirceircf","language":"cpp20","sourceCode":"x"}`, "submission-00000042", "submission-00000043")
+			return jobRawRequest(t, &jobServiceStub{}, `{"bundleId":"ceirceirceirceirceirceircf","language":"cpp","sourceCode":"x"}`, "submission-00000042", "submission-00000043")
 		}, 400, []string{"X-Request-Id"}},
 		"job invalid idempotency": {"/api/v1/judge-jobs", http.MethodPost, func(t *testing.T) (*Server, *http.Request) {
-			return jobRawRequest(t, &jobServiceStub{}, `{"bundleId":"ceirceirceirceirceirceircf","language":"cpp20","sourceCode":"x"}`, "short")
+			return jobRawRequest(t, &jobServiceStub{}, `{"bundleId":"ceirceirceirceirceirceircf","language":"cpp","sourceCode":"x"}`, "short")
 		}, 400, []string{"X-Request-Id"}},
 		"job invalid JSON": {"/api/v1/judge-jobs", http.MethodPost, func(t *testing.T) (*Server, *http.Request) {
 			return jobRawRequest(t, &jobServiceStub{}, `{"sourceCode":`, "submission-00000042")
@@ -294,14 +294,14 @@ func TestOpenAPIContractCoversLiveHandlerResponses(t *testing.T) {
 		"job quota exceeded": {"/api/v1/judge-jobs", http.MethodPost, func(t *testing.T) (*Server, *http.Request) {
 			quota := &writeQuotaStub{decision: external.QuotaDecision{Allowed: false, RetryAfter: time.Second}}
 			server := newJobServer(t, staticAuthenticator{principal: Principal{TenantID: "tenant-7", scopes: allScopes}}, &jobServiceStub{view: JobView{JobID: "ceirceirceirceirceirceirce"}}, quota)
-			request := httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs", strings.NewReader(`{"bundleId":"ceirceirceirceirceirceircf","language":"cpp20","sourceCode":"x"}`))
+			request := httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs", strings.NewReader(`{"bundleId":"ceirceirceirceirceirceircf","language":"cpp","sourceCode":"x"}`))
 			request.Header.Set("Idempotency-Key", "submission-00000042")
 			return server, request
 		}, 429, []string{"X-Request-Id", "Retry-After"}},
 		"job quota unavailable": {"/api/v1/judge-jobs", http.MethodPost, func(t *testing.T) (*Server, *http.Request) {
 			quota := &writeQuotaStub{err: external.ErrQuotaUnavailable}
 			server := newJobServer(t, staticAuthenticator{principal: Principal{TenantID: "tenant-7", scopes: allScopes}}, &jobServiceStub{view: JobView{JobID: "ceirceirceirceirceirceirce"}}, quota)
-			request := httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs", strings.NewReader(`{"bundleId":"ceirceirceirceirceirceircf","language":"cpp20","sourceCode":"x"}`))
+			request := httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs", strings.NewReader(`{"bundleId":"ceirceirceirceirceirceircf","language":"cpp","sourceCode":"x"}`))
 			request.Header.Set("Idempotency-Key", "submission-00000042")
 			return server, request
 		}, 503, []string{"X-Request-Id", "Retry-After"}},

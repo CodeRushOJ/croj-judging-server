@@ -158,3 +158,22 @@ func healthyProductionProbes() map[string]Probe {
 		"minio": probeFunc(func(context.Context) error { return nil }), "sandbox": probeFunc(func(context.Context) error { return nil }),
 	}
 }
+
+func TestRuntimeAppliesAndValidatesHTTPTimeouts(t *testing.T) {
+	runtime, err := NewRuntime(Config{Enabled: true, ListenAddress: "127.0.0.1:0", ShutdownTimeout: time.Second}, http.NotFoundHandler(), nil, healthyProductionProbes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := runtime.httpServer()
+	if server.ReadHeaderTimeout != 5*time.Second || server.ReadTimeout != 30*time.Second || server.WriteTimeout != 30*time.Second || server.IdleTimeout != 60*time.Second {
+		t.Fatalf("HTTP timeouts = header:%s read:%s write:%s idle:%s", server.ReadHeaderTimeout, server.ReadTimeout, server.WriteTimeout, server.IdleTimeout)
+	}
+
+	_, err = NewRuntime(Config{
+		Enabled: true, ListenAddress: "127.0.0.1:0", ShutdownTimeout: time.Second,
+		ReadHeaderTimeout: time.Second, ReadTimeout: 2 * time.Second, WriteTimeout: 3 * time.Second, IdleTimeout: -1,
+	}, http.NotFoundHandler(), nil, healthyProductionProbes())
+	if err == nil {
+		t.Fatal("negative idle timeout accepted")
+	}
+}

@@ -35,6 +35,7 @@ type SourceObjectStore interface {
 }
 
 type SourceObjectMetadata struct {
+	InternalID uint64
 	ExternalID string
 	ObjectKey  string
 	SHA256     []byte
@@ -48,6 +49,7 @@ func (SourceObjectMetadata) GoString() string { return "[REDACTED SOURCE OBJECT]
 
 type ExternalJobRecord struct {
 	InternalID       uint64
+	TenantInternalID uint64
 	ExternalID       string
 	TenantExternalID string
 	BundleExternalID string

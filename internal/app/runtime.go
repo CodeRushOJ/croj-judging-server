@@ -44,10 +44,14 @@ func NewWorker(run func(context.Context) error) Worker {
 }
 
 type Config struct {
-	Enabled          bool
-	ListenAddress    string
-	ReadinessTimeout time.Duration
-	ShutdownTimeout  time.Duration
+	Enabled           bool
+	ListenAddress     string
+	ReadinessTimeout  time.Duration
+	ShutdownTimeout   time.Duration
+	ReadHeaderTimeout time.Duration
+	ReadTimeout       time.Duration
+	WriteTimeout      time.Duration
+	IdleTimeout       time.Duration
 }
 
 type Runtime struct {
@@ -77,6 +81,9 @@ func NewRuntime(config Config, api http.Handler, workers []Worker, probes map[st
 		runtime.config.ReadinessTimeout = 2 * time.Second
 	} else if config.ReadinessTimeout < 0 || config.ReadinessTimeout > 30*time.Second {
 		return nil, fmt.Errorf("external REST readiness timeout is invalid")
+	}
+	if err := normalizeHTTPTimeouts(&runtime.config); err != nil {
+		return nil, err
 	}
 	for _, worker := range runtime.worker {
 		if worker == nil {
@@ -132,7 +139,7 @@ func (runtime *Runtime) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listen for external REST: %w", err)
 	}
-	server := &http.Server{Handler: runtime.Handler(), ReadHeaderTimeout: 5 * time.Second}
+	server := runtime.httpServer()
 	workerContext, stopWorkers := context.WithCancel(ctx)
 	var workers sync.WaitGroup
 	errorsChannel := make(chan error, len(runtime.worker)+1)
@@ -196,6 +203,37 @@ func (runtime *Runtime) Run(ctx context.Context) error {
 		return fmt.Errorf("shutdown external REST: %w", shutdownErr)
 	}
 	return nil
+}
+
+func normalizeHTTPTimeouts(config *Config) error {
+	defaults := []struct {
+		value    *time.Duration
+		name     string
+		fallback time.Duration
+		maximum  time.Duration
+	}{
+		{&config.ReadHeaderTimeout, "read header", 5 * time.Second, time.Minute},
+		{&config.ReadTimeout, "read", 30 * time.Second, 10 * time.Minute},
+		{&config.WriteTimeout, "write", 30 * time.Second, 10 * time.Minute},
+		{&config.IdleTimeout, "idle", 60 * time.Second, 10 * time.Minute},
+	}
+	for _, item := range defaults {
+		if *item.value == 0 {
+			*item.value = item.fallback
+		}
+		if *item.value < 0 || *item.value > item.maximum {
+			return fmt.Errorf("external REST %s timeout is invalid", item.name)
+		}
+	}
+	return nil
+}
+
+func (runtime *Runtime) httpServer() *http.Server {
+	return &http.Server{
+		Handler: runtime.Handler(), ReadHeaderTimeout: runtime.config.ReadHeaderTimeout,
+		ReadTimeout: runtime.config.ReadTimeout, WriteTimeout: runtime.config.WriteTimeout,
+		IdleTimeout: runtime.config.IdleTimeout,
+	}
 }
 
 func (runtime *Runtime) serveReadiness(response http.ResponseWriter, request *http.Request) {
