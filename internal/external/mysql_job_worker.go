@@ -74,10 +74,14 @@ func (repository *MySQLJobRepository) ClaimNext(
 	if repository == nil || !validWorkerID(workerID) || leaseDuration <= 0 || leaseDuration > 15*time.Minute {
 		return WorkerJobClaim{}, ErrInvalidJobState
 	}
-	for {
+	const maximumClaimRetries = 32
+	for attempt := 0; attempt < maximumClaimRetries; attempt++ {
 		claim, retry, err := repository.claimOne(ctx, workerID, leaseDuration)
 		if err != nil {
 			if retry && errors.Is(err, ErrJobNotClaimable) {
+				if err := waitForClaimRetry(ctx); err != nil {
+					return WorkerJobClaim{}, repositoryUnavailable("wait for worker claim contention", err)
+				}
 				continue
 			}
 			return WorkerJobClaim{}, err
@@ -85,7 +89,11 @@ func (repository *MySQLJobRepository) ClaimNext(
 		if !retry {
 			return claim, nil
 		}
+		if err := waitForClaimRetry(ctx); err != nil {
+			return WorkerJobClaim{}, repositoryUnavailable("wait for worker claim recovery", err)
+		}
 	}
+	return WorkerJobClaim{}, repositoryUnavailable("worker claim contention budget exhausted", ErrJobNotClaimable)
 }
 
 func (repository *MySQLJobRepository) claimOne(
@@ -524,4 +532,15 @@ func mysqlCurrentTime(ctx context.Context, tx *sql.Tx) (time.Time, error) {
 		return time.Time{}, repositoryUnavailable("read database lease clock", err)
 	}
 	return now.UTC(), nil
+}
+
+func waitForClaimRetry(ctx context.Context) error {
+	timer := time.NewTimer(2 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }

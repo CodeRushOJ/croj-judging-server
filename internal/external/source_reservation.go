@@ -29,7 +29,8 @@ func (repository *MySQLJobRepository) SweepSourceReservations(
 		var objectKey string
 		err = tx.QueryRowContext(ctx, `
 SELECT object_key FROM t_external_source_reservation
-WHERE created_at <= CURRENT_TIMESTAMP(3) - INTERVAL ? MICROSECOND
+WHERE lease_until <= CURRENT_TIMESTAMP(3)
+  AND created_at <= CURRENT_TIMESTAMP(3) - INTERVAL ? MICROSECOND
 ORDER BY created_at, object_key LIMIT 1 FOR UPDATE SKIP LOCKED`, minimumAge.Microseconds()).Scan(&objectKey)
 		if errors.Is(err, sql.ErrNoRows) {
 			_ = tx.Rollback()
