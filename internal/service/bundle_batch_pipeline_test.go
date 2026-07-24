@@ -52,6 +52,35 @@ func (executor *sequenceBatchExecutor) ExecuteBatch(_ context.Context, address s
 	return executor.eventSets[index], nil
 }
 
+func TestBatchBundlePipelineReturnsSystemErrorWhenImmutableLimitsDisagree(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		config ExecutionConfig
+	}{
+		{name: "time limit", config: ExecutionConfig{TimeLimitMillis: 2000, MemoryLimitMB: 64}},
+		{name: "memory limit", config: ExecutionConfig{TimeLimitMillis: 1000, MemoryLimitMB: 128}},
+		{name: "zero time limit", config: ExecutionConfig{TimeLimitMillis: 0, MemoryLimitMB: 64}},
+		{name: "negative time limit", config: ExecutionConfig{TimeLimitMillis: -1, MemoryLimitMB: 64}},
+		{name: "zero memory limit", config: ExecutionConfig{TimeLimitMillis: 1000, MemoryLimitMB: 0}},
+		{name: "negative memory limit", config: ExecutionConfig{TimeLimitMillis: 1000, MemoryLimitMB: -1}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			artifact := &countingArtifact{memoryArtifact: exactArtifact(1)}
+			executor := &batchExecutorStub{}
+			pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a"}}, executor, 1)
+
+			result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), test.config, artifact)
+
+			if err != nil || result.Status != callback.StatusSystemError {
+				t.Fatalf("result=%+v error=%v, want terminal SYSTEM_ERROR", result, err)
+			}
+			if artifact.reads != 0 || len(executor.requests) != 0 {
+				t.Fatalf("case reads=%d sandbox calls=%d, want immutable-boundary rejection", artifact.reads, len(executor.requests))
+			}
+		})
+	}
+}
+
 func TestBatchBundlePipelineRejectsOversizedBatchBeforeSandbox(t *testing.T) {
 	artifact := &memoryArtifact{
 		manifest: bundle.Manifest{SchemaVersion: 1, JudgeMode: bundle.JudgeModeACM, Checker: bundle.CheckerExact, Limits: bundle.Limits{TimeLimitMillis: 1000, MemoryLimitMiB: 64}},
