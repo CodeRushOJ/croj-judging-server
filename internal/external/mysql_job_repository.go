@@ -1,0 +1,899 @@
+package external
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/base32"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
+	"time"
+)
+
+const (
+	submitJobIdempotencyScope           = "judge-job-submit"
+	defaultSourceObjectOperationTimeout = 2 * time.Minute
+	maximumSourceObjectOperationTimeout = 20 * time.Minute
+	defaultSubmissionOperationTimeout   = 3 * time.Minute
+	maximumSubmissionOperationTimeout   = 30 * time.Minute
+	submissionCoordinationWaitLimit     = 750 * time.Millisecond
+	submissionCoordinationPollInterval  = 25 * time.Millisecond
+	submissionCoordinationLeaseGrace    = 2 * time.Minute
+	submissionCompensationAllowance     = time.Minute
+)
+
+type MySQLJobRepositoryConfig struct {
+	Database              *sql.DB
+	Random                io.Reader
+	Now                   func() time.Time
+	IdempotencyPepper     []byte
+	CursorKey             []byte
+	SourceCipher          *SourceCipher
+	SourceObjects         SourceObjectStore
+	SourceObjectTimeout   time.Duration
+	SubmitTimeout         time.Duration
+	IdempotencyTTL        time.Duration
+	WebhookDeliveryWindow time.Duration
+}
+
+type MySQLJobRepository struct {
+	database                     *sql.DB
+	random                       io.Reader
+	now                          func() time.Time
+	idempotencyPepper            []byte
+	cursor                       *JobCursorCodec
+	sourceCipher                 *SourceCipher
+	sourceObjects                SourceObjectStore
+	sourceObjectOperationTimeout time.Duration
+	submitOperationTimeout       time.Duration
+	idempotencyTTL               time.Duration
+	webhookDeliveryWindow        time.Duration
+}
+
+func NewMySQLJobRepository(config MySQLJobRepositoryConfig) (*MySQLJobRepository, error) {
+	if config.Database == nil || config.Random == nil || config.Now == nil || config.SourceCipher == nil || config.SourceObjects == nil {
+		return nil, fmt.Errorf("database, random source, clock, source cipher, and source object store are required")
+	}
+	if len(config.IdempotencyPepper) < sha256.Size || config.IdempotencyTTL <= 0 || config.IdempotencyTTL > 7*24*time.Hour {
+		return nil, fmt.Errorf("idempotency pepper and a retention window up to seven days are required")
+	}
+	if config.WebhookDeliveryWindow == 0 {
+		config.WebhookDeliveryWindow = 24 * time.Hour
+	}
+	if config.WebhookDeliveryWindow < time.Minute || config.WebhookDeliveryWindow > 7*24*time.Hour {
+		return nil, fmt.Errorf("webhook delivery window must be between one minute and seven days")
+	}
+	if config.SourceObjectTimeout == 0 {
+		config.SourceObjectTimeout = defaultSourceObjectOperationTimeout
+	}
+	if config.SourceObjectTimeout < time.Second || config.SourceObjectTimeout > maximumSourceObjectOperationTimeout {
+		return nil, fmt.Errorf("source object operation timeout must be between one second and twenty minutes")
+	}
+	if config.SubmitTimeout == 0 {
+		config.SubmitTimeout = defaultSubmissionOperationTimeout
+	}
+	if config.SubmitTimeout <= 0 || config.SubmitTimeout > maximumSubmissionOperationTimeout {
+		return nil, fmt.Errorf("submit operation timeout must be positive and at most thirty minutes")
+	}
+	cursor, err := NewJobCursorCodec(config.CursorKey)
+	if err != nil {
+		return nil, err
+	}
+	return &MySQLJobRepository{
+		database: config.Database, random: config.Random, now: config.Now,
+		idempotencyPepper: append([]byte(nil), config.IdempotencyPepper...), cursor: cursor,
+		sourceCipher: config.SourceCipher, sourceObjects: config.SourceObjects,
+		sourceObjectOperationTimeout: config.SourceObjectTimeout,
+		submitOperationTimeout:       config.SubmitTimeout,
+		idempotencyTTL:               config.IdempotencyTTL,
+		webhookDeliveryWindow:        config.WebhookDeliveryWindow,
+	}, nil
+}
+
+func (repository *MySQLJobRepository) Submit(
+	ctx context.Context,
+	tenantExternalID string,
+	idempotencyKey string,
+	request JudgeJobRequest,
+	admit func(context.Context) error,
+) (result SubmitJobResult, resultErr error) {
+	if repository == nil || admit == nil || !externalIDPattern.MatchString(tenantExternalID) {
+		return SubmitJobResult{}, ErrExternalJobInvalid
+	}
+	ctx, cancelSubmit := submissionOperationContext(ctx, repository.submitOperationTimeout)
+	defer cancelSubmit()
+	keyDigest, err := DigestIdempotencyKey(idempotencyKey, repository.idempotencyPepper)
+	if err != nil {
+		return SubmitJobResult{}, fmt.Errorf("%w: invalid idempotency key", ErrExternalJobInvalid)
+	}
+	// Canonical identity must remain stable when an operator tightens policy.
+	requestHash, err := CanonicalJobRequestHash(request, int64(len(request.SourceCode)))
+	if err != nil {
+		return SubmitJobResult{}, fmt.Errorf("%w: %v", ErrExternalJobInvalid, err)
+	}
+	coordinationExternalID := submissionSourceExternalID(tenantExternalID, keyDigest)
+	coordinationObjectKey, err := SourceObjectKey(tenantExternalID, coordinationExternalID)
+	if err != nil {
+		return SubmitJobResult{}, repositoryUnavailable("derive submission reservation key", err)
+	}
+	sourceExternalID, err := generateExternalID(repository.random)
+	if err != nil {
+		return SubmitJobResult{}, repositoryUnavailable("generate source object ID", err)
+	}
+	jobExternalID, err := generateExternalID(repository.random)
+	if err != nil {
+		return SubmitJobResult{}, repositoryUnavailable("generate job ID", err)
+	}
+	sourceObjectKey, err := SourceObjectKey(tenantExternalID, sourceExternalID)
+	if err != nil {
+		return SubmitJobResult{}, repositoryUnavailable("derive source object key", err)
+	}
+	encrypted, err := repository.sourceCipher.Encrypt(tenantExternalID, sourceExternalID, request.SourceCode)
+	if err != nil {
+		return SubmitJobResult{}, repositoryUnavailable("encrypt source", err)
+	}
+	coordinationToken := make([]byte, 32)
+	if _, err := io.ReadFull(repository.random, coordinationToken); err != nil {
+		return SubmitJobResult{}, repositoryUnavailable("generate submission reservation token", err)
+	}
+	sourceReservationToken := make([]byte, 32)
+	if _, err := io.ReadFull(repository.random, sourceReservationToken); err != nil {
+		return SubmitJobResult{}, repositoryUnavailable("generate source reservation token", err)
+	}
+	if replay, found, err := repository.findSubmitReplay(ctx, tenantExternalID, keyDigest, requestHash); err != nil {
+		return SubmitJobResult{}, err
+	} else if found {
+		return replay, nil
+	}
+	if err := repository.preflightSubmit(ctx, tenantExternalID, request); err != nil {
+		return SubmitJobResult{}, err
+	}
+	coordinationReplay, coordinationAcquired, err := repository.acquireSubmissionCoordination(
+		ctx, tenantExternalID, keyDigest, requestHash, coordinationObjectKey, coordinationToken,
+	)
+	if err != nil {
+		return SubmitJobResult{}, err
+	}
+	if !coordinationAcquired {
+		return coordinationReplay, nil
+	}
+	coordinationActive := true
+	sourceReservationActive := false
+	releaseAllReservations := func() {
+		// A timed-out MySQL statement can keep its server-side transaction and
+		// row locks alive until MySQL notices the closed connection. Waiting on
+		// those same rows here would extend an application deadline by the
+		// server lock timeout. The fenced reservation sweeper is the recovery
+		// path once the request context has expired.
+		if ctx.Err() != nil || (!sourceReservationActive && !coordinationActive) {
+			return
+		}
+		cleanupContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		var deleted sql.Result
+		var deleteErr error
+		switch {
+		case sourceReservationActive && coordinationActive:
+			deleted, deleteErr = repository.database.ExecContext(cleanupContext, `
+DELETE FROM t_external_source_reservation
+WHERE (object_key = ? AND owner_token = ?) OR (object_key = ? AND owner_token = ?)`,
+				sourceObjectKey, sourceReservationToken, coordinationObjectKey, coordinationToken)
+		case sourceReservationActive:
+			deleted, deleteErr = repository.database.ExecContext(cleanupContext, `
+DELETE FROM t_external_source_reservation
+WHERE object_key = ? AND owner_token = ?`, sourceObjectKey, sourceReservationToken)
+		default:
+			deleted, deleteErr = repository.database.ExecContext(cleanupContext, `
+DELETE FROM t_external_source_reservation
+WHERE object_key = ? AND owner_token = ?`, coordinationObjectKey, coordinationToken)
+		}
+		if deleteErr != nil {
+			return
+		}
+		affected, rowsErr := deleted.RowsAffected()
+		if rowsErr != nil {
+			return
+		}
+		if sourceReservationActive && coordinationActive && affected == 2 {
+			sourceReservationActive = false
+			coordinationActive = false
+		} else if sourceReservationActive && !coordinationActive && affected == 1 {
+			sourceReservationActive = false
+		} else if !sourceReservationActive && coordinationActive && affected == 1 {
+			coordinationActive = false
+		}
+	}
+	// A predecessor can commit between the lock-free replay lookup and this
+	// reservation claim. Recheck before charging quota or touching MinIO.
+	if replay, found, err := repository.findSubmitReplay(ctx, tenantExternalID, keyDigest, requestHash); err != nil {
+		releaseAllReservations()
+		return SubmitJobResult{}, err
+	} else if found {
+		releaseAllReservations()
+		return replay, nil
+	}
+	if err := admit(ctx); err != nil {
+		releaseAllReservations()
+		return SubmitJobResult{}, err
+	}
+	if err := repository.acquireSourceReservation(ctx, sourceObjectKey, sourceReservationToken); err != nil {
+		releaseAllReservations()
+		return SubmitJobResult{}, err
+	}
+	sourceReservationActive = true
+	objectMayExist := true
+	createContext, cancelCreate := context.WithTimeout(ctx, repository.sourceObjectOperationTimeout)
+	createErr := repository.sourceObjects.Create(createContext, sourceObjectKey, encrypted.Ciphertext)
+	cancelCreate()
+	if createErr != nil {
+		if errors.Is(createErr, ErrSourceObjectExists) {
+			if replay, found, replayErr := repository.findSubmitReplay(ctx, tenantExternalID, keyDigest, requestHash); replayErr == nil && found {
+				releaseAllReservations()
+				return replay, nil
+			}
+		}
+		// Any other object-store failure can be outcome-ambiguous. Retain the
+		// fenced reservation for the reconciler rather than risking deletion of
+		// bytes that MinIO may have committed.
+		return SubmitJobResult{}, fmt.Errorf("%w: persist encrypted source", ErrExternalJobUnavailable)
+	}
+	tx, err := repository.database.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		cleanupContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if cleanupErr := repository.sourceObjects.Delete(cleanupContext, sourceObjectKey); cleanupErr == nil {
+			objectMayExist = false
+			releaseAllReservations()
+		}
+		return SubmitJobResult{}, repositoryUnavailable("begin submit transaction", err)
+	}
+	commitOutcomeUnknown := false
+	committed := false
+	defer func() {
+		if committed || commitOutcomeUnknown {
+			return
+		}
+		// Always release database locks before compensating object storage.
+		_ = tx.Rollback()
+		if !objectMayExist {
+			releaseAllReservations()
+			return
+		}
+		cleanupContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if cleanupErr := repository.sourceObjects.Delete(cleanupContext, sourceObjectKey); cleanupErr != nil {
+			resultErr = fmt.Errorf("%w: source compensation failed", ErrExternalJobUnavailable)
+			return
+		}
+		objectMayExist = false
+		releaseAllReservations()
+	}()
+	if err := lockSubmissionReservations(ctx, tx,
+		sourceReservationClaim{objectKey: coordinationObjectKey, ownerToken: coordinationToken},
+		sourceReservationClaim{objectKey: sourceObjectKey, ownerToken: sourceReservationToken},
+	); err != nil {
+		return SubmitJobResult{}, repositoryUnavailable("lock encrypted source reservation", err)
+	}
+
+	tenantInternalID, policy, err := lockTenantPolicy(ctx, tx, tenantExternalID)
+	if err != nil {
+		return SubmitJobResult{}, err
+	}
+	// Current admission limits are applied only after an idempotent replay has
+	// had a chance to return its already-accepted resource.
+	now, err := mysqlCurrentTime(ctx, tx)
+	if err != nil {
+		return SubmitJobResult{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `
+DELETE FROM t_external_idempotency
+WHERE tenant_id = ? AND operation_scope = ? AND key_digest = ? AND expires_at <= ?`,
+		tenantInternalID, submitJobIdempotencyScope, keyDigest, now); err != nil {
+		return SubmitJobResult{}, repositoryUnavailable("expire idempotency record", err)
+	}
+	var storedHash []byte
+	var existingJobID string
+	err = tx.QueryRowContext(ctx, `
+SELECT request_hash, resource_external_id
+FROM t_external_idempotency
+WHERE tenant_id = ? AND operation_scope = ? AND key_digest = ?`,
+		tenantInternalID, submitJobIdempotencyScope, keyDigest).Scan(&storedHash, &existingJobID)
+	if err == nil {
+		if !bytes.Equal(storedHash, requestHash) {
+			return SubmitJobResult{}, ErrExternalJobConflict
+		}
+		job, err := getExternalJob(ctx, tx, tenantExternalID, existingJobID, false)
+		if err != nil {
+			return SubmitJobResult{}, repositoryUnavailable("read replayed job", err)
+		}
+		return SubmitJobResult{Job: job, Replayed: true}, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return SubmitJobResult{}, repositoryUnavailable("read idempotency record", err)
+	}
+	if int64(len(request.SourceCode)) > policy.MaxSourceBytes {
+		return SubmitJobResult{}, fmt.Errorf("%w: source code exceeds current tenant policy", ErrExternalJobInvalid)
+	}
+
+	var queuedJobs int
+	if err := tx.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM t_external_job WHERE tenant_id = ? AND status = 'QUEUED'",
+		tenantInternalID).Scan(&queuedJobs); err != nil {
+		return SubmitJobResult{}, repositoryUnavailable("establish queued quota", err)
+	}
+	if queuedJobs >= policy.MaxQueuedJobs {
+		return SubmitJobResult{}, ErrQueuedQuotaExceeded
+	}
+
+	var bundleInternalID uint64
+	if err := tx.QueryRowContext(ctx, `
+SELECT id FROM t_external_bundle
+WHERE tenant_id = ? AND external_id = ? AND publication_status = 'READY' AND ready_at IS NOT NULL
+  AND delete_marked_at IS NULL AND deleted_at IS NULL`,
+		tenantInternalID, request.BundleID).Scan(&bundleInternalID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return SubmitJobResult{}, fmt.Errorf("%w: bundle is unavailable", ErrExternalJobInvalid)
+		}
+		return SubmitJobResult{}, repositoryUnavailable("read tenant bundle", err)
+	}
+	var callbackInternalID sql.NullInt64
+	if request.CallbackID != "" {
+		var callbackID int64
+		if err := tx.QueryRowContext(ctx, `
+SELECT id FROM t_external_callback
+WHERE tenant_id = ? AND external_id = ? AND disabled_at IS NULL
+  AND secret_nonce IS NOT NULL AND OCTET_LENGTH(secret_nonce) = 12
+  AND OCTET_LENGTH(secret_ciphertext) > 16 AND secret_key_version > 0
+FOR SHARE`,
+			tenantInternalID, request.CallbackID).Scan(&callbackID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return SubmitJobResult{}, fmt.Errorf("%w: callback is unavailable", ErrExternalJobInvalid)
+			}
+			return SubmitJobResult{}, repositoryUnavailable("read tenant callback", err)
+		}
+		callbackInternalID = sql.NullInt64{Int64: callbackID, Valid: true}
+	}
+	sourceResult, err := tx.ExecContext(ctx, `
+INSERT INTO t_external_source_object(
+    external_id, tenant_id, object_key, source_sha256, source_size_bytes,
+    encryption_key_version, encryption_nonce
+) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		sourceExternalID, tenantInternalID, sourceObjectKey, encrypted.SHA256, encrypted.SizeBytes,
+		encrypted.KeyVersion, encrypted.Nonce)
+	if err != nil {
+		return SubmitJobResult{}, repositoryUnavailable("persist source metadata", err)
+	}
+	sourceInternalID, err := sourceResult.LastInsertId()
+	if err != nil {
+		return SubmitJobResult{}, repositoryUnavailable("read source metadata ID", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO t_external_job(
+    external_id, tenant_id, bundle_id, source_object_id, callback_id, status,
+    language_id, stop_on_failure, client_reference, request_hash, next_attempt_at, created_at
+) VALUES (?, ?, ?, ?, ?, 'QUEUED', ?, ?, NULLIF(?, ''), ?, ?, ?)`,
+		jobExternalID, tenantInternalID, bundleInternalID, sourceInternalID, callbackInternalID,
+		request.Language, request.StopOnFailure, request.ClientReference, requestHash, now, now); err != nil {
+		return SubmitJobResult{}, repositoryUnavailable("persist queued job", err)
+	}
+	responseJSON, err := json.Marshal(struct {
+		JobID     string    `json:"jobId"`
+		Status    JobStatus `json:"status"`
+		CreatedAt time.Time `json:"createdAt"`
+	}{JobID: jobExternalID, Status: JobStatusQueued, CreatedAt: now})
+	if err != nil {
+		return SubmitJobResult{}, repositoryUnavailable("encode idempotency response", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO t_external_idempotency(
+    tenant_id, operation_scope, key_digest, request_hash, resource_type,
+    resource_external_id, response_status, response_json, expires_at
+) VALUES (?, ?, ?, ?, 'judge-job', ?, 202, ?, ?)`,
+		tenantInternalID, submitJobIdempotencyScope, keyDigest, requestHash,
+		jobExternalID, responseJSON, now.Add(repository.idempotencyTTL)); err != nil {
+		return SubmitJobResult{}, repositoryUnavailable("persist idempotency record", err)
+	}
+	deletedReservations, err := tx.ExecContext(ctx, `
+DELETE FROM t_external_source_reservation
+WHERE (object_key = ? AND owner_token = ?) OR (object_key = ? AND owner_token = ?)`,
+		coordinationObjectKey, coordinationToken, sourceObjectKey, sourceReservationToken)
+	if err != nil {
+		return SubmitJobResult{}, repositoryUnavailable("publish source reservation", err)
+	}
+	if affected, rowsErr := deletedReservations.RowsAffected(); rowsErr != nil || affected != 2 {
+		return SubmitJobResult{}, repositoryUnavailable("confirm published source reservations", errors.Join(rowsErr, fmt.Errorf("affected reservations: %d", affected)))
+	}
+	job, err := getExternalJob(ctx, tx, tenantExternalID, jobExternalID, false)
+	if err != nil {
+		return SubmitJobResult{}, repositoryUnavailable("read submitted job", err)
+	}
+	if err := tx.Commit(); err != nil {
+		// Commit errors can be outcome-ambiguous (the server may have committed
+		// before the connection failed). Deleting here could break a committed
+		// job. Keep this private, content-opaque object for the retention sweeper;
+		// an idempotent retry determines whether the transaction committed.
+		commitOutcomeUnknown = true
+		return SubmitJobResult{}, repositoryUnavailable("commit submitted job with unknown outcome", err)
+	}
+	committed = true
+	coordinationActive = false
+	sourceReservationActive = false
+	objectMayExist = false
+	return SubmitJobResult{Job: job}, nil
+}
+
+func submissionOperationContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(parent, timeout)
+}
+
+const sourceReservationAdmissionLease = 25 * time.Minute
+
+func lockSubmissionReservations(ctx context.Context, tx *sql.Tx, first, second sourceReservationClaim) error {
+	if second.objectKey < first.objectKey {
+		first, second = second, first
+	}
+	for _, claim := range []sourceReservationClaim{first, second} {
+		var locked string
+		if err := tx.QueryRowContext(ctx, `
+SELECT object_key FROM t_external_source_reservation
+WHERE object_key = ? AND owner_token = ? AND lease_until > CURRENT_TIMESTAMP(3)
+FOR UPDATE`, claim.objectKey, claim.ownerToken).Scan(&locked); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func submissionSourceExternalID(tenantExternalID string, keyDigest []byte) string {
+	digest := sha256.New()
+	_, _ = digest.Write([]byte(tenantExternalID))
+	_, _ = digest.Write([]byte{0})
+	_, _ = digest.Write(keyDigest)
+	sum := digest.Sum(nil)
+	return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(sum[:externalIDRandomBytes]))
+}
+
+func (repository *MySQLJobRepository) findSubmitReplay(
+	ctx context.Context,
+	tenantExternalID string,
+	keyDigest []byte,
+	requestHash []byte,
+) (SubmitJobResult, bool, error) {
+	var storedHash []byte
+	var existingJobID string
+	err := repository.database.QueryRowContext(ctx, `
+SELECT idempotency.request_hash, idempotency.resource_external_id
+FROM t_external_idempotency AS idempotency
+JOIN t_external_tenant AS tenant ON tenant.id = idempotency.tenant_id
+WHERE tenant.external_id = ? AND idempotency.operation_scope = ?
+  AND idempotency.key_digest = ? AND idempotency.expires_at > CURRENT_TIMESTAMP(3)
+LIMIT 1`, tenantExternalID, submitJobIdempotencyScope, keyDigest).Scan(&storedHash, &existingJobID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return SubmitJobResult{}, false, nil
+	}
+	if err != nil {
+		return SubmitJobResult{}, false, repositoryUnavailable("read submit replay", err)
+	}
+	if !bytes.Equal(storedHash, requestHash) {
+		return SubmitJobResult{}, false, ErrExternalJobConflict
+	}
+	job, err := getExternalJob(ctx, repository.database, tenantExternalID, existingJobID, false)
+	if err != nil {
+		return SubmitJobResult{}, false, repositoryUnavailable("read replayed job", err)
+	}
+	return SubmitJobResult{Job: job, Replayed: true}, true, nil
+}
+
+// preflightSubmit rejects known-invalid requests without creating remote
+// artifacts. Its result is intentionally advisory: the final transaction
+// repeats every policy, ownership, and quota check under the canonical lock
+// order after external admission and object persistence have completed.
+func (repository *MySQLJobRepository) preflightSubmit(ctx context.Context, tenantExternalID string, request JudgeJobRequest) error {
+	var tenantInternalID uint64
+	var encodedPolicy []byte
+	if err := repository.database.QueryRowContext(ctx, `
+SELECT id, policy_json FROM t_external_tenant
+WHERE external_id = ? AND status = 'ACTIVE'`, tenantExternalID).Scan(&tenantInternalID, &encodedPolicy); err != nil {
+		return repositoryUnavailable("preflight tenant policy", err)
+	}
+	policy, err := decodeTenantPolicy(encodedPolicy)
+	if err != nil {
+		return ErrExternalJobUnavailable
+	}
+	if int64(len(request.SourceCode)) > policy.MaxSourceBytes {
+		return fmt.Errorf("%w: source code exceeds current tenant policy", ErrExternalJobInvalid)
+	}
+	var queuedJobs int
+	if err := repository.database.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM t_external_job WHERE tenant_id = ? AND status = 'QUEUED'", tenantInternalID).Scan(&queuedJobs); err != nil {
+		return repositoryUnavailable("preflight queued quota", err)
+	}
+	if queuedJobs >= policy.MaxQueuedJobs {
+		return ErrQueuedQuotaExceeded
+	}
+	var bundleExists int
+	if err := repository.database.QueryRowContext(ctx, `
+SELECT EXISTS(SELECT 1 FROM t_external_bundle
+WHERE tenant_id = ? AND external_id = ? AND publication_status = 'READY' AND ready_at IS NOT NULL
+  AND delete_marked_at IS NULL AND deleted_at IS NULL)`, tenantInternalID, request.BundleID).Scan(&bundleExists); err != nil {
+		return repositoryUnavailable("preflight tenant bundle", err)
+	}
+	if bundleExists != 1 {
+		return fmt.Errorf("%w: bundle is unavailable", ErrExternalJobInvalid)
+	}
+	if request.CallbackID != "" {
+		var callbackExists int
+		if err := repository.database.QueryRowContext(ctx, `
+SELECT EXISTS(SELECT 1 FROM t_external_callback
+WHERE tenant_id = ? AND external_id = ? AND disabled_at IS NULL
+  AND secret_nonce IS NOT NULL AND OCTET_LENGTH(secret_nonce) = 12
+  AND OCTET_LENGTH(secret_ciphertext) > 16 AND secret_key_version > 0)`, tenantInternalID, request.CallbackID).Scan(&callbackExists); err != nil {
+			return repositoryUnavailable("preflight tenant callback", err)
+		}
+		if callbackExists != 1 {
+			return fmt.Errorf("%w: callback is unavailable", ErrExternalJobInvalid)
+		}
+	}
+	return nil
+}
+
+func (repository *MySQLJobRepository) acquireSourceReservation(ctx context.Context, objectKey string, ownerToken []byte) error {
+	for {
+		acquired, err := repository.tryAcquireSourceReservation(ctx, objectKey, ownerToken, sourceReservationAdmissionLease)
+		if err != nil {
+			if IsTransientDatabaseError(err) {
+				if waitErr := waitForSourceReservationRetry(ctx); waitErr != nil {
+					return repositoryUnavailable("wait after source reservation contention", waitErr)
+				}
+				continue
+			}
+			return repositoryUnavailable("reserve encrypted source object", err)
+		}
+		if acquired {
+			return nil
+		}
+		if err := waitForSourceReservationRetry(ctx); err != nil {
+			return repositoryUnavailable("wait for source reservation", err)
+		}
+	}
+}
+
+func (repository *MySQLJobRepository) acquireSubmissionCoordination(
+	ctx context.Context,
+	tenantExternalID string,
+	keyDigest, requestHash []byte,
+	objectKey string,
+	ownerToken []byte,
+) (SubmitJobResult, bool, error) {
+	waitContext, cancel := context.WithTimeout(ctx, submissionCoordinationWaitLimit)
+	defer cancel()
+	for {
+		replay, found, err := repository.findSubmitReplay(waitContext, tenantExternalID, keyDigest, requestHash)
+		if err != nil || found {
+			return replay, false, err
+		}
+		acquired, err := repository.tryAcquireSourceReservation(
+			waitContext, objectKey, ownerToken, submissionCoordinationLease(
+				ctx, repository.sourceObjectOperationTimeout+submissionCoordinationLeaseGrace,
+			),
+		)
+		if err != nil {
+			if !IsTransientDatabaseError(err) {
+				return SubmitJobResult{}, false, repositoryUnavailable("reserve idempotent submission", err)
+			}
+		} else if acquired {
+			return SubmitJobResult{}, true, nil
+		}
+		if err := waitForSubmissionCoordination(waitContext); err != nil {
+			return SubmitJobResult{}, false, repositoryUnavailable("wait for concurrent idempotent submission", err)
+		}
+	}
+}
+
+func submissionCoordinationLease(ctx context.Context, fallback time.Duration) time.Duration {
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining < 0 {
+			remaining = 0
+		}
+		return remaining + submissionCompensationAllowance
+	}
+	return fallback
+}
+
+func (repository *MySQLJobRepository) tryAcquireSourceReservation(
+	ctx context.Context,
+	objectKey string,
+	ownerToken []byte,
+	lease time.Duration,
+) (bool, error) {
+	result, err := repository.database.ExecContext(ctx, `
+INSERT IGNORE INTO t_external_source_reservation(object_key, owner_token, lease_until)
+VALUES (?, ?, CURRENT_TIMESTAMP(3) + INTERVAL ? MICROSECOND)`, objectKey, ownerToken, lease.Microseconds())
+	if err != nil {
+		return false, err
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		return false, err
+	} else if affected == 1 {
+		return true, nil
+	}
+	result, err = repository.database.ExecContext(ctx, `
+UPDATE t_external_source_reservation
+SET owner_token = ?, lease_until = CURRENT_TIMESTAMP(3) + INTERVAL ? MICROSECOND,
+    created_at = CURRENT_TIMESTAMP(3)
+WHERE object_key = ? AND lease_until <= CURRENT_TIMESTAMP(3)`, ownerToken, lease.Microseconds(), objectKey)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	return affected == 1, err
+}
+
+func waitForSubmissionCoordination(ctx context.Context) error {
+	timer := time.NewTimer(submissionCoordinationPollInterval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	case <-timer.C:
+		return nil
+	}
+}
+
+func waitForSourceReservationRetry(ctx context.Context) error {
+	timer := time.NewTimer(10 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	case <-timer.C:
+		return nil
+	}
+}
+
+func lockTenantPolicy(ctx context.Context, tx *sql.Tx, tenantExternalID string) (uint64, TenantPolicy, error) {
+	var tenantInternalID uint64
+	var status string
+	var encodedPolicy []byte
+	if err := tx.QueryRowContext(ctx, `
+SELECT id, status, policy_json FROM t_external_tenant
+WHERE external_id = ? FOR UPDATE`, tenantExternalID).Scan(&tenantInternalID, &status, &encodedPolicy); err != nil {
+		return 0, TenantPolicy{}, repositoryUnavailable("lock tenant policy", err)
+	}
+	if status != "ACTIVE" {
+		return 0, TenantPolicy{}, ErrExternalJobUnavailable
+	}
+	var policy TenantPolicy
+	decoder := json.NewDecoder(bytes.NewReader(encodedPolicy))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&policy); err != nil || policy.validate() != nil {
+		return 0, TenantPolicy{}, ErrExternalJobUnavailable
+	}
+	return tenantInternalID, policy, nil
+}
+
+func (repository *MySQLJobRepository) Get(ctx context.Context, tenantExternalID, jobExternalID string) (ExternalJobRecord, error) {
+	if repository == nil || !externalIDPattern.MatchString(tenantExternalID) || !externalIDPattern.MatchString(jobExternalID) {
+		return ExternalJobRecord{}, ErrExternalJobNotFound
+	}
+	job, err := getExternalJob(ctx, repository.database, tenantExternalID, jobExternalID, false)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ExternalJobRecord{}, ErrExternalJobNotFound
+	}
+	if err != nil {
+		return ExternalJobRecord{}, repositoryUnavailable("read job", err)
+	}
+	return job, nil
+}
+
+func (repository *MySQLJobRepository) List(ctx context.Context, tenantExternalID string, options JobListOptions) (JobListResult, error) {
+	if repository == nil || !externalIDPattern.MatchString(tenantExternalID) || options.Limit < 1 || options.Limit > 100 || !validJobStatusFilter(options.Status) {
+		return JobListResult{}, ErrExternalJobInvalid
+	}
+	arguments := []any{tenantExternalID}
+	conditions := []string{"tenant.external_id = ?"}
+	if options.Status != "" {
+		conditions = append(conditions, "job.status = ?")
+		arguments = append(arguments, options.Status)
+	}
+	if options.Cursor != "" {
+		cursor, err := repository.cursor.Decode(options.Cursor, tenantExternalID, options.Status)
+		if err != nil {
+			return JobListResult{}, ErrInvalidJobCursor
+		}
+		conditions = append(conditions, "(job.created_at < ? OR (job.created_at = ? AND job.id < ?))")
+		arguments = append(arguments, cursor.CreatedAt, cursor.CreatedAt, cursor.InternalID)
+	}
+	arguments = append(arguments, options.Limit+1)
+	query := externalJobSelect + " WHERE " + strings.Join(conditions, " AND ") +
+		" ORDER BY job.created_at DESC, job.id DESC LIMIT ?"
+	rows, err := repository.database.QueryContext(ctx, query, arguments...)
+	if err != nil {
+		return JobListResult{}, repositoryUnavailable("list jobs", err)
+	}
+	defer rows.Close()
+	jobs := make([]ExternalJobRecord, 0, options.Limit+1)
+	for rows.Next() {
+		job, err := scanExternalJob(rows)
+		if err != nil {
+			return JobListResult{}, repositoryUnavailable("scan listed job", err)
+		}
+		jobs = append(jobs, job)
+	}
+	if err := rows.Err(); err != nil {
+		return JobListResult{}, repositoryUnavailable("iterate listed jobs", err)
+	}
+	result := JobListResult{Jobs: jobs}
+	if len(jobs) > options.Limit {
+		last := jobs[options.Limit-1]
+		result.Jobs = jobs[:options.Limit]
+		result.NextCursor, err = repository.cursor.Encode(JobCursor{
+			TenantID: tenantExternalID, Status: options.Status,
+			CreatedAt: last.CreatedAt, InternalID: last.InternalID,
+		})
+		if err != nil {
+			return JobListResult{}, repositoryUnavailable("encode next cursor", err)
+		}
+	}
+	return result, nil
+}
+
+func (repository *MySQLJobRepository) Cancel(ctx context.Context, tenantExternalID, jobExternalID string) (ExternalJobRecord, error) {
+	if repository == nil || !externalIDPattern.MatchString(tenantExternalID) || !externalIDPattern.MatchString(jobExternalID) {
+		return ExternalJobRecord{}, ErrExternalJobNotFound
+	}
+	tx, err := repository.database.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return ExternalJobRecord{}, repositoryUnavailable("begin cancellation", err)
+	}
+	defer tx.Rollback()
+	// All mutating paths use tenant -> job lock order. This avoids a cancel
+	// racing a worker claim into the inverse job -> tenant deadlock pattern.
+	var tenantInternalID uint64
+	if err := tx.QueryRowContext(ctx,
+		"SELECT id FROM t_external_tenant WHERE external_id = ? FOR UPDATE",
+		tenantExternalID).Scan(&tenantInternalID); errors.Is(err, sql.ErrNoRows) {
+		return ExternalJobRecord{}, ErrExternalJobNotFound
+	} else if err != nil {
+		return ExternalJobRecord{}, repositoryUnavailable("lock cancellation tenant", err)
+	}
+	job, err := getExternalJob(ctx, tx, tenantExternalID, jobExternalID, true)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ExternalJobRecord{}, ErrExternalJobNotFound
+	}
+	if err != nil {
+		return ExternalJobRecord{}, repositoryUnavailable("lock job for cancellation", err)
+	}
+	now, err := mysqlCurrentTime(ctx, tx)
+	if err != nil {
+		return ExternalJobRecord{}, err
+	}
+	emitTerminalEvent := false
+	switch job.Status {
+	case JobStatusQueued:
+		emitTerminalEvent = true
+		_, err = tx.ExecContext(ctx, `
+UPDATE t_external_job
+SET status = 'CANCELLED', cancel_requested_at = ?, completed_at = ?, worker_id = NULL,
+    lease_token = NULL, lease_until = NULL
+WHERE id = ? AND status = 'QUEUED'`, now, now, job.InternalID)
+	case JobStatusRunning:
+		if job.CancelRequested == nil {
+			_, err = tx.ExecContext(ctx, `UPDATE t_external_job SET cancel_requested_at = ? WHERE id = ? AND status = 'RUNNING'`, now, job.InternalID)
+		}
+	case JobStatusSucceeded, JobStatusFailed, JobStatusCancelled:
+	default:
+		return ExternalJobRecord{}, ErrExternalJobUnavailable
+	}
+	if err != nil {
+		return ExternalJobRecord{}, repositoryUnavailable("persist cancellation", err)
+	}
+	job, err = getExternalJob(ctx, tx, tenantExternalID, jobExternalID, false)
+	if err != nil {
+		return ExternalJobRecord{}, repositoryUnavailable("read cancelled job", err)
+	}
+	if emitTerminalEvent {
+		if _, err := repository.insertTerminalWebhookEvent(ctx, tx, now, job); err != nil {
+			return ExternalJobRecord{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return ExternalJobRecord{}, repositoryUnavailable("commit cancellation", err)
+	}
+	return job, nil
+}
+
+type rowScannerSQL interface{ Scan(...any) error }
+
+type queryerSQL interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+const externalJobSelect = `
+SELECT job.id, job.tenant_id, job.external_id, tenant.external_id, bundle.external_id,
+       source.id, source.external_id, source.object_key, source.source_sha256,
+       source.source_size_bytes, source.encryption_key_version, source.encryption_nonce,
+       callback.external_id, job.status, job.language_id, job.stop_on_failure,
+       job.client_reference, job.attempt_no, job.worker_id, job.lease_until,
+       job.cancel_requested_at, job.result_json, job.failure_code,
+       job.created_at, job.started_at, job.completed_at
+FROM t_external_job AS job
+JOIN t_external_tenant AS tenant ON tenant.id = job.tenant_id
+JOIN t_external_bundle AS bundle ON bundle.id = job.bundle_id AND bundle.tenant_id = job.tenant_id
+JOIN t_external_source_object AS source ON source.id = job.source_object_id AND source.tenant_id = job.tenant_id
+LEFT JOIN t_external_callback AS callback ON callback.id = job.callback_id AND callback.tenant_id = job.tenant_id`
+
+func getExternalJob(ctx context.Context, queryer queryerSQL, tenantExternalID, jobExternalID string, forUpdate bool) (ExternalJobRecord, error) {
+	query := externalJobSelect + " WHERE tenant.external_id = ? AND job.external_id = ?"
+	if forUpdate {
+		query += " FOR UPDATE"
+	}
+	return scanExternalJob(queryer.QueryRowContext(ctx, query, tenantExternalID, jobExternalID))
+}
+
+func scanExternalJob(scanner rowScannerSQL) (ExternalJobRecord, error) {
+	var job ExternalJobRecord
+	var callbackID, clientReference, workerID, failureCode sql.NullString
+	var leaseUntil, cancelRequested, startedAt, completedAt sql.NullTime
+	var resultJSON []byte
+	var keyVersion uint64
+	if err := scanner.Scan(
+		&job.InternalID, &job.TenantInternalID, &job.ExternalID, &job.TenantExternalID, &job.BundleExternalID,
+		&job.Source.InternalID, &job.Source.ExternalID, &job.Source.ObjectKey, &job.Source.SHA256,
+		&job.Source.SizeBytes, &keyVersion, &job.Source.Nonce,
+		&callbackID, &job.Status, &job.Language, &job.StopOnFailure,
+		&clientReference, &job.AttemptNo, &workerID, &leaseUntil,
+		&cancelRequested, &resultJSON, &failureCode,
+		&job.CreatedAt, &startedAt, &completedAt,
+	); err != nil {
+		return ExternalJobRecord{}, err
+	}
+	if keyVersion == 0 || keyVersion > 65535 {
+		return ExternalJobRecord{}, fmt.Errorf("invalid source key version")
+	}
+	job.Source.KeyVersion = uint16(keyVersion)
+	job.CallbackID = callbackID.String
+	job.ClientReference = clientReference.String
+	job.WorkerID = workerID.String
+	job.FailureCode = failureCode.String
+	job.LeaseUntil = nullableTimePointer(leaseUntil)
+	job.CancelRequested = nullableTimePointer(cancelRequested)
+	job.StartedAt = nullableTimePointer(startedAt)
+	job.CompletedAt = nullableTimePointer(completedAt)
+	if len(resultJSON) > 0 {
+		var result DurableJobResult
+		decoder := json.NewDecoder(bytes.NewReader(resultJSON))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&result); err != nil || validateDurableJobResult(result) != nil {
+			return ExternalJobRecord{}, fmt.Errorf("invalid persisted job result")
+		}
+		job.Result = &result
+	}
+	return job, nil
+}
+
+func nullableTimePointer(value sql.NullTime) *time.Time {
+	if !value.Valid {
+		return nil
+	}
+	copied := value.Time.UTC()
+	return &copied
+}
+
+func validJobStatusFilter(status JobStatus) bool {
+	switch status {
+	case "", JobStatusQueued, JobStatusRunning, JobStatusSucceeded, JobStatusFailed, JobStatusCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+func repositoryUnavailable(operation string, err error) error {
+	return fmt.Errorf("%w: %s: %w", ErrExternalJobUnavailable, operation, err)
+}

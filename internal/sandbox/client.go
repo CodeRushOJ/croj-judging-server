@@ -1,65 +1,288 @@
 package sandbox
 
 import (
-	"bytes"
-	"encoding/json"
+	"context"
+	"errors"
 	"fmt"
-	"net/http"
+	"io"
+	"strings"
+	"sync"
 	"time"
 
-	"github.com/CodeRushOJ/croj-judging-server/pkg/model"
+	sandboxpb "github.com/CodeRushOJ/croj-judging-server/proto"
+	"google.golang.org/grpc"
+	_ "google.golang.org/grpc/balancer/roundrobin"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/proto"
 )
 
-// Client 结构体，用于与判题沙盒交互
+var ErrClientClosed = errors.New("sandbox client is closed")
+var ErrInvalidBatchStream = errors.New("invalid sandbox batch stream")
+
+const maxBatchMessageBytesV1 = 64 << 20
+const maxBatchResponseBytesV1 = maxBatchMessageBytesV1
+
+type batchStreamGuard struct {
+	maxEvents int
+	maxBytes  int
+	events    int
+	bytes     int
+	terminal  bool
+}
+
+func (guard *batchStreamGuard) observe(event *sandboxpb.ExecuteBatchV1Event) error {
+	if event == nil {
+		return fmt.Errorf("%w: nil event", ErrInvalidBatchStream)
+	}
+	if guard.terminal {
+		return fmt.Errorf("%w: event after terminal", ErrInvalidBatchStream)
+	}
+	guard.events++
+	guard.bytes += proto.Size(event)
+	if guard.events > guard.maxEvents {
+		return fmt.Errorf("%w: event count exceeds %d", ErrInvalidBatchStream, guard.maxEvents)
+	}
+	if guard.bytes > guard.maxBytes {
+		return fmt.Errorf("%w: event bytes exceed %d", ErrInvalidBatchStream, guard.maxBytes)
+	}
+	if event.Kind == sandboxpb.ExecuteBatchV1Event_COMPLETED || event.Kind == sandboxpb.ExecuteBatchV1Event_COMPILE_ERROR {
+		guard.terminal = true
+	}
+	return nil
+}
+
+func (guard *batchStreamGuard) finish() error {
+	if !guard.terminal {
+		return fmt.Errorf("%w: terminal event is missing", ErrInvalidBatchStream)
+	}
+	return nil
+}
+
+// Client owns one reusable gRPC connection per ready sandbox endpoint.
 type Client struct {
-	httpClient *http.Client
+	timeout     time.Duration
+	dialOptions []grpc.DialOption
+	maxConns    int
+	idleTTL     time.Duration
+
+	mu     sync.Mutex
+	conns  map[string]*connectionEntry
+	closed bool
 }
 
-// NewClient 创建一个新的判题沙盒客户端
-func NewClient() *Client {
+type connectionEntry struct {
+	connection *grpc.ClientConn
+	lastUsed   time.Time
+	inUse      int
+}
+
+func NewClient(timeout time.Duration, dialOptions ...grpc.DialOption) *Client {
+	return NewClientWithCache(timeout, 128, 5*time.Minute, dialOptions...)
+}
+
+func NewClientWithCache(timeout time.Duration, maxConnections int, idleTTL time.Duration, dialOptions ...grpc.DialOption) *Client {
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	if maxConnections <= 0 {
+		maxConnections = 128
+	}
+	if idleTTL <= 0 {
+		idleTTL = 5 * time.Minute
+	}
+	options := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+	options = append(options, dialOptions...)
 	return &Client{
-		httpClient: &http.Client{
-			Timeout: 30 * time.Second, // 设置请求超时
-		},
+		timeout:     timeout,
+		dialOptions: options,
+		maxConns:    maxConnections,
+		idleTTL:     idleTTL,
+		conns:       make(map[string]*connectionEntry),
 	}
 }
 
-// Judge 向指定的沙盒发送判题请求
-func (c *Client) Judge(sandboxAddr string, task *model.Task) (*model.JudgeResult, error) {
-	fmt.Printf("Sending judge request for task %s to sandbox %s...\n", task.ID, sandboxAddr)
+func (c *Client) Execute(ctx context.Context, address string, request *sandboxpb.ExecuteRequest) (*sandboxpb.ExecuteResponse, error) {
+	if address == "" {
+		return nil, fmt.Errorf("sandbox address is required")
+	}
+	if request == nil {
+		return nil, fmt.Errorf("sandbox execute request is required")
+	}
 
-	// 准备请求体
-	requestBody, err := json.Marshal(task) // 假设沙盒接收 Task 对象
+	entry, err := c.acquire(address)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal judge request: %w", err)
+		return nil, err
 	}
-
-	// 构建 HTTP 请求
-	url := fmt.Sprintf("http://%s/judge", sandboxAddr) // 假设沙盒的判题接口是 /judge
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(requestBody))
+	defer c.release(address, entry)
+	rpcContext, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	response, err := sandboxpb.NewSandboxServiceClient(entry.connection).Execute(rpcContext, request)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create judge request: %w", err)
+		return nil, fmt.Errorf("execute on sandbox %s: %w", address, err)
 	}
-	req.Header.Set("Content-Type", "application/json")
+	return response, nil
+}
 
-	// 发送请求
-	resp, err := c.httpClient.Do(req)
+func batchRPCTimeout(base time.Duration, request *sandboxpb.ExecuteBatchV1Request) time.Duration {
+	if request == nil || len(request.Cases) <= 1 {
+		return base
+	}
+	caseTimeoutSeconds := request.Timeout
+	if caseTimeoutSeconds <= 0 {
+		caseTimeoutSeconds = 1
+	}
+	if caseTimeoutSeconds > 30 {
+		caseTimeoutSeconds = 30
+	}
+	return base + time.Duration(len(request.Cases)-1)*time.Duration(caseTimeoutSeconds)*time.Second
+}
+
+// ExecuteBatch runs one compile-once stream and returns events only after a clean EOF.
+// Partial streams are discarded so callers can safely retry the complete batch.
+func (c *Client) ExecuteBatch(
+	ctx context.Context,
+	address string,
+	request *sandboxpb.ExecuteBatchV1Request,
+) ([]*sandboxpb.ExecuteBatchV1Event, error) {
+	if address == "" {
+		return nil, fmt.Errorf("sandbox address is required")
+	}
+	if request == nil {
+		return nil, fmt.Errorf("sandbox batch request is required")
+	}
+	entry, err := c.acquire(address)
 	if err != nil {
-		return nil, fmt.Errorf("failed to send judge request to %s: %w", sandboxAddr, err)
+		return nil, err
 	}
-	defer resp.Body.Close()
-
-	// 处理响应
-	if resp.StatusCode != http.StatusOK {
-		// 可以读取响应体获取更详细的错误信息
-		return nil, fmt.Errorf("sandbox %s returned non-OK status: %d", sandboxAddr, resp.StatusCode)
+	defer c.release(address, entry)
+	rpcContext, cancel := context.WithTimeout(ctx, batchRPCTimeout(c.timeout, request))
+	defer cancel()
+	stream, err := sandboxpb.NewSandboxServiceClient(entry.connection).ExecuteBatchV1(
+		rpcContext,
+		request,
+		grpc.MaxCallSendMsgSize(maxBatchMessageBytesV1),
+		grpc.MaxCallRecvMsgSize(maxBatchMessageBytesV1),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("start batch on sandbox %s: %w", address, err)
 	}
-
-	var result model.JudgeResult
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode judge response from %s: %w", sandboxAddr, err)
+	events := make([]*sandboxpb.ExecuteBatchV1Event, 0, len(request.Cases)+1)
+	guard := batchStreamGuard{maxEvents: len(request.Cases) + 1, maxBytes: maxBatchResponseBytesV1}
+	for {
+		event, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			if err := guard.finish(); err != nil {
+				return nil, err
+			}
+			return events, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("receive batch from sandbox %s: %w", address, err)
+		}
+		if err := guard.observe(event); err != nil {
+			return nil, err
+		}
+		events = append(events, event)
 	}
+}
 
-	fmt.Printf("Received judge result for task %s from sandbox %s.\n", task.ID, sandboxAddr)
-	return &result, nil
+func (c *Client) acquire(address string) (*connectionEntry, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return nil, ErrClientClosed
+	}
+	now := time.Now()
+	c.pruneIdle(now)
+	if entry := c.conns[address]; entry != nil {
+		entry.inUse++
+		entry.lastUsed = now
+		return entry, nil
+	}
+	if len(c.conns) >= c.maxConns {
+		c.evictOldestIdle()
+	}
+	if len(c.conns) >= c.maxConns {
+		return nil, fmt.Errorf("sandbox connection cache is full")
+	}
+	// URI targets (the production default is dns:/// for a headless Service)
+	// must reach gRPC's resolver and round_robin balancer unchanged. Deprecated
+	// direct EndpointSlice addresses retain passthrough compatibility.
+	target := address
+	if !strings.Contains(address, ":///") {
+		target = "passthrough:///" + address
+	}
+	options := append([]grpc.DialOption(nil), c.dialOptions...)
+	options = append(options, grpc.WithDefaultServiceConfig(`{"loadBalancingConfig":[{"round_robin":{}}]}`))
+	connection, err := grpc.NewClient(target, options...)
+	if err != nil {
+		return nil, fmt.Errorf("create gRPC client for sandbox %s: %w", address, err)
+	}
+	entry := &connectionEntry{connection: connection, lastUsed: now, inUse: 1}
+	c.conns[address] = entry
+	return entry, nil
+}
+
+func (c *Client) release(address string, entry *connectionEntry) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.conns[address] != entry {
+		return
+	}
+	if entry.inUse > 0 {
+		entry.inUse--
+	}
+	entry.lastUsed = time.Now()
+	if !c.closed {
+		c.pruneIdle(entry.lastUsed)
+	}
+}
+
+func (c *Client) pruneIdle(now time.Time) {
+	for address, entry := range c.conns {
+		if entry.inUse == 0 && now.Sub(entry.lastUsed) >= c.idleTTL {
+			delete(c.conns, address)
+			_ = entry.connection.Close()
+		}
+	}
+}
+
+func (c *Client) evictOldestIdle() {
+	var oldestAddress string
+	var oldest *connectionEntry
+	for address, entry := range c.conns {
+		if entry.inUse != 0 {
+			continue
+		}
+		if oldest == nil || entry.lastUsed.Before(oldest.lastUsed) {
+			oldestAddress, oldest = address, entry
+		}
+	}
+	if oldest != nil {
+		delete(c.conns, oldestAddress)
+		_ = oldest.connection.Close()
+	}
+}
+
+func (c *Client) Close() error {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil
+	}
+	c.closed = true
+	connections := make([]*grpc.ClientConn, 0, len(c.conns))
+	for _, entry := range c.conns {
+		connections = append(connections, entry.connection)
+	}
+	c.conns = nil
+	c.mu.Unlock()
+
+	var closeErrors []error
+	for _, connection := range connections {
+		if err := connection.Close(); err != nil {
+			closeErrors = append(closeErrors, err)
+		}
+	}
+	return errors.Join(closeErrors...)
 }

@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      redis:
+        image: redis:8.4-alpine@sha256:61ea466e4022f3803b9f019e01f7738aac694f01989aee35a013724921d8e742
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 20
+    env:
+      REDIS_TEST_ADDR: 127.0.0.1:6379
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: 1.26.3
+          cache: true
+      - name: Test with race detector
+        run: go test -race ./...
+      - name: Validate async REST OpenAPI and live-handler contract
+        run: go test -count=1 -run '^TestOpenAPI' ./internal/httpapi
+      - name: Exercise headless-Service DNS round robin contract
+        run: go test -race -count=10 -run '^TestClientUsesGRPCRoundRobinAcrossResolvedHeadlessServiceEndpoints$' ./internal/sandbox
+      - name: Vet
+        run: go vet ./...
+      - name: Build binary
+        run: CGO_ENABLED=0 go build -trimpath ./cmd ./cmd/judge-admin
+      - name: Build container image
+        run: docker build -t coderushoj/judging-server:ci .
+      - name: Verify runtime and migration binaries in image
+        run: bash scripts/ci/test-image-contract.sh coderushoj/judging-server:ci
+
+  mysql84-bundle-integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      mysql:
+        image: mysql@sha256:c592c15aaf4a1961e15d82eb31ea5987dda862d1c4b1e93424438c0e91dc1f8d
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+          MYSQL_DATABASE: croj_bundle_ci
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot --silent"
+          --health-interval=2s
+          --health-timeout=5s
+          --health-retries=30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: 1.26.3
+          cache: true
+      - name: Run immutable bundle integration on MySQL 8.4
+        env:
+          EXTERNAL_JUDGE_MYSQL_TEST_DSN: root:@tcp(127.0.0.1:3306)/croj_bundle_ci?parseTime=true&multiStatements=true
+        run: go test -race -count=1 -run '^TestExternalBundleSQLRepositoryIntegration$' ./internal/integration
+      - name: Run durable job repository and lease integration on MySQL 8.4
+        env:
+          JUDGE_TEST_MYSQL_DSN: root:@tcp(127.0.0.1:3306)/croj_bundle_ci?parseTime=true&loc=UTC&charset=utf8mb4
+        run: go test -race -count=1 ./internal/external
+      - name: Run asynchronous REST end-to-end integration on MySQL 8.4
+        env:
+          ASYNC_REST_E2E_MYSQL_DSN: root:@tcp(127.0.0.1:3306)/croj_async_rest_e2e?parseTime=true&loc=UTC&charset=utf8mb4&multiStatements=true
+        run: |
+          mysql --host=127.0.0.1 --user=root --execute='CREATE DATABASE croj_async_rest_e2e CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci'
+          go test -race -count=1 -run '^TestExternalAsyncRESTEndToEnd' ./internal/integration
+      - name: Run durable webhook contract on MySQL 8.4
+        env:
+          JUDGE_TEST_MYSQL_DSN: root:@tcp(127.0.0.1:3306)/croj_bundle_ci?parseTime=true&loc=UTC&charset=utf8mb4
+        run: go test -race -count=1 -timeout=10m ./internal/external -run '^TestMySQLWebhook'
+      - name: Run canonical bundle ceiling integration on MySQL 8.4
+        env:
+          EXTERNAL_JUDGE_MYSQL_TEST_DSN: root:@tcp(127.0.0.1:3306)/croj_bundle_ci?parseTime=true&multiStatements=true
+        run: go test -race -count=1 -run '^TestExternalBundleSQLRepositoryIntegration/tenant_and_platform_execution_ceilings_reject_before_publication$' ./internal/integration
+      - name: Verify bundle MySQL CI contract
+        run: bash scripts/ci/test-bundle-mysql84-contract.sh
+      - name: Verify webhook MySQL CI contract
+        run: |
+          bash scripts/ci/test-webhook-mysql84-contract.sh
+          bash scripts/ci/test-webhook-mysql84-contract-self-test.sh

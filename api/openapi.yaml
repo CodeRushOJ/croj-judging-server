@@ -1,0 +1,1209 @@
+openapi: 3.1.0
+info:
+  title: CodeRushOJ External Judge API
+  version: 1.0.0-beta.1
+  summary: Asynchronous, tenant-isolated judging for external OJ systems
+  description: |
+    This contract documents the external OJ REST handlers and durable workers.
+    The HTTP listener starts only when `EXTERNAL_API_ENABLED=true` and schema v6
+    plus its runtime dependencies pass readiness checks.
+
+    Clients upload one immutable hidden-test bundle, submit an idempotent judge
+    job, and poll its status URL until it reaches `SUCCEEDED`, `FAILED`, or
+    `CANCELLED`. A repeated Idempotency-Key with the same canonical request
+    replays the original resource; reuse with different content returns `409`.
+    Resource lookup is tenant scoped, so an unknown ID and another tenant's ID
+    both return the same `404` response.
+
+    Send exactly one `Authorization` field. Judge-job submissions require an
+    `application/json` Content-Type and are read through a dedicated short,
+    bounded admission pool; the longer bundle-upload deadline is not reused.
+
+    A configured webhook is delivered at-least-once. Consumers must deduplicate
+    by `X-CodeRushOJ-Event-Id`. The v1 signature framing is
+    `v1\n<event-id-byte-length>\n<event-id>\n<timestamp>\n<raw-body>`: the event
+    length is its UTF-8 byte length, timestamp is decimal Unix seconds, and
+    `<raw-body>` is the exact raw body bytes received by the consumer. The
+    server sends `X-CodeRushOJ-Event-Id`, `X-CodeRushOJ-Timestamp`, and
+    `X-CodeRushOJ-Signature: v1=<lowercase-hex(HMAC-SHA256(secret, framing))>`.
+    Compare the decoded digest in constant time. There is no public
+    callback-management endpoint in this version.
+servers:
+  - url: https://judge.example.invalid
+    description: Placeholder private endpoint; replace with the operator-provided TLS URL.
+tags:
+  - name: Capabilities
+  - name: Bundles
+  - name: Judge jobs
+security:
+  - BearerAuth: []
+paths:
+  /api/v1/capabilities:
+    get:
+      tags: [Capabilities]
+      operationId: getCapabilities
+      summary: Discover immutable language and judge limits
+      description: |
+        Requires `capabilities:read`. Use the returned language identifiers and
+        limits when preparing bundle and job requests.
+
+        ```bash
+        API_KEY='dummy-not-a-real-key'
+        curl --fail-with-body \
+          -H "Authorization: Bearer ${API_KEY}" \
+          https://judge.example.invalid/api/v1/capabilities
+        ```
+      responses:
+        '200':
+          description: Current API capabilities.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Capabilities'
+              example:
+                apiVersion: v1
+                languages:
+                  - id: go
+                    displayName: Go
+                    runtime: go
+                  - id: cpp
+                    displayName: C++ 17
+                    runtime: gcc
+                  - id: python
+                    displayName: Python 3
+                    runtime: python3
+                  - id: java
+                    displayName: Java
+                    runtime: java
+                  - id: javascript
+                    displayName: JavaScript
+                    runtime: node
+                judgeModes: [ACM]
+                checkers: [exact, token]
+                limits:
+                  maxSourceBytes: 1048576
+                  maxBundleBytes: 67108864
+                  maxCaseBytes: 8388608
+                  maxCaseCount: 256
+                  maxTimeLimitMillis: 10000
+                  maxMemoryLimitMiB: 1024
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/AuthenticationUnavailable'
+
+  /api/v1/bundles:
+    post:
+      tags: [Bundles]
+      operationId: uploadBundle
+      summary: Upload and publish an immutable hidden-test bundle
+      description: |
+        Requires `bundle:write`. The multipart body must contain exactly one
+        `bundle` ZIP. The server validates it, publishes it under a private
+        tenant content address, and returns metadata only. Hidden cases and
+        storage locations are never returned. A same-content replay returns
+        `200`; the first successful publication returns `201`.
+
+        ```bash
+        API_KEY='dummy-not-a-real-key'
+        curl --fail-with-body \
+          -X POST https://judge.example.invalid/api/v1/bundles \
+          -H "Authorization: Bearer ${API_KEY}" \
+          -H 'Idempotency-Key: example-upload-0001' \
+          -F 'bundle=@./tests.zip;type=application/zip'
+        ```
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/BundleUpload'
+            encoding:
+              bundle:
+                contentType: application/zip
+      responses:
+        '200':
+          description: Idempotent replay of an already published bundle.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+            Location:
+              $ref: '#/components/headers/BundleLocation'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BundleMetadata'
+              example:
+                bundleId: aaaaaaaaaaaaaaaaaaaaaaaaaa
+                sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                sizeBytes: 2408
+                caseCount: 2
+                manifestVersion: 1
+                createdAt: '2026-07-19T01:02:03Z'
+        '201':
+          description: Bundle created and published.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+            Location:
+              $ref: '#/components/headers/BundleLocation'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BundleMetadata'
+              example:
+                bundleId: aaaaaaaaaaaaaaaaaaaaaaaaaa
+                sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                sizeBytes: 2408
+                caseCount: 2
+                manifestVersion: 1
+                createdAt: '2026-07-19T01:02:03Z'
+        '400':
+          $ref: '#/components/responses/InvalidBundle'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/BundleConflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/BundleWriteUnavailable'
+
+  /api/v1/bundles/{bundleId}:
+    get:
+      tags: [Bundles]
+      operationId: getBundle
+      summary: Read ready bundle metadata
+      description: |
+        Requires `bundle:read`. Only published `READY` metadata is visible.
+        Unknown, unpublished, and cross-tenant IDs all return `404`.
+      parameters:
+        - $ref: '#/components/parameters/BundleId'
+      responses:
+        '200':
+          description: Tenant-owned ready bundle metadata.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BundleMetadata'
+              example:
+                bundleId: aaaaaaaaaaaaaaaaaaaaaaaaaa
+                sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                sizeBytes: 2408
+                caseCount: 2
+                manifestVersion: 1
+                createdAt: '2026-07-19T01:02:03Z'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/BundleReadUnavailable'
+
+  /api/v1/judge-jobs:
+    post:
+      tags: [Judge jobs]
+      operationId: submitJudgeJob
+      summary: Submit an asynchronous judge job
+      description: |
+        Requires `job:submit`. `202` means the job was durably accepted, not
+        that judging succeeded. Poll the relative `statusUrl` or `Location`.
+        Source code exists only in this request and is never echoed by a public
+        response. A same-request replay returns the original job with
+        `Idempotent-Replay: true`; a different request using the key returns
+        `409`. The request must carry exactly one `Content-Type` whose media
+        type is `application/json`; only an optional UTF-8 charset parameter is
+        accepted.
+
+        ```bash
+        API_KEY='dummy-not-a-real-key'
+        curl --fail-with-body \
+          -X POST https://judge.example.invalid/api/v1/judge-jobs \
+          -H "Authorization: Bearer ${API_KEY}" \
+          -H 'Content-Type: application/json' \
+          -H 'Idempotency-Key: example-submit-0001' \
+          --data '{"bundleId":"aaaaaaaaaaaaaaaaaaaaaaaaaa","language":"cpp","sourceCode":"int main(){return 0;}","stopOnFailure":true,"clientReference":"submission-42"}'
+        ```
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubmitJobRequest'
+            example:
+              bundleId: aaaaaaaaaaaaaaaaaaaaaaaaaa
+              language: cpp
+              sourceCode: 'int main(){return 0;}'
+              stopOnFailure: true
+              clientReference: submission-42
+      responses:
+        '202':
+          description: Job accepted or idempotently replayed.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+            Location:
+              $ref: '#/components/headers/JobLocation'
+            Idempotent-Replay:
+              $ref: '#/components/headers/IdempotentReplay'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobView'
+              example:
+                jobId: ceirceirceirceirceirceirce
+                status: QUEUED
+                statusUrl: /api/v1/judge-jobs/ceirceirceirceirceirceirce
+                createdAt: '2026-07-19T08:00:00Z'
+                clientReference: submission-42
+        '400':
+          $ref: '#/components/responses/InvalidJobSubmit'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/JobNotFound'
+        '408':
+          $ref: '#/components/responses/JobRequestTimeout'
+        '409':
+          $ref: '#/components/responses/JobConflict'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/JobSubmitUnavailable'
+    get:
+      tags: [Judge jobs]
+      operationId: listJudgeJobs
+      summary: List tenant judge jobs using a stable cursor
+      description: Requires `job:read`. Items are ordered by stable creation-time and ID boundaries.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/JobStatusFilter'
+      responses:
+        '200':
+          description: One tenant-scoped page.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobListPage'
+              example:
+                items:
+                  - jobId: ceirceirceirceirceirceirce
+                    status: RUNNING
+                    createdAt: '2026-07-19T08:00:00Z'
+                    clientReference: submission-42
+                nextCursor: example-next-cursor
+        '400':
+          $ref: '#/components/responses/InvalidListQuery'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/JobReadUnavailable'
+
+  /api/v1/judge-jobs/{jobId}:
+    get:
+      tags: [Judge jobs]
+      operationId: getJudgeJob
+      summary: Get one asynchronous judge job
+      description: |
+        Requires `job:read`. `SUCCEEDED` means the judge ran to completion and
+        may contain any contestant verdict. `FAILED` is a terminal
+        infrastructure failure. Unknown and cross-tenant IDs both return `404`.
+
+        ```bash
+        API_KEY='dummy-not-a-real-key'
+        curl --fail-with-body \
+          -H "Authorization: Bearer ${API_KEY}" \
+          https://judge.example.invalid/api/v1/judge-jobs/ceirceirceirceirceirceirce
+        ```
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '200':
+          description: Current redacted job state and, when terminal, result.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobView'
+              example:
+                jobId: ceirceirceirceirceirceirce
+                status: SUCCEEDED
+                createdAt: '2026-07-19T08:00:00Z'
+                clientReference: submission-42
+                result:
+                  verdict: ACCEPTED
+                  compileStatus: SUCCEEDED
+                  timeMillis: 18
+                  memoryBytes: 12582912
+                  cases:
+                    - caseId: case-01
+                      verdict: ACCEPTED
+                      timeMillis: 18
+                      memoryBytes: 12582912
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/JobNotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/JobReadUnavailable'
+
+  /api/v1/judge-jobs/{jobId}/cancel:
+    post:
+      tags: [Judge jobs]
+      operationId: cancelJudgeJob
+      summary: Request idempotent cancellation
+      description: |
+        Requires `job:cancel`. A queued job becomes `CANCELLED`; a running job
+        records cancellation intent and stops at a compile/case boundary.
+        Terminal jobs are unchanged. Repeating cancellation returns the current
+        state and does not create another operation.
+
+        ```bash
+        API_KEY='dummy-not-a-real-key'
+        curl --fail-with-body \
+          -X POST \
+          -H "Authorization: Bearer ${API_KEY}" \
+          https://judge.example.invalid/api/v1/judge-jobs/ceirceirceirceirceirceirce/cancel
+        ```
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '200':
+          description: Current job state after the idempotent cancellation request.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobView'
+              example:
+                jobId: ceirceirceirceirceirceirce
+                status: CANCELLED
+                createdAt: '2026-07-19T08:00:00Z'
+                clientReference: submission-42
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/JobNotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/JobReadUnavailable'
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque CodeRushOJ API key
+      description: |
+        Operator-issued opaque API key. Keys are tenant bound and grant one or
+        more of `capabilities:read`, `bundle:write`, `bundle:read`, `job:submit`,
+        `job:read`, and `job:cancel`. Send exactly one Authorization field;
+        repeated or comma-combined credentials are rejected as ambiguous.
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: 16-128 visible ASCII characters; scoped to the authenticated tenant and operation.
+      schema:
+        type: string
+        minLength: 16
+        maxLength: 128
+        pattern: '^[!-~]+$'
+      example: example-request-01
+    BundleId:
+      name: bundleId
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/ExternalId'
+    JobId:
+      name: jobId
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/ExternalId'
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema:
+        type: string
+        maxLength: 512
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 50
+    JobStatusFilter:
+      name: status
+      in: query
+      required: false
+      schema:
+        $ref: '#/components/schemas/JobStatus'
+  headers:
+    XRequestId:
+      description: Correlation ID generated for this response.
+      schema:
+        type: string
+        pattern: '^([0-9a-f]{32}|unavailable)$'
+      example: unavailable
+    CacheControl:
+      description: Prevents authenticated API responses from being cached.
+      schema:
+        type: string
+        const: no-store
+      example: no-store
+    BundleLocation:
+      description: Relative metadata URL for the returned bundle.
+      schema:
+        type: string
+        pattern: '^/api/v1/bundles/[a-z2-7]{26}$'
+      example: /api/v1/bundles/aaaaaaaaaaaaaaaaaaaaaaaaaa
+    JobLocation:
+      description: Relative status URL for the returned judge job.
+      schema:
+        type: string
+        pattern: '^/api/v1/judge-jobs/[a-z2-7]{26}$'
+      example: /api/v1/judge-jobs/ceirceirceirceirceirceirce
+    IdempotentReplay:
+      description: Present with value `true` only when job submission replayed an existing request.
+      schema:
+        type: boolean
+      example: true
+    RetryAfter:
+      description: Minimum whole seconds before retrying this operation.
+      schema:
+        type: integer
+        minimum: 1
+      example: 5
+    WWWAuthenticate:
+      description: Bearer authentication challenge.
+      schema:
+        type: string
+      example: 'Bearer realm="coderushoj-judge"'
+  responses:
+    InvalidJobSubmit:
+      description: Invalid Idempotency-Key header or malformed strict JSON body.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            missingOrRepeatedIdempotencyKey:
+              value:
+                type: https://coderushoj.dev/problems/invalid-idempotency-key
+                title: Invalid Idempotency-Key
+                status: 400
+                detail: Provide exactly one Idempotency-Key header.
+                requestId: unavailable
+            invalidIdempotencyKey:
+              value:
+                type: https://coderushoj.dev/problems/invalid-idempotency-key
+                title: Invalid Idempotency-Key
+                status: 400
+                detail: Provide 16 to 128 visible ASCII characters.
+                requestId: unavailable
+            invalidJSON:
+              value:
+                type: https://coderushoj.dev/problems/invalid-json
+                title: Invalid request body
+                status: 400
+                detail: Provide one JSON object containing only documented fields.
+                requestId: unavailable
+    InvalidBundle:
+      description: Invalid idempotency key, multipart envelope, or immutable bundle ZIP.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://coderushoj.dev/problems/invalid-bundle
+            title: Invalid bundle upload
+            status: 400
+            detail: Provide one valid immutable bundle ZIP and an Idempotency-Key.
+            requestId: unavailable
+    InvalidListQuery:
+      description: Unknown, repeated, malformed, or out-of-range list parameter.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://coderushoj.dev/problems/invalid-list-query
+            title: Invalid list query
+            status: 400
+            detail: Use only cursor, limit (1-100), and a documented status.
+            requestId: unavailable
+    Unauthorized:
+      description: Missing, malformed, unknown, expired, or revoked API key.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
+        WWW-Authenticate:
+          $ref: '#/components/headers/WWWAuthenticate'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://coderushoj.dev/problems/unauthorized
+            title: Authentication required
+            status: 401
+            detail: Provide a valid active API key.
+            requestId: unavailable
+    Forbidden:
+      description: The API key lacks the operation scope.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://coderushoj.dev/problems/insufficient-scope
+            title: Insufficient scope
+            status: 403
+            detail: The API key does not grant this operation.
+            requestId: unavailable
+    NotFound:
+      description: The resource is absent, unpublished, or belongs to another tenant.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://coderushoj.dev/problems/not-found
+            title: Resource not found
+            status: 404
+            detail: The requested API resource does not exist.
+            requestId: unavailable
+    JobNotFound:
+      description: The job is absent or belongs to another tenant.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://coderushoj.dev/problems/job-not-found
+            title: Judge job not found
+            status: 404
+            detail: The requested judge job does not exist.
+            requestId: unavailable
+    BundleConflict:
+      description: The bundle Idempotency-Key was already used for different content.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://coderushoj.dev/problems/idempotency-conflict
+            title: Idempotency conflict
+            status: 409
+            detail: The Idempotency-Key was already used for different content.
+            requestId: unavailable
+    JobConflict:
+      description: The job Idempotency-Key is already bound to a different request.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://coderushoj.dev/problems/idempotency-conflict
+            title: Idempotency conflict
+            status: 409
+            detail: The Idempotency-Key is already bound to a different request.
+            requestId: unavailable
+    PayloadTooLarge:
+      description: The bundle exceeds the configured upload limit.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://coderushoj.dev/problems/bundle-too-large
+            title: Bundle too large
+            status: 413
+            detail: The bundle exceeds the configured upload limit.
+            requestId: unavailable
+    JobRequestTimeout:
+      description: The complete judge-job JSON body was not received before the authenticated read deadline.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://coderushoj.dev/problems/request-body-timeout
+            title: Request body timeout
+            status: 408
+            detail: Retry the request with a complete JSON body before the read deadline.
+            requestId: unavailable
+    UnsupportedMediaType:
+      description: Judge-job submissions require an application/json request body.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://coderushoj.dev/problems/unsupported-media-type
+            title: Unsupported media type
+            status: 415
+            detail: 'Use Content-Type: application/json for judge job submissions.'
+            requestId: unavailable
+    UnprocessableEntity:
+      description: A syntactically valid job violates tenant or judge policy.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://coderushoj.dev/problems/invalid-job
+            title: Judge job is invalid
+            status: 422
+            detail: The job could not be accepted under tenant policy.
+            requestId: unavailable
+    TooManyRequests:
+      description: Tenant write quota is exhausted.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://coderushoj.dev/problems/quota-exceeded
+            title: Quota exceeded
+            status: 429
+            detail: Retry after the indicated delay.
+            requestId: unavailable
+    InternalError:
+      description: The operation failed without exposing internal details.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://coderushoj.dev/problems/internal-error
+            title: Internal server error
+            status: 500
+            detail: The request could not be completed.
+            requestId: unavailable
+    AuthenticationUnavailable:
+      description: API-key storage is temporarily unavailable.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://coderushoj.dev/problems/authentication-unavailable
+            title: Authentication temporarily unavailable
+            status: 503
+            detail: Retry the request later.
+            requestId: unavailable
+    BundleWriteUnavailable:
+      description: Authentication, upload quota, or bundle publication is temporarily unavailable.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            authenticationUnavailable:
+              value:
+                type: https://coderushoj.dev/problems/authentication-unavailable
+                title: Authentication temporarily unavailable
+                status: 503
+                detail: Retry the request later.
+                requestId: unavailable
+            quotaUnavailable:
+              value:
+                type: https://coderushoj.dev/problems/quota-unavailable
+                title: Quota temporarily unavailable
+                status: 503
+                detail: Retry the request later.
+                requestId: unavailable
+            bundlePublishing:
+              value:
+                type: https://coderushoj.dev/problems/bundle-publishing
+                title: Bundle publication in progress
+                status: 503
+                detail: Retry this idempotent upload later.
+                requestId: unavailable
+            bundleUnavailable:
+              value:
+                type: https://coderushoj.dev/problems/bundle-unavailable
+                title: Bundle service unavailable
+                status: 503
+                detail: The bundle operation could not be completed.
+                requestId: unavailable
+    BundleReadUnavailable:
+      description: Authentication or bundle metadata storage is temporarily unavailable.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            authenticationUnavailable:
+              value:
+                type: https://coderushoj.dev/problems/authentication-unavailable
+                title: Authentication temporarily unavailable
+                status: 503
+                detail: Retry the request later.
+                requestId: unavailable
+            bundleUnavailable:
+              value:
+                type: https://coderushoj.dev/problems/bundle-unavailable
+                title: Bundle service unavailable
+                status: 503
+                detail: The bundle operation could not be completed.
+                requestId: unavailable
+    JobSubmitUnavailable:
+      description: Authentication, body-reader admission, submit quota, or job storage is temporarily unavailable.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            authenticationUnavailable:
+              value:
+                type: https://coderushoj.dev/problems/authentication-unavailable
+                title: Authentication temporarily unavailable
+                status: 503
+                detail: Retry the request later.
+                requestId: unavailable
+            quotaUnavailable:
+              value:
+                type: https://coderushoj.dev/problems/quota-unavailable
+                title: Quota temporarily unavailable
+                status: 503
+                detail: Retry the request later.
+                requestId: unavailable
+            submitCapacityExhausted:
+              value:
+                type: https://coderushoj.dev/problems/submit-capacity-exhausted
+                title: Submit capacity exhausted
+                status: 503
+                detail: Retry the judge job submission later.
+                requestId: unavailable
+            jobServiceUnavailable:
+              value:
+                type: https://coderushoj.dev/problems/job-service-unavailable
+                title: Judge job service unavailable
+                status: 503
+                detail: Retry the request later.
+                requestId: unavailable
+    JobReadUnavailable:
+      description: Authentication or job storage is temporarily unavailable.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            authenticationUnavailable:
+              value:
+                type: https://coderushoj.dev/problems/authentication-unavailable
+                title: Authentication temporarily unavailable
+                status: 503
+                detail: Retry the request later.
+                requestId: unavailable
+            jobServiceUnavailable:
+              value:
+                type: https://coderushoj.dev/problems/job-service-unavailable
+                title: Judge job service unavailable
+                status: 503
+                detail: Retry the request later.
+                requestId: unavailable
+  schemas:
+    ExternalId:
+      type: string
+      pattern: '^[a-z2-7]{26}$'
+      example: ceirceirceirceirceirceirce
+    LanguageCapability:
+      type: object
+      additionalProperties: false
+      required: [id, displayName, runtime]
+      properties:
+        id:
+          type: string
+          enum: [go, cpp, python, java, javascript]
+        displayName:
+          type: string
+          minLength: 1
+        runtime:
+          type: string
+          minLength: 1
+    CapabilityLimits:
+      type: object
+      additionalProperties: false
+      required: [maxSourceBytes, maxBundleBytes, maxCaseBytes, maxCaseCount, maxTimeLimitMillis, maxMemoryLimitMiB]
+      properties:
+        maxSourceBytes:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 1537228672809118378
+        maxBundleBytes:
+          type: integer
+          format: int64
+          minimum: 1
+        maxCaseBytes:
+          type: integer
+          format: int64
+          minimum: 1
+        maxCaseCount:
+          type: integer
+          minimum: 1
+          maximum: 256
+        maxTimeLimitMillis:
+          type: integer
+          minimum: 1
+          description: Maximum per-case wall-clock limit accepted in an immutable bundle manifest.
+        maxMemoryLimitMiB:
+          type: integer
+          minimum: 1
+          description: Maximum per-case memory limit accepted in an immutable bundle manifest.
+    Capabilities:
+      type: object
+      additionalProperties: false
+      required: [apiVersion, languages, judgeModes, checkers, limits]
+      properties:
+        apiVersion:
+          type: string
+          const: v1
+        languages:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/LanguageCapability'
+        judgeModes:
+          type: array
+          items:
+            type: string
+        checkers:
+          type: array
+          items:
+            type: string
+            enum: [exact, token]
+        limits:
+          $ref: '#/components/schemas/CapabilityLimits'
+    BundleUpload:
+      type: object
+      additionalProperties: false
+      required: [bundle]
+      properties:
+        bundle:
+          type: string
+          format: binary
+          contentMediaType: application/zip
+    BundleMetadata:
+      type: object
+      additionalProperties: false
+      required: [bundleId, sha256, sizeBytes, caseCount, manifestVersion, createdAt]
+      properties:
+        bundleId:
+          $ref: '#/components/schemas/ExternalId'
+        sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        sizeBytes:
+          type: integer
+          format: int64
+          minimum: 1
+        caseCount:
+          type: integer
+          minimum: 1
+          maximum: 256
+        manifestVersion:
+          type: integer
+          minimum: 1
+        createdAt:
+          type: string
+          format: date-time
+    SubmitJobRequest:
+      type: object
+      additionalProperties: false
+      required: [bundleId, language, sourceCode]
+      properties:
+        bundleId:
+          $ref: '#/components/schemas/ExternalId'
+        language:
+          type: string
+          enum: [go, cpp, python, java, javascript]
+        sourceCode:
+          type: string
+          minLength: 1
+          description: UTF-8 contestant source. This field exists only in the submit request.
+        stopOnFailure:
+          type: boolean
+          default: false
+        callbackId:
+          $ref: '#/components/schemas/ExternalId'
+        clientReference:
+          type: string
+          maxLength: 255
+    JobStatus:
+      type: string
+      enum: [QUEUED, RUNNING, SUCCEEDED, FAILED, CANCELLED]
+    CaseResultView:
+      type: object
+      additionalProperties: false
+      required: [caseId, verdict, timeMillis, memoryBytes]
+      properties:
+        caseId:
+          type: string
+        verdict:
+          type: string
+        timeMillis:
+          type: integer
+          format: int64
+          minimum: 0
+        memoryBytes:
+          type: integer
+          format: int64
+          minimum: 0
+    JobResultView:
+      type: object
+      additionalProperties: false
+      required: [verdict, compileStatus, timeMillis, memoryBytes, cases]
+      properties:
+        verdict:
+          type: string
+        compileStatus:
+          type: string
+        timeMillis:
+          type: integer
+          format: int64
+          minimum: 0
+        memoryBytes:
+          type: integer
+          format: int64
+          minimum: 0
+        cases:
+          type: array
+          items:
+            $ref: '#/components/schemas/CaseResultView'
+    JobView:
+      type: object
+      additionalProperties: false
+      required: [jobId, status, createdAt]
+      properties:
+        jobId:
+          $ref: '#/components/schemas/ExternalId'
+        status:
+          $ref: '#/components/schemas/JobStatus'
+        statusUrl:
+          type: string
+          pattern: '^/api/v1/judge-jobs/[a-z2-7]{26}$'
+        createdAt:
+          type: string
+          format: date-time
+        clientReference:
+          type: string
+          maxLength: 255
+        failureCode:
+          type: string
+          pattern: '^[A-Z][A-Z0-9_]{0,63}$'
+          description: Stable machine-readable reason present when the job failed before producing a result.
+        result:
+          $ref: '#/components/schemas/JobResultView'
+    JobListPage:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/JobView'
+        nextCursor:
+          type: string
+          maxLength: 512
+    Problem:
+      type: object
+      additionalProperties: false
+      required: [type, title, status, detail, requestId]
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+          minimum: 400
+          maximum: 599
+        detail:
+          type: string
+        requestId:
+          type: string

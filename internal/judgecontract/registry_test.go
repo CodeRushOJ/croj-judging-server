@@ -1,0 +1,45 @@
+package judgecontract_test
+
+import (
+	"reflect"
+	"testing"
+
+	"github.com/CodeRushOJ/croj-judging-server/internal/judgecontract"
+)
+
+func TestCanonicalV1RegistryPublishesTheExactLanguageAndCheckerSets(t *testing.T) {
+	languages := judgecontract.CanonicalLanguages()
+	gotLanguageIDs := make([]string, 0, len(languages))
+	for _, language := range languages {
+		gotLanguageIDs = append(gotLanguageIDs, language.PublicID)
+		if language.PublicID != language.SandboxID {
+			t.Errorf("public language %q maps to Sandbox language %q", language.PublicID, language.SandboxID)
+		}
+	}
+	if want := []string{"go", "cpp", "python", "java", "javascript"}; !reflect.DeepEqual(gotLanguageIDs, want) {
+		t.Fatalf("canonical language IDs = %v, want %v", gotLanguageIDs, want)
+	}
+	cpp, ok := judgecontract.ResolveLanguage("cpp")
+	if !ok || cpp.SandboxID != "cpp" || cpp.DisplayName != "C++ 17" || cpp.Runtime != "gcc" {
+		t.Fatalf("canonical cpp mapping = %+v available=%v", cpp, ok)
+	}
+	for _, unsupported := range []string{"cpp17", "cpp20", "c++", "C++"} {
+		if language, ok := judgecontract.ResolveLanguage(unsupported); ok {
+			t.Errorf("unsupported alias %q resolved to %+v", unsupported, language)
+		}
+	}
+	if got, want := judgecontract.CanonicalCheckers(), []judgecontract.Checker{judgecontract.CheckerExact, judgecontract.CheckerToken}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("canonical checkers = %v, want %v", got, want)
+	}
+
+	// Callers receive copies and cannot mutate the immutable protocol registry.
+	languages[0].PublicID = "mutated"
+	checkers := judgecontract.CanonicalCheckers()
+	checkers[0] = "mutated"
+	if resolved, ok := judgecontract.ResolveLanguage("go"); !ok || resolved.PublicID != "go" {
+		t.Fatalf("language registry was mutated: %+v available=%v", resolved, ok)
+	}
+	if !judgecontract.IsCanonicalChecker(judgecontract.CheckerExact) {
+		t.Fatal("checker registry was mutated")
+	}
+}

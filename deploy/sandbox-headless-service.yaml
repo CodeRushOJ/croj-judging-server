@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: sandbox-workers
+  namespace: coderushoj
+  labels:
+    app.kubernetes.io/name: croj-sandbox
+    app.kubernetes.io/component: execution-worker
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: false
+  selector:
+    app.kubernetes.io/name: croj-sandbox
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: grpc
+      protocol: TCP

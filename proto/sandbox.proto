@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package sandbox;
+
+option go_package = "github.com/CodeRushOJ/croj-judging-server/proto";
+
+// SandboxService is the compatibility API exposed by croj-sandbox.
+service SandboxService {
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse) {}
+  rpc ExecuteBatchV1(ExecuteBatchV1Request) returns (stream ExecuteBatchV1Event) {}
+}
+
+message ExecuteRequest {
+  string language = 1;
+  string source_code = 2;
+  string stdin = 3;
+  int32 timeout = 4;
+  int32 memory_limit = 5;
+  string expected_output = 6;
+}
+
+message ExecuteResponse {
+  string status = 1;
+  int32 exit_code = 2;
+  string stdout = 3;
+  string stderr = 4;
+  string error = 5;
+  string compile_error = 6;
+  int64 time_used = 7;
+  int64 memory_used = 8;
+}
+
+message ExecuteBatchV1Request {
+  string language = 1;
+  string source_code = 2;
+  int32 timeout = 3;
+  int32 memory_limit = 4;
+  bool stop_on_failure = 5;
+  repeated ExecuteBatchV1Case cases = 6;
+}
+
+message ExecuteBatchV1Case {
+  string case_id = 1;
+  string stdin = 2;
+  string expected_output = 3;
+  bool compare_output = 4;
+  string token_expected_sha256 = 5;
+}
+
+message ExecuteBatchV1Event {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    CASE_RESULT = 1;
+    COMPILE_ERROR = 2;
+    COMPLETED = 3;
+  }
+
+  Kind kind = 1;
+  string case_id = 2;
+  ExecuteResponse result = 3;
+}

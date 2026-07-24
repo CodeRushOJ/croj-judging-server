@@ -1,0 +1,366 @@
+package service
+
+import (
+	"context"
+	"crypto/sha256"
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/CodeRushOJ/croj-judging-server/internal/bundle"
+	"github.com/CodeRushOJ/croj-judging-server/internal/callback"
+	judgesandbox "github.com/CodeRushOJ/croj-judging-server/internal/sandbox"
+	sandboxpb "github.com/CodeRushOJ/croj-judging-server/proto"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protowire"
+	"google.golang.org/protobuf/proto"
+)
+
+type batchExecutorStub struct {
+	requests  []*sandboxpb.ExecuteBatchV1Request
+	addresses []string
+	events    []*sandboxpb.ExecuteBatchV1Event
+	err       error
+}
+
+type sequenceBatchExecutor struct {
+	eventSets [][]*sandboxpb.ExecuteBatchV1Event
+	errors    []error
+	requests  []*sandboxpb.ExecuteBatchV1Request
+	addresses []string
+}
+
+type countingArtifact struct {
+	*memoryArtifact
+	reads int
+}
+
+func (artifact *countingArtifact) ReadCase(testCase bundle.Case) (string, string, error) {
+	artifact.reads++
+	return artifact.memoryArtifact.ReadCase(testCase)
+}
+
+func (executor *sequenceBatchExecutor) ExecuteBatch(_ context.Context, address string, request *sandboxpb.ExecuteBatchV1Request) ([]*sandboxpb.ExecuteBatchV1Event, error) {
+	index := len(executor.requests)
+	executor.requests = append(executor.requests, request)
+	executor.addresses = append(executor.addresses, address)
+	if index < len(executor.errors) && executor.errors[index] != nil {
+		return nil, executor.errors[index]
+	}
+	return executor.eventSets[index], nil
+}
+
+func TestBatchBundlePipelineRejectsOversizedBatchBeforeSandbox(t *testing.T) {
+	artifact := &memoryArtifact{
+		manifest: bundle.Manifest{SchemaVersion: 1, JudgeMode: bundle.JudgeModeACM, Checker: bundle.CheckerExact, Limits: bundle.Limits{TimeLimitMillis: 1000, MemoryLimitMiB: 64}},
+		contents: map[string]string{},
+	}
+	for index := 0; index < 257; index++ {
+		id := fmt.Sprintf("case-%03d", index)
+		input, output := id+".in", id+".out"
+		artifact.manifest.Cases = append(artifact.manifest.Cases, bundle.Case{ID: id, Input: input, Output: output, Weight: 1})
+		artifact.contents[input], artifact.contents[output] = "input", "output"
+	}
+	executor := &batchExecutorStub{}
+	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a"}}, executor, 1)
+
+	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validExecutionConfig(), artifact)
+	if !errors.Is(err, ErrCanonicalInfrastructure) || result.Status != "" || len(executor.requests) != 0 {
+		t.Fatalf("result=%+v sandbox calls=%d", result, len(executor.requests))
+	}
+}
+
+func TestIncrementalBatchCaseWireSizeMatchesProtobuf(t *testing.T) {
+	request := &sandboxpb.ExecuteBatchV1Request{Language: "cpp", SourceCode: "int main(){}", Timeout: 2, MemoryLimit: 64}
+	incremental := proto.Size(request)
+	for index := 0; index < 256; index++ {
+		requestCase := &sandboxpb.ExecuteBatchV1Case{CaseId: fmt.Sprintf("case-%03d", index), Stdin: strings.Repeat("x", index*17), ExpectedOutput: "answer", CompareOutput: true}
+		incremental += batchCaseWireBytes(requestCase)
+		request.Cases = append(request.Cases, requestCase)
+		if incremental != proto.Size(request) {
+			t.Fatalf("case %d incremental=%d protobuf=%d", index, incremental, proto.Size(request))
+		}
+	}
+	field := request.ProtoReflect().Descriptor().Fields().ByName("cases")
+	if field == nil || protowire.Number(field.Number()) != executeBatchCasesFieldNumber {
+		t.Fatalf("cases field number=%v want=%d", field, executeBatchCasesFieldNumber)
+	}
+}
+
+func TestBatchBundlePipelineStopsReadingCasesWhenWireLimitIsCrossed(t *testing.T) {
+	artifact := &countingArtifact{memoryArtifact: exactArtifact(3)}
+	executor := &batchExecutorStub{}
+	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a"}}, executor, 1)
+	pipeline.maxRequestBytes = proto.Size(&sandboxpb.ExecuteBatchV1Request{
+		Language:      validBundleSubmission().Language,
+		SourceCode:    validBundleSubmission().Code,
+		Timeout:       timeoutSeconds(validExecutionConfig().TimeLimitMillis),
+		MemoryLimit:   boundedInt32(validExecutionConfig().MemoryLimitMB),
+		StopOnFailure: true,
+	})
+
+	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validExecutionConfig(), artifact)
+	if !errors.Is(err, ErrCanonicalInfrastructure) || result.Status != "" || artifact.reads != 1 || len(executor.requests) != 0 {
+		t.Fatalf("result=%+v reads=%d sandbox calls=%d", result, artifact.reads, len(executor.requests))
+	}
+}
+
+func TestBatchBundlePipelineRetainsOnlyHashesForLargeTokenOutputs(t *testing.T) {
+	const caseCount = 64
+	artifact := &countingArtifact{memoryArtifact: &memoryArtifact{
+		manifest: bundle.Manifest{SchemaVersion: 1, JudgeMode: bundle.JudgeModeACM, Checker: bundle.CheckerToken, Limits: bundle.Limits{TimeLimitMillis: 1000, MemoryLimitMiB: 64}},
+		contents: make(map[string]string, caseCount*2),
+	}}
+	largeToken := strings.Repeat("x", 256<<10)
+	for index := range caseCount {
+		id := fmt.Sprintf("case-%03d", index)
+		input, output := id+".in", id+".out"
+		artifact.manifest.Cases = append(artifact.manifest.Cases, bundle.Case{ID: id, Input: input, Output: output, Weight: 1})
+		artifact.contents[input] = "x"
+		artifact.contents[output] = fmt.Sprintf("%03d-%s", index, largeToken)
+	}
+	executor := &batchExecutorStub{events: []*sandboxpb.ExecuteBatchV1Event{{
+		Kind:   sandboxpb.ExecuteBatchV1Event_COMPILE_ERROR,
+		Result: &sandboxpb.ExecuteResponse{Status: "Compile Error"},
+	}}}
+	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a"}}, executor, 1)
+	pipeline.maxExpectedCheckBytes = caseCount * sha256.Size * 2
+
+	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validExecutionConfig(), artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != callback.StatusCompileError || artifact.reads != caseCount || len(executor.requests) != 1 {
+		t.Fatalf("result=%+v reads=%d sandbox calls=%d", result, artifact.reads, len(executor.requests))
+	}
+	if size := proto.Size(executor.requests[0]); size >= 1<<20 {
+		t.Fatalf("token request retained raw expected outputs: protobuf size=%d", size)
+	}
+}
+
+func (executor *batchExecutorStub) ExecuteBatch(
+	_ context.Context,
+	address string,
+	request *sandboxpb.ExecuteBatchV1Request,
+) ([]*sandboxpb.ExecuteBatchV1Event, error) {
+	executor.addresses = append(executor.addresses, address)
+	executor.requests = append(executor.requests, request)
+	return executor.events, executor.err
+}
+
+func TestBatchBundlePipelineDoesNotRetryMalformedCompletedStream(t *testing.T) {
+	executor := &sequenceBatchExecutor{eventSets: [][]*sandboxpb.ExecuteBatchV1Event{nil, nil}}
+	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a", "sandbox-b"}}, executor, 2)
+	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validExecutionConfig(), exactArtifact(1))
+	if !errors.Is(err, ErrCanonicalInfrastructure) || result.Status != "" || len(executor.requests) != 1 {
+		t.Fatalf("result=%+v sandbox calls=%d, want deterministic failure without retry", result, len(executor.requests))
+	}
+}
+
+func TestBatchBundlePipelineDoesNotRetryClientRejectedStream(t *testing.T) {
+	executor := &sequenceBatchExecutor{errors: []error{judgesandbox.ErrInvalidBatchStream, nil}}
+	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a", "sandbox-b"}}, executor, 2)
+	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validExecutionConfig(), exactArtifact(1))
+	if !errors.Is(err, ErrCanonicalInfrastructure) || result.Status != "" || len(executor.requests) != 1 {
+		t.Fatalf("result=%+v sandbox calls=%d, want deterministic failure without retry", result, len(executor.requests))
+	}
+}
+
+func TestBatchBundlePipelineRoutesSandboxSystemErrorToInfrastructureFailure(t *testing.T) {
+	executor := &batchExecutorStub{events: []*sandboxpb.ExecuteBatchV1Event{
+		{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT, CaseId: "case-1", Result: &sandboxpb.ExecuteResponse{Status: "Sandbox Error"}},
+		{Kind: sandboxpb.ExecuteBatchV1Event_COMPLETED},
+	}}
+	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a"}}, executor, 1)
+	result, err := pipeline.ExecuteCanonical(context.Background(), CanonicalExecutionRequest{Language: "cpp", SourceCode: "int main(){}", StopOnFailure: true}, exactArtifact(1))
+	if !errors.Is(err, ErrCanonicalInfrastructure) || result.Status != "" {
+		t.Fatalf("result=%+v error=%v", result, err)
+	}
+}
+
+func TestBatchBundlePipelineSendsAllCasesInOneCompileOnceRequest(t *testing.T) {
+	executor := &batchExecutorStub{events: []*sandboxpb.ExecuteBatchV1Event{
+		{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT, CaseId: "case-1", Result: &sandboxpb.ExecuteResponse{Status: "Accepted", Stdout: "one", TimeUsed: 8, MemoryUsed: 100}},
+		{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT, CaseId: "case-2", Result: &sandboxpb.ExecuteResponse{Status: "Accepted", Stdout: "two", TimeUsed: 11, MemoryUsed: 120}},
+		{Kind: sandboxpb.ExecuteBatchV1Event_COMPLETED},
+	}}
+	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a"}}, executor, 2)
+
+	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validExecutionConfig(), exactArtifact(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != callback.StatusAccepted || result.TimeUsedMillis != 11 || result.MemoryUsedKB != 120 {
+		t.Fatalf("result = %+v", result)
+	}
+	if len(executor.requests) != 1 || len(executor.requests[0].Cases) != 2 {
+		t.Fatalf("batch requests = %+v", executor.requests)
+	}
+	if executor.requests[0].Cases[0].CaseId != "case-1" || executor.requests[0].Cases[1].CaseId != "case-2" {
+		t.Fatalf("case order = %+v", executor.requests[0].Cases)
+	}
+	if !executor.requests[0].Cases[0].CompareOutput || executor.requests[0].Cases[0].ExpectedOutput != "one\n" {
+		t.Fatalf("exact case contract = %+v", executor.requests[0].Cases[0])
+	}
+}
+
+func TestBatchBundlePipelineCanonicalRequestUsesBundleLimitsAndStopPolicy(t *testing.T) {
+	artifact := exactArtifact(1)
+	artifact.manifest.Limits = bundle.Limits{TimeLimitMillis: 1500, MemoryLimitMiB: 512}
+	executor := &batchExecutorStub{events: []*sandboxpb.ExecuteBatchV1Event{
+		{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT, CaseId: "case-1", Result: &sandboxpb.ExecuteResponse{Status: "Accepted", Stdout: "one"}},
+		{Kind: sandboxpb.ExecuteBatchV1Event_COMPLETED},
+	}}
+	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"dns:///sandbox-workers.coderushoj.svc.cluster.local:50051"}}, executor, 1)
+	result, err := pipeline.ExecuteCanonical(context.Background(), CanonicalExecutionRequest{
+		Language: "cpp", SourceCode: "int main(){}", StopOnFailure: false,
+	}, artifact)
+	if err != nil || result.Status != callback.StatusAccepted || len(result.Cases) != 1 || result.Cases[0].CaseID != "case-1" || result.Cases[0].Status != callback.StatusAccepted {
+		t.Fatalf("result=%+v error=%v", result, err)
+	}
+	request := executor.requests[0]
+	if request.Language != "cpp" || request.SourceCode != "int main(){}" || request.Timeout != 2 || request.MemoryLimit != 512 || request.StopOnFailure {
+		t.Fatalf("canonical sandbox request = %+v", request)
+	}
+}
+
+func TestBatchBundlePipelineKeepsOrderedResultsWhenStopOnFailureIsDisabled(t *testing.T) {
+	executor := &batchExecutorStub{events: []*sandboxpb.ExecuteBatchV1Event{
+		{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT, CaseId: "case-1", Result: &sandboxpb.ExecuteResponse{Status: "Accepted", Stdout: "wrong", TimeUsed: 8, MemoryUsed: 100}},
+		{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT, CaseId: "case-2", Result: &sandboxpb.ExecuteResponse{Status: "Accepted", Stdout: "two", TimeUsed: 11, MemoryUsed: 120}},
+		{Kind: sandboxpb.ExecuteBatchV1Event_COMPLETED},
+	}}
+	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a"}}, executor, 1)
+	result, err := pipeline.ExecuteCanonical(context.Background(), CanonicalExecutionRequest{
+		Language: "cpp", SourceCode: "int main(){}", StopOnFailure: false,
+	}, exactArtifact(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != callback.StatusWrongAnswer || len(result.Cases) != 2 ||
+		result.Cases[0].CaseID != "case-1" || result.Cases[0].Status != callback.StatusWrongAnswer ||
+		result.Cases[1].CaseID != "case-2" || result.Cases[1].Status != callback.StatusAccepted ||
+		result.TimeUsedMillis != 11 || result.MemoryUsedKB != 120 {
+		t.Fatalf("canonical result = %+v", result)
+	}
+}
+
+func TestBatchBundlePipelineRetriesWholeBatchOnCapacityFailure(t *testing.T) {
+	executor := &sequenceBatchExecutor{
+		errors: []error{status.Error(codes.ResourceExhausted, "busy"), nil},
+		eventSets: [][]*sandboxpb.ExecuteBatchV1Event{nil, {
+			{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT, CaseId: "case-1", Result: &sandboxpb.ExecuteResponse{Status: "Accepted", Stdout: "one"}},
+			{Kind: sandboxpb.ExecuteBatchV1Event_COMPLETED},
+		}},
+	}
+	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a", "sandbox-b"}}, executor, 2)
+	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validExecutionConfig(), exactArtifact(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != callback.StatusAccepted || len(executor.requests) != 2 || executor.addresses[0] == executor.addresses[1] {
+		t.Fatalf("result=%+v addresses=%v", result, executor.addresses)
+	}
+}
+
+func TestBatchBundlePipelinePreservesRetryableCodeAfterEndpointExhaustion(t *testing.T) {
+	executor := &sequenceBatchExecutor{errors: []error{
+		status.Error(codes.Unavailable, "gone"),
+		status.Error(codes.Unavailable, "gone"),
+	}}
+	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a", "sandbox-b"}}, executor, 2)
+	_, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validExecutionConfig(), exactArtifact(1))
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("error = %v, want Unavailable", err)
+	}
+}
+
+func TestBatchBundlePipelineNeverRetriesSameEndpointInOneAttempt(t *testing.T) {
+	executor := &sequenceBatchExecutor{errors: []error{
+		status.Error(codes.Unavailable, "gone"),
+		status.Error(codes.Unavailable, "gone"),
+		status.Error(codes.Unavailable, "gone"),
+	}}
+	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a"}}, executor, 3)
+	_, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validExecutionConfig(), exactArtifact(1))
+	if status.Code(err) != codes.Unavailable || len(executor.requests) != 1 {
+		t.Fatalf("error=%v sandbox calls=%d, want one attempt and preserved Unavailable", err, len(executor.requests))
+	}
+}
+
+func TestBatchBundlePipelineRedactsCompileDiagnostics(t *testing.T) {
+	secret := "source-and-hidden-diagnostic"
+	executor := &batchExecutorStub{events: []*sandboxpb.ExecuteBatchV1Event{{
+		Kind: sandboxpb.ExecuteBatchV1Event_COMPILE_ERROR,
+		Result: &sandboxpb.ExecuteResponse{
+			Status:       "Compile Error",
+			CompileError: secret,
+			Error:        secret,
+		},
+	}}}
+	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a"}}, executor, 1)
+	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validExecutionConfig(), exactArtifact(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != callback.StatusCompileError || result.CompileError != "compilation failed; diagnostics redacted" || strings.Contains(fmt.Sprintf("%+v", result), secret) {
+		t.Fatalf("result leaked compile diagnostics: %+v", result)
+	}
+}
+
+func TestBatchBundlePipelineKeepsTokenExpectedOutputOutOfSandbox(t *testing.T) {
+	artifact := exactArtifact(1)
+	artifact.manifest.Checker = bundle.CheckerToken
+	executor := &batchExecutorStub{events: []*sandboxpb.ExecuteBatchV1Event{
+		{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT, CaseId: "case-1", Result: &sandboxpb.ExecuteResponse{Status: "Accepted", Stdout: " one\t"}},
+		{Kind: sandboxpb.ExecuteBatchV1Event_COMPLETED},
+	}}
+	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a"}}, executor, 1)
+	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validExecutionConfig(), artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != callback.StatusAccepted {
+		t.Fatalf("result = %+v", result)
+	}
+	if executor.requests[0].Cases[0].ExpectedOutput != "" || executor.requests[0].Cases[0].CompareOutput || executor.requests[0].Cases[0].TokenExpectedSha256 != "615f69ed4e249a34955fc08be20fc324c06462f6ae8b817d22280505adca9209" || !executor.requests[0].StopOnFailure {
+		t.Fatalf("token expected output crossed sandbox boundary: %+v", executor.requests[0].Cases[0])
+	}
+}
+
+func TestBatchBundlePipelineRechecksTokenVerdictFromRetainedHash(t *testing.T) {
+	artifact := exactArtifact(1)
+	artifact.manifest.Checker = bundle.CheckerToken
+	executor := &batchExecutorStub{events: []*sandboxpb.ExecuteBatchV1Event{
+		{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT, CaseId: "case-1", Result: &sandboxpb.ExecuteResponse{Status: "Accepted", Stdout: "wrong"}},
+		{Kind: sandboxpb.ExecuteBatchV1Event_COMPLETED},
+	}}
+	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a"}}, executor, 1)
+
+	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validExecutionConfig(), artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != callback.StatusWrongAnswer {
+		t.Fatalf("result=%+v, want local hash-only Wrong Answer", result)
+	}
+}
+
+func TestBatchBundlePipelineStopsTokenBatchAtFirstMismatch(t *testing.T) {
+	artifact := exactArtifact(2)
+	artifact.manifest.Checker = bundle.CheckerToken
+	executor := &batchExecutorStub{events: []*sandboxpb.ExecuteBatchV1Event{
+		{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT, CaseId: "case-1", Result: &sandboxpb.ExecuteResponse{Status: "Wrong Answer", Stdout: "wrong"}},
+		{Kind: sandboxpb.ExecuteBatchV1Event_COMPLETED},
+	}}
+	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a"}}, executor, 1)
+	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), validExecutionConfig(), artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != callback.StatusWrongAnswer || executor.requests[0].Cases[0].TokenExpectedSha256 == "" || executor.requests[0].Cases[0].ExpectedOutput != "" {
+		t.Fatalf("result=%+v request=%+v, want hash-only first-case comparison", result, executor.requests[0])
+	}
+}
