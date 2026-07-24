@@ -150,6 +150,21 @@ func newExternalRuntime(
 	if err != nil {
 		return nil, err
 	}
+	jobBodyReadTimeout, err := positiveDuration(externalConfig.JobBodyReadTimeout, "external job body read")
+	if err != nil {
+		return nil, err
+	}
+	jobSubmitTimeout, err := positiveDuration(externalConfig.JobSubmitTimeout, "external job submit")
+	if err != nil {
+		return nil, err
+	}
+	bundleOperationTimeout, err := positiveDuration(externalConfig.BundleOperationTimeout, "external bundle operation")
+	if err != nil {
+		return nil, err
+	}
+	if err := validateExternalOperationTimeouts(writeTimeout, jobBodyReadTimeout, jobSubmitTimeout, bundleOperationTimeout); err != nil {
+		return nil, err
+	}
 	sourceRetention, err := positiveDuration(externalConfig.SourceRetention, "external source retention")
 	if err != nil {
 		return nil, err
@@ -170,7 +185,7 @@ func newExternalRuntime(
 	if err != nil {
 		return nil, err
 	}
-	if externalConfig.WorkerConcurrency <= 0 || externalConfig.BundleUploadConcurrency <= 0 || strings.TrimSpace(externalConfig.WorkerID) == "" ||
+	if externalConfig.WorkerConcurrency <= 0 || externalConfig.BundleUploadConcurrency <= 0 || externalConfig.JobBodyConcurrency <= 0 || strings.TrimSpace(externalConfig.WorkerID) == "" ||
 		strings.TrimSpace(externalConfig.RedisAddress) == "" || externalConfig.SourceKeyVersion <= 0 || externalConfig.SourceKeyVersion > 65535 {
 		return nil, fmt.Errorf("external worker concurrency and source key version are invalid")
 	}
@@ -220,6 +235,7 @@ func newExternalRuntime(
 	jobRepository, err := external.NewMySQLJobRepository(external.MySQLJobRepositoryConfig{
 		Database: database, Random: rand.Reader, Now: time.Now, IdempotencyPepper: idempotencyPepper,
 		CursorKey: cursorKey, SourceCipher: sourceCipher, SourceObjects: sourceObjects, IdempotencyTTL: idempotencyTTL,
+		SubmitTimeout: jobSubmitTimeout,
 	})
 	if err != nil {
 		return nil, err
@@ -263,6 +279,9 @@ func newExternalRuntime(
 		httpapi.WithBundleApplication(bundleService),
 		httpapi.WithBundleWriteQuota(quota, external.QuotaLimit{Capacity: externalConfig.BundleByteCapacity, RefillPeriod: quotaRefill}),
 		httpapi.WithBundleUploadConcurrency(externalConfig.BundleUploadConcurrency),
+		httpapi.WithBundleOperationTimeout(bundleOperationTimeout),
+		httpapi.WithJobBodyProtection(jobBodyReadTimeout, externalConfig.JobBodyConcurrency),
+		httpapi.WithJobSubmitTimeout(jobSubmitTimeout),
 	)
 	if err != nil {
 		_ = redisClient.Close()
@@ -299,7 +318,14 @@ func newExternalRuntime(
 		_ = redisClient.Close()
 		return nil, err
 	}
-	workers := make([]app.Worker, 0, externalConfig.WorkerConcurrency+len(webhookWorkers)+4)
+	bundleStagingCollector, err := external.NewBundleStagingGarbageCollector(external.BundleStagingGarbageCollectorConfig{
+		Store: bundleObjects, References: bundleRepository,
+	})
+	if err != nil {
+		_ = redisClient.Close()
+		return nil, err
+	}
+	workers := make([]app.Worker, 0, externalConfig.WorkerConcurrency+len(webhookWorkers)+5)
 	for index := 0; index < externalConfig.WorkerConcurrency; index++ {
 		workerID := externalConfig.WorkerID + "-" + strconv.Itoa(index)
 		workers = append(workers, app.NewWorker(func(ctx context.Context) error { return runner.Run(ctx, workerID, idleBackoff) }))
@@ -308,6 +334,7 @@ func newExternalRuntime(
 	workers = append(workers, app.NewWorker(reservationWorker.Run))
 	workers = append(workers, app.NewWorker(retentionWorker.Run))
 	workers = append(workers, app.NewWorker(idempotencyRetentionWorker.Run))
+	workers = append(workers, app.NewWorker(bundleStagingCollector.Run))
 	reconciler, err := external.NewBundleReconciler(bundleService)
 	if err != nil {
 		_ = redisClient.Close()
@@ -366,6 +393,17 @@ func positiveDuration(value, name string) (time.Duration, error) {
 		return 0, fmt.Errorf("%s duration is invalid", name)
 	}
 	return duration, nil
+}
+
+func validateExternalOperationTimeouts(writeTimeout, jobBodyReadTimeout, jobSubmitTimeout, bundleOperationTimeout time.Duration) error {
+	const responseWriteAllowance = 30 * time.Second
+	if bundleOperationTimeout+responseWriteAllowance > writeTimeout {
+		return fmt.Errorf("external bundle operation timeout must preserve the response write allowance")
+	}
+	if jobBodyReadTimeout+jobSubmitTimeout+responseWriteAllowance > writeTimeout {
+		return fmt.Errorf("external job submit timeouts must preserve the response write allowance")
+	}
+	return nil
 }
 
 func decode32(value, name string) ([]byte, error) {

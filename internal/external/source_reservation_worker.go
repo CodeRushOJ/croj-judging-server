@@ -2,6 +2,7 @@ package external
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -69,7 +70,13 @@ func (worker *SourceReservationWorker) Run(ctx context.Context) error {
 	for {
 		drained, err := worker.sweep(ctx)
 		if err != nil {
-			return err
+			if !IsTransientDatabaseError(err) && !errors.Is(err, ErrSourceObjectStoreUnavailable) {
+				return err
+			}
+			if err := worker.wait(ctx, worker.revisitDelay); err != nil {
+				return err
+			}
+			continue
 		}
 		delay := worker.revisitDelay
 		if drained {

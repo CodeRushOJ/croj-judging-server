@@ -90,7 +90,7 @@ func TestOpenAPIOperationsMatchLiveHTTPHandlers(t *testing.T) {
 		"/api/v1/capabilities":              {http.MethodGet: {200, 401, 403, 503}},
 		"/api/v1/bundles":                   {http.MethodPost: {200, 201, 400, 401, 403, 409, 413, 429, 503}},
 		"/api/v1/bundles/{bundleId}":        {http.MethodGet: {200, 401, 403, 404, 503}},
-		"/api/v1/judge-jobs":                {http.MethodGet: {200, 400, 401, 403, 500, 503}, http.MethodPost: {202, 400, 401, 403, 404, 409, 422, 429, 500, 503}},
+		"/api/v1/judge-jobs":                {http.MethodGet: {200, 400, 401, 403, 500, 503}, http.MethodPost: {202, 400, 401, 403, 404, 408, 409, 415, 422, 429, 500, 503}},
 		"/api/v1/judge-jobs/{jobId}":        {http.MethodGet: {200, 401, 403, 404, 500, 503}},
 		"/api/v1/judge-jobs/{jobId}/cancel": {http.MethodPost: {200, 401, 403, 404, 500, 503}},
 	}
@@ -142,6 +142,7 @@ func TestOpenAPIContractCoversLiveHandlerResponses(t *testing.T) {
 	jobRawRequest := func(t *testing.T, service *jobServiceStub, body string, keys ...string) (*Server, *http.Request) {
 		server := newJobTestServer(t, service, ScopeJobSubmit)
 		request := httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
 		request.Header.Set("Authorization", "Bearer dummy")
 		for _, key := range keys {
 			request.Header.Add("Idempotency-Key", key)
@@ -309,6 +310,11 @@ func TestOpenAPIContractCoversLiveHandlerResponses(t *testing.T) {
 		"job invalid JSON": {"/api/v1/judge-jobs", http.MethodPost, func(t *testing.T) (*Server, *http.Request) {
 			return jobRawRequest(t, &jobServiceStub{}, `{"sourceCode":`, "submission-00000042")
 		}, 400, []string{"X-Request-Id"}},
+		"job unsupported media type": {"/api/v1/judge-jobs", http.MethodPost, func(t *testing.T) (*Server, *http.Request) {
+			server, request := jobRawRequest(t, &jobServiceStub{}, `{}`, "submission-00000042")
+			request.Header.Set("Content-Type", "text/plain")
+			return server, request
+		}, 415, []string{"X-Request-Id"}},
 		"job not found": {"/api/v1/judge-jobs", http.MethodPost, func(t *testing.T) (*Server, *http.Request) {
 			return jobRequest(t, &jobServiceStub{err: ErrJobNotFound})
 		}, 404, []string{"X-Request-Id"}},
@@ -336,6 +342,7 @@ func TestOpenAPIContractCoversLiveHandlerResponses(t *testing.T) {
 			quota := &writeQuotaStub{decision: external.QuotaDecision{Allowed: false, RetryAfter: time.Second}}
 			server := newJobServer(t, staticAuthenticator{principal: Principal{TenantID: "tenant-7", scopes: allScopes}}, &jobServiceStub{view: JobView{JobID: "ceirceirceirceirceirceirce"}}, quota)
 			request := httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs", strings.NewReader(`{"bundleId":"ceirceirceirceirceirceircf","language":"cpp","sourceCode":"x"}`))
+			request.Header.Set("Content-Type", "application/json")
 			request.Header.Set("Idempotency-Key", "submission-00000042")
 			return server, request
 		}, 429, []string{"X-Request-Id", "Retry-After"}},
@@ -343,6 +350,7 @@ func TestOpenAPIContractCoversLiveHandlerResponses(t *testing.T) {
 			quota := &writeQuotaStub{err: external.ErrQuotaUnavailable}
 			server := newJobServer(t, staticAuthenticator{principal: Principal{TenantID: "tenant-7", scopes: allScopes}}, &jobServiceStub{view: JobView{JobID: "ceirceirceirceirceirceirce"}}, quota)
 			request := httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs", strings.NewReader(`{"bundleId":"ceirceirceirceirceirceircf","language":"cpp","sourceCode":"x"}`))
+			request.Header.Set("Content-Type", "application/json")
 			request.Header.Set("Idempotency-Key", "submission-00000042")
 			return server, request
 		}, 503, []string{"X-Request-Id", "Retry-After"}},
@@ -549,6 +557,23 @@ func TestOpenAPIContractPinsSecurityHeadersAndAsynchronousSemantics(t *testing.T
 			t.Errorf("job submit %d response misses Retry-After", status)
 		}
 	}
+	for path, method := range map[string]string{
+		"/api/v1/bundles":            http.MethodPost,
+		"/api/v1/bundles/{bundleId}": http.MethodGet,
+	} {
+		for status, response := range operation(t, document, path, method).Responses.Map() {
+			if response.Value == nil {
+				continue
+			}
+			_, hasRetryAfter := response.Value.Headers["Retry-After"]
+			if status == "503" && !hasRetryAfter {
+				t.Errorf("%s %s bundle 503 response misses Retry-After", method, path)
+			}
+			if status != "503" && status != "429" && hasRetryAfter {
+				t.Errorf("%s %s terminal %s response advertises Retry-After", method, path, status)
+			}
+		}
+	}
 	bundleLocation := operation(t, document, "/api/v1/bundles", http.MethodPost).Responses.Status(201).Value.Headers["Location"]
 	jobLocation := jobSubmit.Responses.Status(202).Value.Headers["Location"]
 	if bundleLocation == nil || bundleLocation.Value == nil || !strings.HasPrefix(fmt.Sprint(bundleLocation.Value.Example), "/api/v1/bundles/") {
@@ -738,6 +763,7 @@ func TestOpenAPIProblemExamplesMatchHandlerProblemTypes(t *testing.T) {
 		"bundle unavailable":       {"/api/v1/bundles", http.MethodPost, 503, "bundle-unavailable"},
 		"bundle not found":         {"/api/v1/bundles/{bundleId}", http.MethodGet, 404, "not-found"},
 		"invalid job JSON":         {"/api/v1/judge-jobs", http.MethodPost, 400, "invalid-json"},
+		"job unsupported media":    {"/api/v1/judge-jobs", http.MethodPost, 415, "unsupported-media-type"},
 		"job not found":            {"/api/v1/judge-jobs", http.MethodPost, 404, "job-not-found"},
 		"invalid list query":       {"/api/v1/judge-jobs", http.MethodGet, 400, "invalid-list-query"},
 		"job get not found":        {"/api/v1/judge-jobs/{jobId}", http.MethodGet, 404, "job-not-found"},

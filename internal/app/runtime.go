@@ -2,6 +2,9 @@ package app
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -105,7 +108,7 @@ func (runtime *Runtime) Started() <-chan struct{} { return runtime.started }
 func (runtime *Runtime) Handler() http.Handler {
 	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if runtime.shuttingDown.Load() {
-			response.WriteHeader(http.StatusServiceUnavailable)
+			writeShutdownProblem(response)
 			return
 		}
 		if request.URL.Path == "/livez" {
@@ -122,6 +125,36 @@ func (runtime *Runtime) Handler() http.Handler {
 		}
 		runtime.api.ServeHTTP(response, request)
 	})
+}
+
+func writeShutdownProblem(response http.ResponseWriter) {
+	requestID := runtimeRequestID()
+	response.Header().Set("Content-Type", "application/problem+json")
+	response.Header().Set("Cache-Control", "no-store")
+	response.Header().Set("Retry-After", "5")
+	response.Header().Set("X-Request-Id", requestID)
+	response.WriteHeader(http.StatusServiceUnavailable)
+	_ = json.NewEncoder(response).Encode(struct {
+		Type      string `json:"type"`
+		Title     string `json:"title"`
+		Status    int    `json:"status"`
+		Detail    string `json:"detail"`
+		RequestID string `json:"requestId"`
+	}{
+		Type:      "https://coderushoj.dev/problems/shutting-down",
+		Title:     "Service shutting down",
+		Status:    http.StatusServiceUnavailable,
+		Detail:    "Retry the request later.",
+		RequestID: requestID,
+	})
+}
+
+func runtimeRequestID() string {
+	var random [16]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return "unavailable"
+	}
+	return hex.EncodeToString(random[:])
 }
 
 func (runtime *Runtime) Run(ctx context.Context) error {

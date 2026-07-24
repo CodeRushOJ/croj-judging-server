@@ -502,8 +502,8 @@ func bundleWithinTenantPolicy(input BundleCommitInput, policy TenantPolicy) bool
 
 func validStagingObjectKey(tenantID, key, digestHex string) bool {
 	parts := strings.Split(key, "/")
-	return len(parts) == 5 && parts[0] == "external" && parts[1] == tenantID && parts[2] == "staging" &&
-		externalIDPattern.MatchString(parts[3]) && parts[4] == digestHex+".zip"
+	return len(parts) == 4 && parts[0] == "external-staging" && parts[1] == tenantID &&
+		externalIDPattern.MatchString(parts[2]) && parts[3] == digestHex+".zip"
 }
 
 func validBundlePublicationClaim(claim BundlePublicationClaim) bool {

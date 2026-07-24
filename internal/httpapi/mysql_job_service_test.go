@@ -10,24 +10,30 @@ import (
 )
 
 type durableJobRepositoryStub struct {
-	submitResult external.SubmitJobResult
-	submitError  error
-	listResult   external.JobListResult
-	listError    error
-	getResult    external.ExternalJobRecord
-	getError     error
-	cancelResult external.ExternalJobRecord
-	cancelError  error
-	tenantID     string
-	key          string
-	request      external.JudgeJobRequest
-	listOptions  external.JobListOptions
+	submitResult      external.SubmitJobResult
+	submitError       error
+	listResult        external.JobListResult
+	listError         error
+	getResult         external.ExternalJobRecord
+	getError          error
+	cancelResult      external.ExternalJobRecord
+	cancelError       error
+	tenantID          string
+	key               string
+	request           external.JudgeJobRequest
+	listOptions       external.JobListOptions
+	submitDeadline    time.Time
+	admissionDeadline time.Time
 }
 
-func (repository *durableJobRepositoryStub) Submit(_ context.Context, tenantID, key string, request external.JudgeJobRequest, admit func() error) (external.SubmitJobResult, error) {
+func (repository *durableJobRepositoryStub) Submit(ctx context.Context, tenantID, key string, request external.JudgeJobRequest, admit func(context.Context) error) (external.SubmitJobResult, error) {
 	repository.tenantID, repository.key, repository.request = tenantID, key, request
+	repository.submitDeadline, _ = ctx.Deadline()
 	if !repository.submitResult.Replayed && repository.submitError == nil {
-		if err := admit(); err != nil {
+		admissionContext, cancel := context.WithCancel(ctx)
+		defer cancel()
+		repository.admissionDeadline, _ = admissionContext.Deadline()
+		if err := admit(admissionContext); err != nil {
 			return external.SubmitJobResult{}, err
 		}
 	}
@@ -74,7 +80,7 @@ func TestMySQLJobServiceMapsCommandsAndRedactsRepositoryInternals(t *testing.T) 
 	view, replayed, err := service.Submit(context.Background(), record.TenantExternalID, "idempotency-key", SubmitJobCommand{
 		BundleID: record.BundleExternalID, Language: "cpp", SourceCode: "int main(){}",
 		StopOnFailure: true, CallbackID: "eeeeeeeeeeeeeeeeeeeeeeeeee", ClientReference: "client-7",
-	}, func() error { return nil })
+	}, func(context.Context) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,11 +143,22 @@ func TestMySQLJobServicePreservesAdmissionError(t *testing.T) {
 		t.Fatal(err)
 	}
 	quotaError := errors.New("quota unavailable")
-	_, _, err = service.Submit(context.Background(), "bbbbbbbbbbbbbbbbbbbbbbbbbb", "idempotency-key", SubmitJobCommand{
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, _, err = service.Submit(ctx, "bbbbbbbbbbbbbbbbbbbbbbbbbb", "idempotency-key", SubmitJobCommand{
 		BundleID: "cccccccccccccccccccccccccc", Language: "cpp", SourceCode: "int main(){}",
-	}, func() error { return quotaError })
+	}, func(admissionContext context.Context) error {
+		deadline, ok := admissionContext.Deadline()
+		if !ok || !deadline.Equal(repository.submitDeadline) {
+			t.Fatalf("admission context deadline=%s submit deadline=%s", deadline, repository.submitDeadline)
+		}
+		return quotaError
+	})
 	if !errors.Is(err, quotaError) {
 		t.Fatalf("admission error was remapped: %v", err)
+	}
+	if !repository.admissionDeadline.Equal(repository.submitDeadline) {
+		t.Fatalf("repository admission deadline=%s submit deadline=%s", repository.admissionDeadline, repository.submitDeadline)
 	}
 }
 
@@ -161,7 +178,7 @@ func TestMySQLJobServiceValidatesAndMapsCanonicalLanguageBeforePersistence(t *te
 	}
 	_, _, err = service.Submit(context.Background(), "bbbbbbbbbbbbbbbbbbbbbbbbbb", "idempotency-key", SubmitJobCommand{
 		BundleID: "cccccccccccccccccccccccccc", Language: "cpp20", SourceCode: "int main(){}",
-	}, func() error { return nil })
+	}, func(context.Context) error { return nil })
 	if !errors.Is(err, ErrJobInvalid) {
 		t.Fatalf("unsupported advertised language error = %v, want ErrJobInvalid", err)
 	}
@@ -172,7 +189,7 @@ func TestMySQLJobServiceValidatesAndMapsCanonicalLanguageBeforePersistence(t *te
 	repository.submitResult.Job.Language = "cpp"
 	_, _, err = service.Submit(context.Background(), "bbbbbbbbbbbbbbbbbbbbbbbbbb", "another-idempotency-key", SubmitJobCommand{
 		BundleID: "cccccccccccccccccccccccccc", Language: "cpp", SourceCode: "int main(){}",
-	}, func() error { return nil })
+	}, func(context.Context) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}

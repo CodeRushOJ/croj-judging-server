@@ -8,7 +8,20 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestBundleOperationTimeoutIsExplicitlyBounded(t *testing.T) {
+	server, err := NewServer(staticAuthenticator{}, testCapabilities(), WithBundleOperationTimeout(40*time.Minute))
+	if err != nil || server.bundleOperationTimeout != 40*time.Minute {
+		t.Fatalf("server=%+v timeout=%s error=%v", server, server.bundleOperationTimeout, err)
+	}
+	for _, timeout := range []time.Duration{time.Minute - time.Nanosecond, 40*time.Minute + time.Nanosecond} {
+		if _, err := NewServer(staticAuthenticator{}, testCapabilities(), WithBundleOperationTimeout(timeout)); err == nil {
+			t.Fatalf("unsafe bundle operation timeout %s was accepted", timeout)
+		}
+	}
+}
 
 type staticAuthenticator struct {
 	principal Principal
@@ -17,6 +30,50 @@ type staticAuthenticator struct {
 
 func (auth staticAuthenticator) Authenticate(context.Context, string) (Principal, error) {
 	return auth.principal, auth.err
+}
+
+type recordingAuthenticator struct {
+	principal     Principal
+	err           error
+	authorization string
+	calls         int
+}
+
+func (auth *recordingAuthenticator) Authenticate(_ context.Context, authorization string) (Principal, error) {
+	auth.calls++
+	auth.authorization = authorization
+	return auth.principal, auth.err
+}
+
+func TestServerRejectsAmbiguousAuthorizationBeforeCredentialLookup(t *testing.T) {
+	authenticator := &recordingAuthenticator{principal: Principal{
+		TenantID: "tenant-7", scopes: map[Scope]struct{}{ScopeCapabilitiesRead: {}},
+	}}
+	server, err := NewServer(authenticator, testCapabilities())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, values := range map[string][]string{
+		"repeated fields": {"Bearer first-secret", "Bearer second-secret"},
+		"combined fields": {"Bearer first-secret, Bearer second-secret"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			authenticator.calls = 0
+			authenticator.authorization = ""
+			request := httptest.NewRequest(http.MethodGet, "/api/v1/capabilities", nil)
+			request.Header["Authorization"] = append([]string(nil), values...)
+			response := httptest.NewRecorder()
+
+			server.ServeHTTP(response, request)
+
+			if response.Code != http.StatusUnauthorized || authenticator.calls != 0 {
+				t.Fatalf("status=%d authCalls=%d body=%s", response.Code, authenticator.calls, response.Body.String())
+			}
+			if response.Header().Get("WWW-Authenticate") == "" || strings.Contains(response.Body.String(), "secret") {
+				t.Fatalf("headers=%v body=%s", response.Header(), response.Body.String())
+			}
+		})
+	}
 }
 
 func TestCapabilitiesRequiresAuthenticationAndReturnsRFC9457Problem(t *testing.T) {
@@ -180,7 +237,7 @@ func TestServerNormalizesNilCapabilityCollectionsToJSONArrays(t *testing.T) {
 func testCapabilities() Capabilities {
 	return Capabilities{
 		APIVersion: "v1",
-		Languages:  []LanguageCapability{{ID: "cpp", DisplayName: "C++ 20", Runtime: "gcc"}},
+		Languages:  []LanguageCapability{{ID: "cpp", DisplayName: "C++ 17", Runtime: "gcc"}},
 		JudgeModes: []string{"ACM"},
 		Checkers:   []string{"exact", "token"},
 		Limits: CapabilityLimits{

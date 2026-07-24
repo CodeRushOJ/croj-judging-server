@@ -27,6 +27,8 @@ var (
 
 const maxExternalBundleCasesV1 = 256
 
+const defaultBundleMaintenanceTimeout = 30 * time.Second
+
 type BundleMetadata struct {
 	BundleID        string    `json:"bundleId"`
 	SHA256          string    `json:"sha256"`
@@ -109,6 +111,7 @@ type BundleServiceConfig struct {
 	PublicationRetry    time.Duration
 	MaxPublishAttempts  int
 	PendingAbandonAfter time.Duration
+	MaintenanceTimeout  time.Duration
 	Random              io.Reader
 }
 
@@ -151,6 +154,11 @@ func NewBundleService(repository BundleRepository, store BundleObjectStore, conf
 	}
 	if config.PendingAbandonAfter <= 0 {
 		config.PendingAbandonAfter = 24 * time.Hour
+	}
+	if config.MaintenanceTimeout == 0 {
+		config.MaintenanceTimeout = defaultBundleMaintenanceTimeout
+	} else if config.MaintenanceTimeout < time.Millisecond || config.MaintenanceTimeout > 5*time.Minute {
+		return nil, fmt.Errorf("bundle maintenance timeout must be between one millisecond and five minutes")
 	}
 	config.IdempotencyPepper = append([]byte(nil), config.IdempotencyPepper...)
 	return &BundleService{repository: repository, store: store, config: config, now: time.Now}, nil
@@ -260,12 +268,16 @@ func (service *BundleService) UploadWithAdmission(ctx context.Context, tenantID,
 	})
 	if err != nil {
 		if errors.Is(err, ErrIdempotencyConflict) || errors.Is(err, ErrBundleNotFound) || errors.Is(err, ErrInvalidBundle) {
-			_ = service.store.Discard(context.Background(), stagingKey)
+			maintenanceContext, cancelMaintenance := service.maintenanceContext(ctx)
+			_ = service.store.Discard(maintenanceContext, stagingKey)
+			cancelMaintenance()
 		}
 		return BundleMetadata{}, false, err
 	}
 	if result.StagingKey != stagingKey {
-		_ = service.store.Discard(context.Background(), stagingKey)
+		maintenanceContext, cancelMaintenance := service.maintenanceContext(ctx)
+		_ = service.store.Discard(maintenanceContext, stagingKey)
+		cancelMaintenance()
 	}
 	if result.Status == BundlePublicationReady {
 		return result.Metadata, result.Replay, nil
@@ -302,14 +314,24 @@ func (service *BundleService) publishOwnedBundle(ctx context.Context, tenantID s
 	defer cancelPromotion()
 	if err := service.store.Promote(promotionContext, claim.StagingKey, claim.ObjectKey, claim.SizeBytes, claim.RequestHash); err != nil {
 		nextAttempt := now.Add(service.config.PublicationRetry)
-		_, _ = service.repository.FailBundlePublication(context.Background(), claim, "OBJECT_PROMOTION_FAILED", nextAttempt, service.config.MaxPublishAttempts)
+		maintenanceContext, cancelMaintenance := service.maintenanceContext(ctx)
+		_, _ = service.repository.FailBundlePublication(maintenanceContext, claim, "OBJECT_PROMOTION_FAILED", nextAttempt, service.config.MaxPublishAttempts)
+		cancelMaintenance()
 		return fmt.Errorf("promote immutable bundle object: %w", err)
 	}
 	if err := service.repository.CompleteBundlePublication(ctx, claim, service.now().UTC()); err != nil {
 		return fmt.Errorf("complete immutable bundle publication: %w", err)
 	}
-	_ = service.store.Discard(context.Background(), claim.StagingKey)
+	maintenanceContext, cancelMaintenance := service.maintenanceContext(ctx)
+	_ = service.store.Discard(maintenanceContext, claim.StagingKey)
+	cancelMaintenance()
 	return nil
+}
+
+func (service *BundleService) maintenanceContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	// Deliberately inherit the request deadline/cancellation. Cleanup must never
+	// extend the HTTP application lifetime; durable staging GC handles leftovers.
+	return context.WithTimeout(ctx, service.config.MaintenanceTimeout)
 }
 
 func bundleObjectKey(tenantID string, digest [sha256.Size]byte) string {
@@ -317,7 +339,7 @@ func bundleObjectKey(tenantID string, digest [sha256.Size]byte) string {
 }
 
 func stagingBundleObjectKey(tenantID, uploadID string, digest [sha256.Size]byte) string {
-	return path.Join("external", tenantID, "staging", uploadID, hex.EncodeToString(digest[:])+".zip")
+	return path.Join("external-staging", tenantID, uploadID, hex.EncodeToString(digest[:])+".zip")
 }
 
 func bundlePublicationNeedsFreshStaging(status BundlePublicationStatus, stagingKey string) bool {

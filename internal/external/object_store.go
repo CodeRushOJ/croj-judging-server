@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/minio/minio-go/v7"
 )
@@ -17,6 +18,20 @@ import (
 type BundleObjectStore interface {
 	Stage(context.Context, string, string, int64, [sha256.Size]byte) error
 	Promote(context.Context, string, string, int64, [sha256.Size]byte) error
+	Discard(context.Context, string) error
+}
+
+// BundleStagingObject is the content-opaque metadata needed to age out an
+// upload that never obtained a durable database reference.
+type BundleStagingObject struct {
+	Key          string
+	LastModified time.Time
+}
+
+type BundleStagingObjectStore interface {
+	// ListStaging scans at most limit object keys strictly after the opaque
+	// continuation. A non-empty returned continuation resumes the bounded scan.
+	ListStaging(context.Context, time.Time, string, int) ([]BundleStagingObject, string, error)
 	Discard(context.Context, string) error
 }
 
@@ -100,6 +115,67 @@ func (store *MinIOBundleObjectStore) Discard(ctx context.Context, key string) er
 		return fmt.Errorf("discard staged immutable bundle object: %w", err)
 	}
 	return nil
+}
+
+func (store *MinIOBundleObjectStore) ListStaging(ctx context.Context, before time.Time, after string, limit int) ([]BundleStagingObject, string, error) {
+	if store == nil || store.client == nil || store.bucket == "" || before.IsZero() || limit < 1 || limit > 1000 || after != "" && !validBundleStagingContinuation(after) {
+		return nil, "", fmt.Errorf("bundle staging list is not configured")
+	}
+	listContext, cancel := context.WithCancel(ctx)
+	defer cancel()
+	objects := make([]BundleStagingObject, 0, limit)
+	listed := store.client.ListObjects(listContext, store.bucket, minio.ListObjectsOptions{
+		Prefix: "external-staging/", Recursive: true, StartAfter: after, MaxKeys: limit,
+	})
+	scanned := 0
+	lastScanned := ""
+	for object := range listed {
+		if object.Err != nil {
+			return nil, "", fmt.Errorf("list staged immutable bundle objects: %w", object.Err)
+		}
+		scanned++
+		lastScanned = object.Key
+		if !validBundleStagingGCKey(object.Key) || object.LastModified.IsZero() || !object.LastModified.Before(before) {
+			if scanned < limit {
+				continue
+			}
+		} else {
+			objects = append(objects, BundleStagingObject{Key: object.Key, LastModified: object.LastModified.UTC()})
+		}
+		if scanned == limit {
+			cancel()
+			for range listed {
+			}
+			break
+		}
+	}
+	if scanned < limit {
+		lastScanned = ""
+	}
+	return objects, lastScanned, nil
+}
+
+func validBundleStagingContinuation(value string) bool {
+	if len(value) <= len("external-staging/") || len(value) > 1024 || !strings.HasPrefix(value, "external-staging/") {
+		return false
+	}
+	for _, character := range value {
+		if character < 0x20 || character == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+func validBundleStagingGCKey(key string) bool {
+	parts := strings.Split(key, "/")
+	if len(parts) != 4 || parts[0] != "external-staging" || !externalIDPattern.MatchString(parts[1]) ||
+		!externalIDPattern.MatchString(parts[2]) || !strings.HasSuffix(parts[3], ".zip") {
+		return false
+	}
+	digest := strings.TrimSuffix(parts[3], ".zip")
+	decoded, err := hex.DecodeString(digest)
+	return err == nil && len(decoded) == sha256.Size && strings.ToLower(digest) == digest
 }
 
 func (store *MinIOBundleObjectStore) stat(ctx context.Context, key string) (minio.ObjectInfo, bool, error) {

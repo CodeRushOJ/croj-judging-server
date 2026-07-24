@@ -73,6 +73,14 @@ external-api:
   read-timeout: "15m"
   write-timeout: "20m"
   idle-timeout: "60s"
+  # Authenticated JSON submissions use a separate short deadline and bounded
+  # reader pool; the 15-minute request deadline remains reserved for bundles.
+  job-body-read-timeout: "2m"
+  job-submit-timeout: "3m"
+  job-body-concurrency: 64
+  # Leave five minutes before the socket write deadline for a retryable
+  # problem response after publication times out.
+  bundle-operation-timeout: "15m"
   bundle-min-upload-bytes-per-second: 1048576
   bundle-upload-concurrency: 4
   source-retention: "720h"

@@ -71,6 +71,9 @@ func (server *Server) serveBundleCollection(response http.ResponseWriter, reques
 		writeProblem(response, problemFor(http.StatusServiceUnavailable, "upload-capacity-exhausted", "Upload capacity exhausted", "Retry the bundle upload later.", requestID))
 		return
 	}
+	operationContext, cancelOperation := context.WithTimeout(request.Context(), server.bundleOperationTimeout)
+	defer cancelOperation()
+	request = request.WithContext(operationContext)
 	const multipartEnvelopeBytes = int64(1 << 20)
 	maxBundleBytes := server.capabilities.Limits.MaxBundleBytes
 	if maxBundleBytes <= 0 || maxBundleBytes > math.MaxInt64-multipartEnvelopeBytes {
@@ -213,6 +216,9 @@ func writeBundleProblem(response http.ResponseWriter, requestID string, err erro
 	case errors.Is(err, external.ErrBundlePublishing):
 		response.Header().Set("Retry-After", "2")
 		problem = problemFor(http.StatusServiceUnavailable, "bundle-publishing", "Bundle publication in progress", "Retry this idempotent upload later.", requestID)
+	}
+	if problem.Status == http.StatusServiceUnavailable && response.Header().Get("Retry-After") == "" {
+		response.Header().Set("Retry-After", "5")
 	}
 	writeProblem(response, problem)
 }

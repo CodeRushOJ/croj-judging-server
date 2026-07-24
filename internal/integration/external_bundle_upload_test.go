@@ -790,7 +790,7 @@ func integrationBundleZIPWithLimits(t *testing.T, input string, timeLimitMillis,
 }
 
 func integrationCapabilities() httpapi.Capabilities {
-	return httpapi.Capabilities{APIVersion: "v1", Languages: []httpapi.LanguageCapability{{ID: "cpp", DisplayName: "C++ 20", Runtime: "gcc"}}, JudgeModes: []string{"ACM"}, Checkers: []string{"exact", "token"}, Limits: httpapi.CapabilityLimits{MaxSourceBytes: 1 << 20, MaxBundleBytes: 1 << 20, MaxCaseBytes: 1 << 20, MaxCaseCount: 256, MaxTimeLimitMillis: 10_000, MaxMemoryLimitMiB: 1024}}
+	return httpapi.Capabilities{APIVersion: "v1", Languages: []httpapi.LanguageCapability{{ID: "cpp", DisplayName: "C++ 17", Runtime: "gcc"}}, JudgeModes: []string{"ACM"}, Checkers: []string{"exact", "token"}, Limits: httpapi.CapabilityLimits{MaxSourceBytes: 1 << 20, MaxBundleBytes: 1 << 20, MaxCaseBytes: 1 << 20, MaxCaseCount: 256, MaxTimeLimitMillis: 10_000, MaxMemoryLimitMiB: 1024}}
 }
 
 func randomExternalID(t *testing.T) string {

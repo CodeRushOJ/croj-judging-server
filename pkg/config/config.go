@@ -37,6 +37,10 @@ type ExternalAPIConfig struct {
 	ReadTimeout                   string `yaml:"read-timeout"`
 	WriteTimeout                  string `yaml:"write-timeout"`
 	IdleTimeout                   string `yaml:"idle-timeout"`
+	JobBodyReadTimeout            string `yaml:"job-body-read-timeout"`
+	JobSubmitTimeout              string `yaml:"job-submit-timeout"`
+	JobBodyConcurrency            int    `yaml:"job-body-concurrency"`
+	BundleOperationTimeout        string `yaml:"bundle-operation-timeout"`
 	BundleMinUploadBytesPerSecond int64  `yaml:"bundle-min-upload-bytes-per-second"`
 	BundleUploadConcurrency       int    `yaml:"bundle-upload-concurrency"`
 	SourceRetention               string `yaml:"source-retention"`
@@ -179,6 +183,9 @@ func (config *Config) applyEnvironment() error {
 	overrideString(&config.ExternalAPI.ReadTimeout, "EXTERNAL_API_READ_TIMEOUT")
 	overrideString(&config.ExternalAPI.WriteTimeout, "EXTERNAL_API_WRITE_TIMEOUT")
 	overrideString(&config.ExternalAPI.IdleTimeout, "EXTERNAL_API_IDLE_TIMEOUT")
+	overrideString(&config.ExternalAPI.JobBodyReadTimeout, "EXTERNAL_JOB_BODY_READ_TIMEOUT")
+	overrideString(&config.ExternalAPI.JobSubmitTimeout, "EXTERNAL_JOB_SUBMIT_TIMEOUT")
+	overrideString(&config.ExternalAPI.BundleOperationTimeout, "EXTERNAL_BUNDLE_OPERATION_TIMEOUT")
 	if err := overridePositiveInt64(&config.ExternalAPI.BundleMinUploadBytesPerSecond, "EXTERNAL_BUNDLE_MIN_UPLOAD_BYTES_PER_SECOND"); err != nil {
 		return err
 	}
@@ -207,6 +214,9 @@ func (config *Config) applyEnvironment() error {
 		return err
 	}
 	if err := overridePositiveInt(&config.ExternalAPI.BundleUploadConcurrency, "EXTERNAL_BUNDLE_UPLOAD_CONCURRENCY"); err != nil {
+		return err
+	}
+	if err := overridePositiveInt(&config.ExternalAPI.JobBodyConcurrency, "EXTERNAL_JOB_BODY_CONCURRENCY"); err != nil {
 		return err
 	}
 	if value, ok := os.LookupEnv("LEGACY_JUDGE_ENABLED"); ok {

@@ -26,6 +26,13 @@ const (
 	dailyReservationImpossible
 )
 
+type mysqlTransactionClock struct {
+	now           time.Time
+	accountingDay time.Time
+}
+
+type mysqlTransactionClockReader func(context.Context, *sql.Tx) (mysqlTransactionClock, error)
+
 func (repository *MySQLJobRepository) LoadClaimSource(ctx context.Context, claim WorkerJobClaim) ([]byte, error) {
 	input, err := repository.LoadClaimInput(ctx, claim)
 	if err != nil {
@@ -90,7 +97,9 @@ WHERE job.id = ? AND job.status = 'RUNNING' AND job.attempt_no = ? AND job.worke
 	input.Bundle.ManifestJSON = append([]byte(nil), manifestJSON...)
 	input.Bundle.Manifest = manifest
 	source.KeyVersion = uint16(keyVersion)
-	ciphertext, err := repository.sourceObjects.Get(ctx, source.ObjectKey, source.SizeBytes+sourceCiphertextOverheadBytes)
+	getContext, cancelGet := context.WithTimeout(ctx, repository.sourceObjectOperationTimeout)
+	ciphertext, err := repository.sourceObjects.Get(getContext, source.ObjectKey, source.SizeBytes+sourceCiphertextOverheadBytes)
+	cancelGet()
 	if err != nil {
 		return WorkerExecutionInput{}, fmt.Errorf("%w: encrypted source object is unavailable", ErrSourceEncryption)
 	}
@@ -149,15 +158,26 @@ func (repository *MySQLJobRepository) claimOne(
 	workerID string,
 	leaseDuration time.Duration,
 ) (WorkerJobClaim, bool, error) {
+	return repository.claimOneWithClock(ctx, workerID, leaseDuration, mysqlCurrentTransactionClock)
+}
+
+func (repository *MySQLJobRepository) claimOneWithClock(
+	ctx context.Context,
+	workerID string,
+	leaseDuration time.Duration,
+	readClock mysqlTransactionClockReader,
+) (WorkerJobClaim, bool, error) {
 	tx, err := repository.database.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return WorkerJobClaim{}, false, repositoryUnavailable("begin worker claim", err)
 	}
 	defer tx.Rollback()
-	leaseNow, err := mysqlCurrentTime(ctx, tx)
+	transactionClock, err := readClock(ctx, tx)
 	if err != nil {
 		return WorkerJobClaim{}, false, err
 	}
+	leaseNow := transactionClock.now
+	accountingDay := transactionClock.accountingDay
 
 	var candidateTenantID uint64
 	err = tx.QueryRowContext(ctx, `
@@ -324,7 +344,7 @@ WHERE id = ? AND status = 'RUNNING' AND attempt_no = ?`, leaseNow, jobInternalID
 			}
 			return WorkerJobClaim{}, true, nil
 		}
-		decision, err := reserveDailyExecution(ctx, tx, candidateTenantID, policy.DailyExecutionMillis, reservedExecutionMillis)
+		decision, err := reserveDailyExecution(ctx, tx, candidateTenantID, accountingDay, policy.DailyExecutionMillis, reservedExecutionMillis)
 		if err != nil {
 			return WorkerJobClaim{}, false, err
 		}
@@ -338,11 +358,12 @@ WHERE id = ? AND status = 'RUNNING' AND attempt_no = ?`, leaseNow, jobInternalID
 			return WorkerJobClaim{}, true, nil
 		}
 		if decision == dailyReservationDeferred {
+			deferredUntil := accountingDay.AddDate(0, 0, 1)
 			if _, err := tx.ExecContext(ctx, `
 	UPDATE t_external_job
 	SET status = 'QUEUED', worker_id = NULL, lease_token = NULL, lease_until = NULL,
-	    next_attempt_at = TIMESTAMP(DATE_ADD(CURRENT_DATE, INTERVAL 1 DAY))
-	WHERE id = ? AND status = 'RUNNING' AND attempt_no = ?`, jobInternalID, attemptNo); err != nil {
+	    next_attempt_at = ?
+	WHERE id = ? AND status = 'RUNNING' AND attempt_no = ?`, deferredUntil, jobInternalID, attemptNo); err != nil {
 				return WorkerJobClaim{}, false, repositoryUnavailable("defer recovered daily quota job", err)
 			}
 			if err := advanceTenantFairness(ctx, tx, candidateTenantID, leaseNow); err != nil {
@@ -366,7 +387,7 @@ WHERE id = ? AND status = 'RUNNING' AND attempt_no = ?`, leaseNow, jobInternalID
 		if reservedExecutionMillis <= 0 {
 			return WorkerJobClaim{}, false, ErrExternalJobUnavailable
 		}
-		decision, err := reserveDailyExecution(ctx, tx, candidateTenantID, policy.DailyExecutionMillis, reservedExecutionMillis)
+		decision, err := reserveDailyExecution(ctx, tx, candidateTenantID, accountingDay, policy.DailyExecutionMillis, reservedExecutionMillis)
 		if err != nil {
 			return WorkerJobClaim{}, false, err
 		}
@@ -380,9 +401,10 @@ WHERE id = ? AND status = 'RUNNING' AND attempt_no = ?`, leaseNow, jobInternalID
 			return WorkerJobClaim{}, true, nil
 		}
 		if decision == dailyReservationDeferred {
+			deferredUntil := accountingDay.AddDate(0, 0, 1)
 			if _, err := tx.ExecContext(ctx, `
-	UPDATE t_external_job SET next_attempt_at = TIMESTAMP(DATE_ADD(CURRENT_DATE, INTERVAL 1 DAY))
-	WHERE id = ? AND status = 'QUEUED'`, jobInternalID); err != nil {
+	UPDATE t_external_job SET next_attempt_at = ?
+	WHERE id = ? AND status = 'QUEUED'`, deferredUntil, jobInternalID); err != nil {
 				return WorkerJobClaim{}, false, repositoryUnavailable("defer daily quota job", err)
 			}
 			if err := advanceTenantFairness(ctx, tx, candidateTenantID, leaseNow); err != nil {
@@ -423,8 +445,8 @@ WHERE id = ? AND status = ? AND attempt_no = ?`,
 	INSERT INTO t_external_job_attempt(
 	    tenant_id, job_id, attempt_no, worker_id, lease_token, status, lease_until,
 	    accounting_day, reserved_execution_millis, started_at
-	) VALUES (?, ?, ?, ?, ?, 'RUNNING', ?, CURRENT_DATE, ?, ?)`,
-		candidateTenantID, jobInternalID, newAttemptNo, workerID, leaseToken, leaseUntil, reservedExecutionMillis, leaseNow); err != nil {
+	) VALUES (?, ?, ?, ?, ?, 'RUNNING', ?, ?, ?, ?)`,
+		candidateTenantID, jobInternalID, newAttemptNo, workerID, leaseToken, leaseUntil, accountingDay, reservedExecutionMillis, leaseNow); err != nil {
 		return WorkerJobClaim{}, false, repositoryUnavailable("persist worker attempt", err)
 	}
 	if err := advanceTenantFairness(ctx, tx, candidateTenantID, leaseNow); err != nil {
@@ -483,7 +505,7 @@ func (repository *MySQLJobRepository) failImpossibleDailyExecution(
 }
 
 func expireAttempt(ctx context.Context, tx *sql.Tx, tenantID, jobID uint64, attemptNo uint32, now time.Time) error {
-	if _, err := releaseAttemptReservation(ctx, tx, tenantID, jobID, attemptNo, nil); err != nil {
+	if _, err := releaseAttemptReservation(ctx, tx, tenantID, jobID, attemptNo, now, nil, false); err != nil {
 		return err
 	}
 	result, err := tx.ExecContext(ctx, `
@@ -613,11 +635,13 @@ WHERE id = ? AND status = 'RUNNING' AND attempt_no = ? AND worker_id = ? AND lea
 	if affected, err := jobResult.RowsAffected(); err != nil || affected != 1 {
 		return ErrStaleJobClaim
 	}
-	consumedMillis := int64(0)
-	if cancelled {
-		result.Cases = nil
-	}
-	consumedMillis, err = settleAttemptReservation(ctx, tx, claim, result.Cases)
+	// A valid case list is trusted accounting evidence even when a concurrent
+	// cancellation prevents the result itself from being published. Cancellation
+	// and compile failure without case evidence conservatively consume the whole
+	// reservation; infrastructure failures are settled by FailInfrastructure and
+	// remain refundable.
+	chargeFullReservation := len(result.Cases) == 0 && (cancelled || result.CompileStatus == "FAILED")
+	consumedMillis, err := settleAttemptReservation(ctx, tx, claim, now, result.Cases, chargeFullReservation)
 	if err != nil {
 		return err
 	}
@@ -693,7 +717,7 @@ WHERE id = ? AND status = 'RUNNING' AND attempt_no = ? AND worker_id = ? AND lea
 	if affected, err := jobResult.RowsAffected(); err != nil || affected != 1 {
 		return "", ErrStaleJobClaim
 	}
-	if _, err := settleAttemptReservation(ctx, tx, claim, nil); err != nil {
+	if _, err := settleAttemptReservation(ctx, tx, claim, now, nil, false); err != nil {
 		return "", err
 	}
 	attemptStatus := "FAILED"
@@ -782,7 +806,7 @@ func finishAttempt(ctx context.Context, tx *sql.Tx, claim WorkerJobClaim, status
 	return nil
 }
 
-func reserveDailyExecution(ctx context.Context, tx *sql.Tx, tenantID uint64, dailyLimit, reserveMillis int64) (dailyReservationDecision, error) {
+func reserveDailyExecution(ctx context.Context, tx *sql.Tx, tenantID uint64, accountingDay time.Time, dailyLimit, reserveMillis int64) (dailyReservationDecision, error) {
 	if dailyLimit <= 0 || reserveMillis <= 0 {
 		return 0, ErrExternalJobUnavailable
 	}
@@ -791,14 +815,14 @@ func reserveDailyExecution(ctx context.Context, tx *sql.Tx, tenantID uint64, dai
 	}
 	if _, err := tx.ExecContext(ctx, `
 	INSERT INTO t_external_execution_daily(tenant_id, accounting_day)
-	VALUES (?, CURRENT_DATE)
-	ON DUPLICATE KEY UPDATE tenant_id = VALUES(tenant_id)`, tenantID); err != nil {
+	VALUES (?, ?)
+	ON DUPLICATE KEY UPDATE tenant_id = VALUES(tenant_id)`, tenantID, accountingDay); err != nil {
 		return 0, repositoryUnavailable("ensure daily execution ledger", err)
 	}
 	var reserved, consumed int64
 	if err := tx.QueryRowContext(ctx, `
 	SELECT reserved_millis, consumed_millis FROM t_external_execution_daily
-	WHERE tenant_id = ? AND accounting_day = CURRENT_DATE FOR UPDATE`, tenantID).Scan(&reserved, &consumed); err != nil {
+	WHERE tenant_id = ? AND accounting_day = ? FOR UPDATE`, tenantID, accountingDay).Scan(&reserved, &consumed); err != nil {
 		return 0, repositoryUnavailable("lock daily execution ledger", err)
 	}
 	if consumed > dailyLimit-reserveMillis || reserved > dailyLimit-reserveMillis-consumed {
@@ -806,7 +830,7 @@ func reserveDailyExecution(ctx context.Context, tx *sql.Tx, tenantID uint64, dai
 	}
 	result, err := tx.ExecContext(ctx, `
 	UPDATE t_external_execution_daily SET reserved_millis = reserved_millis + ?
-	WHERE tenant_id = ? AND accounting_day = CURRENT_DATE`, reserveMillis, tenantID)
+	WHERE tenant_id = ? AND accounting_day = ?`, reserveMillis, tenantID, accountingDay)
 	if err != nil {
 		return 0, repositoryUnavailable("reserve daily execution", err)
 	}
@@ -816,7 +840,7 @@ func reserveDailyExecution(ctx context.Context, tx *sql.Tx, tenantID uint64, dai
 	return dailyReservationAllowed, nil
 }
 
-func releaseAttemptReservation(ctx context.Context, tx *sql.Tx, tenantID, jobID uint64, attemptNo uint32, cases []DurableCaseResult) (int64, error) {
+func releaseAttemptReservation(ctx context.Context, tx *sql.Tx, tenantID, jobID uint64, attemptNo uint32, now time.Time, cases []DurableCaseResult, chargeFullReservation bool) (int64, error) {
 	var accountingDay sql.NullTime
 	var reserved int64
 	if err := tx.QueryRowContext(ctx, `
@@ -831,7 +855,10 @@ func releaseAttemptReservation(ctx context.Context, tx *sql.Tx, tenantID, jobID 
 	if !accountingDay.Valid || reserved <= 0 {
 		return 0, ErrExternalJobUnavailable
 	}
-	consumedMillis := cappedCaseExecutionMillis(cases, reserved)
+	consumedMillis := reserved
+	if !chargeFullReservation {
+		consumedMillis = cappedCaseExecutionMillis(cases, reserved)
+	}
 	result, err := tx.ExecContext(ctx, `
 	UPDATE t_external_execution_daily
 	SET reserved_millis = reserved_millis - ?, consumed_millis = consumed_millis + ?
@@ -844,16 +871,16 @@ func releaseAttemptReservation(ctx context.Context, tx *sql.Tx, tenantID, jobID 
 	}
 	if _, err := tx.ExecContext(ctx, `
 	UPDATE t_external_job
-	SET next_attempt_at = CURRENT_TIMESTAMP(3)
+	SET next_attempt_at = ?
 	WHERE tenant_id = ? AND status = 'QUEUED'
-	  AND next_attempt_at = TIMESTAMP(DATE_ADD(?, INTERVAL 1 DAY))`, tenantID, accountingDay.Time); err != nil {
+	  AND next_attempt_at = TIMESTAMP(DATE_ADD(?, INTERVAL 1 DAY))`, now, tenantID, accountingDay.Time); err != nil {
 		return 0, repositoryUnavailable("wake daily quota jobs after settlement", err)
 	}
 	return consumedMillis, nil
 }
 
-func settleAttemptReservation(ctx context.Context, tx *sql.Tx, claim WorkerJobClaim, cases []DurableCaseResult) (int64, error) {
-	return releaseAttemptReservation(ctx, tx, claim.Job.TenantInternalID, claim.Job.InternalID, claim.AttemptNo, cases)
+func settleAttemptReservation(ctx context.Context, tx *sql.Tx, claim WorkerJobClaim, now time.Time, cases []DurableCaseResult, chargeFullReservation bool) (int64, error) {
+	return releaseAttemptReservation(ctx, tx, claim.Job.TenantInternalID, claim.Job.InternalID, claim.AttemptNo, now, cases, chargeFullReservation)
 }
 
 func cappedCaseExecutionMillis(cases []DurableCaseResult, reservation int64) int64 {
@@ -909,6 +936,18 @@ func mysqlCurrentTime(ctx context.Context, tx *sql.Tx) (time.Time, error) {
 		return time.Time{}, repositoryUnavailable("read database lease clock", err)
 	}
 	return now.UTC(), nil
+}
+
+func mysqlCurrentTransactionClock(ctx context.Context, tx *sql.Tx) (mysqlTransactionClock, error) {
+	var now, accountingDay time.Time
+	if err := tx.QueryRowContext(ctx, "SELECT CURRENT_TIMESTAMP(3), CURRENT_DATE").Scan(&now, &accountingDay); err != nil {
+		return mysqlTransactionClock{}, repositoryUnavailable("read database transaction clock", err)
+	}
+	year, month, day := accountingDay.Date()
+	return mysqlTransactionClock{
+		now:           now.UTC(),
+		accountingDay: time.Date(year, month, day, 0, 0, 0, 0, time.UTC),
+	}, nil
 }
 
 func waitForClaimRetry(ctx context.Context) error {

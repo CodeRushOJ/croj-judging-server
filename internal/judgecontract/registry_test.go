@@ -19,6 +19,15 @@ func TestCanonicalV1RegistryPublishesTheExactLanguageAndCheckerSets(t *testing.T
 	if want := []string{"go", "cpp", "python", "java", "javascript"}; !reflect.DeepEqual(gotLanguageIDs, want) {
 		t.Fatalf("canonical language IDs = %v, want %v", gotLanguageIDs, want)
 	}
+	cpp, ok := judgecontract.ResolveLanguage("cpp")
+	if !ok || cpp.SandboxID != "cpp" || cpp.DisplayName != "C++ 17" || cpp.Runtime != "gcc" {
+		t.Fatalf("canonical cpp mapping = %+v available=%v", cpp, ok)
+	}
+	for _, unsupported := range []string{"cpp17", "cpp20", "c++", "C++"} {
+		if language, ok := judgecontract.ResolveLanguage(unsupported); ok {
+			t.Errorf("unsupported alias %q resolved to %+v", unsupported, language)
+		}
+	}
 	if got, want := judgecontract.CanonicalCheckers(), []judgecontract.Checker{judgecontract.CheckerExact, judgecontract.CheckerToken}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("canonical checkers = %v, want %v", got, want)
 	}

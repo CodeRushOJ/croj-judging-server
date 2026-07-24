@@ -6,6 +6,26 @@ ALTER TABLE t_external_tenant
 ALTER TABLE t_external_tenant
     ADD KEY idx_external_tenant_fair_claim(status, last_claimed_at, id);
 -- migrate:split
+-- migrate:replay-errors 1091
+ALTER TABLE t_external_job_attempt
+    DROP FOREIGN KEY fk_external_attempt_job_tenant;
+-- migrate:split
+-- migrate:replay-errors 1826
+ALTER TABLE t_external_job_attempt
+    ADD CONSTRAINT fk_external_attempt_job_tenant
+        FOREIGN KEY (job_id, tenant_id) REFERENCES t_external_job(id, tenant_id)
+        ON DELETE RESTRICT ON UPDATE RESTRICT;
+-- migrate:split
+-- migrate:replay-errors 1091
+ALTER TABLE t_external_source_object
+    DROP FOREIGN KEY fk_external_source_tenant;
+-- migrate:split
+-- migrate:replay-errors 1826
+ALTER TABLE t_external_source_object
+    ADD CONSTRAINT fk_external_source_tenant
+        FOREIGN KEY (tenant_id) REFERENCES t_external_tenant(id)
+        ON DELETE RESTRICT ON UPDATE RESTRICT;
+-- migrate:split
 CREATE TABLE IF NOT EXISTS t_external_execution_daily (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     tenant_id BIGINT UNSIGNED NOT NULL,
@@ -17,6 +37,7 @@ CREATE TABLE IF NOT EXISTS t_external_execution_daily (
     PRIMARY KEY (id),
     UNIQUE KEY uk_external_execution_daily (tenant_id, accounting_day),
     CONSTRAINT fk_external_execution_daily_tenant FOREIGN KEY (tenant_id) REFERENCES t_external_tenant(id)
+        ON DELETE RESTRICT ON UPDATE RESTRICT
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 -- migrate:split
 -- migrate:replay-errors 1060
@@ -95,6 +116,7 @@ CREATE TABLE IF NOT EXISTS t_external_retention_audit (
     event_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     PRIMARY KEY (id),
     KEY idx_external_retention_audit_tenant_time(tenant_id, event_at, id),
-    CONSTRAINT fk_external_retention_audit_tenant FOREIGN KEY (tenant_id) REFERENCES t_external_tenant(id),
+    CONSTRAINT fk_external_retention_audit_tenant FOREIGN KEY (tenant_id) REFERENCES t_external_tenant(id)
+        ON DELETE RESTRICT ON UPDATE RESTRICT,
     CONSTRAINT chk_external_retention_audit_event CHECK (event_type IN ('MARKED','DELETE_RETRY','DELETED'))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;

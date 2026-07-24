@@ -189,6 +189,18 @@ func TestExecutionAccountingAndRetentionPostconditionCoversRuntimeDependencies(t
 		"delete_next_attempt_at",
 		"chk_external_attempt_accounting",
 		"chk_external_source_delete_fence",
+		"chk_external_retention_audit_event",
+		"fk_external_execution_daily_tenant",
+		"fk_external_attempt_job_tenant",
+		"fk_external_retention_audit_tenant",
+		"constraint_type = 'primary key'",
+		"column_default = '0'",
+		"index_type = 'btree'",
+		"is_visible = 'yes'",
+		"sub_part is null",
+		"information_schema.referential_constraints",
+		"delete_rule = 'restrict'",
+		"update_rule = 'restrict'",
 	} {
 		if !strings.Contains(validation, contract) {
 			t.Errorf("v6 postcondition is missing runtime dependency %q", contract)

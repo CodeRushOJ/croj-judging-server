@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/CodeRushOJ/croj-judging-server/internal/callback"
 	"github.com/CodeRushOJ/croj-judging-server/internal/external"
 	"github.com/CodeRushOJ/croj-judging-server/internal/service"
+	mysqlDriver "github.com/go-sql-driver/mysql"
 )
 
 func TestDurableResultPreservesCanonicalVerdictCasesAndUnits(t *testing.T) {
@@ -96,6 +98,78 @@ func TestRunnerClaimsQueuedWorkAndStopsWithParentContext(t *testing.T) {
 	}
 	if err := <-done; !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run error = %v", err)
+	}
+}
+
+func TestRunnerClaimLoopRetriesTransientDatabaseFailuresButReturnsPermanentErrors(t *testing.T) {
+	transient := fmt.Errorf("claim: %w", &mysqlDriver.MySQLError{Number: 1205, Message: "lock wait timeout"})
+	repository := &runnerRepository{claimErrors: []error{transient}, claimRetried: make(chan struct{})}
+	runner, err := NewRunner(repository, staticProvider{}, acceptedCore{}, Config{
+		LeaseDuration: time.Second, HeartbeatInterval: 20 * time.Millisecond,
+		ControlPollInterval: 10 * time.Millisecond, RetryDelay: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(ctx, "transient-claim-worker", time.Millisecond) }()
+	select {
+	case <-repository.claimRetried:
+		cancel()
+	case err := <-done:
+		t.Fatalf("transient claim error stopped runner: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("runner did not retry transient claim error")
+	}
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("runner shutdown error=%v", err)
+	}
+
+	permanent := errors.New("claim invariant")
+	repository = &runnerRepository{claimErrors: []error{permanent}}
+	runner, err = NewRunner(repository, staticProvider{}, acceptedCore{}, Config{
+		LeaseDuration: time.Second, HeartbeatInterval: 20 * time.Millisecond,
+		ControlPollInterval: 10 * time.Millisecond, RetryDelay: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.Run(context.Background(), "permanent-claim-worker", time.Millisecond); !errors.Is(err, permanent) {
+		t.Fatalf("permanent claim error=%v", err)
+	}
+}
+
+func TestRunnerClaimLoopRetriesTransientCompletionDatabaseFailure(t *testing.T) {
+	claim := external.WorkerJobClaim{Job: external.ExternalJobRecord{InternalID: 10}, WorkerID: "completion-loop", AttemptNo: 1, LeaseToken: make([]byte, 32), LeaseUntil: time.Now().Add(time.Minute)}
+	repository := &runnerRepository{
+		claim: &claim, claimRetried: make(chan struct{}),
+		completeErr: fmt.Errorf("complete: %w", &mysqlDriver.MySQLError{Number: 1213, Message: "deadlock"}),
+		input: external.WorkerExecutionInput{
+			Language: "go126", SourceCode: []byte("package main"),
+			Bundle: external.WorkerBundleInput{ObjectKey: "bundle.zip", SHA256: strings.Repeat("a", 64), SizeBytes: 1},
+		},
+	}
+	runner, err := NewRunner(repository, staticProvider{artifact: &runnerArtifact{}}, acceptedCore{}, Config{
+		LeaseDuration: time.Second, HeartbeatInterval: 20 * time.Millisecond,
+		ControlPollInterval: 10 * time.Millisecond, RetryDelay: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(ctx, "completion-loop", time.Millisecond) }()
+	select {
+	case <-repository.claimRetried:
+		cancel()
+	case err := <-done:
+		t.Fatalf("transient completion error stopped runner: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("runner did not continue after transient completion error")
+	}
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("runner shutdown error=%v", err)
 	}
 }
 
@@ -190,9 +264,26 @@ type runnerRepository struct {
 	heartbeatSignal        chan struct{}
 	controlErr             error
 	controlBlock           bool
+	claimErrors            []error
+	claimCalls             int
+	claimRetried           chan struct{}
+	completeErr            error
 }
 
 func (repository *runnerRepository) ClaimNext(context.Context, string, time.Duration) (external.WorkerJobClaim, error) {
+	repository.claimCalls++
+	if repository.claimCalls >= 2 && repository.claimRetried != nil {
+		select {
+		case <-repository.claimRetried:
+		default:
+			close(repository.claimRetried)
+		}
+	}
+	if len(repository.claimErrors) > 0 {
+		err := repository.claimErrors[0]
+		repository.claimErrors = repository.claimErrors[1:]
+		return external.WorkerJobClaim{}, err
+	}
 	if repository.claim == nil {
 		return external.WorkerJobClaim{}, external.ErrJobNotClaimable
 	}
@@ -222,6 +313,9 @@ func (repository *runnerRepository) ClaimCancelled(ctx context.Context, _ extern
 }
 func (repository *runnerRepository) Complete(_ context.Context, _ external.WorkerJobClaim, _ external.DurableJobResult) error {
 	repository.completions++
+	if repository.completeErr != nil {
+		return repository.completeErr
+	}
 	if repository.completionSignal != nil {
 		repository.completionSignal <- struct{}{}
 	}

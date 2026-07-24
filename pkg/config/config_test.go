@@ -81,6 +81,10 @@ sandbox-discovery:
 	t.Setenv("EXTERNAL_API_READ_TIMEOUT", "45s")
 	t.Setenv("EXTERNAL_API_WRITE_TIMEOUT", "50s")
 	t.Setenv("EXTERNAL_API_IDLE_TIMEOUT", "70s")
+	t.Setenv("EXTERNAL_JOB_BODY_READ_TIMEOUT", "90s")
+	t.Setenv("EXTERNAL_JOB_SUBMIT_TIMEOUT", "3m")
+	t.Setenv("EXTERNAL_JOB_BODY_CONCURRENCY", "23")
+	t.Setenv("EXTERNAL_BUNDLE_OPERATION_TIMEOUT", "15m")
 	t.Setenv("EXTERNAL_BUNDLE_MIN_UPLOAD_BYTES_PER_SECOND", "1048576")
 	t.Setenv("EXTERNAL_BUNDLE_UPLOAD_CONCURRENCY", "7")
 	t.Setenv("EXTERNAL_SOURCE_RETENTION", "1080h")
@@ -121,6 +125,8 @@ sandbox-discovery:
 		config.ExternalAPI.CallbackKeysJSON != `{"2":"callback-key"}` || config.ExternalAPI.WebhookWorkerConcurrency != 4 ||
 		config.ExternalAPI.ReadHeaderTimeout != "4s" || config.ExternalAPI.ReadTimeout != "45s" ||
 		config.ExternalAPI.WriteTimeout != "50s" || config.ExternalAPI.IdleTimeout != "70s" ||
+		config.ExternalAPI.JobBodyReadTimeout != "90s" || config.ExternalAPI.JobSubmitTimeout != "3m" ||
+		config.ExternalAPI.JobBodyConcurrency != 23 || config.ExternalAPI.BundleOperationTimeout != "15m" ||
 		config.ExternalAPI.BundleMinUploadBytesPerSecond != 1048576 ||
 		config.ExternalAPI.BundleUploadConcurrency != 7 || config.ExternalAPI.SourceRetention != "1080h" ||
 		config.ExternalAPI.RetentionIdleDelay != "2m" || config.ExternalAPI.RetentionDeleteTimeout != "20s" {

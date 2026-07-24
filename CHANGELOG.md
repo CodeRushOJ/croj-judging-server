@@ -6,10 +6,13 @@
 
 ### Added
 
+- 外部 REST 拒绝重复或合并的 `Authorization`，任务提交严格要求 `application/json`，并使用独立 2 分钟读取截止时间与有界并发槽防止认证后 Slowloris；bundle 长上传窗口保持隔离。
+- 所有可重试 bundle `503` 与 OpenAPI 一致返回 `Retry-After`；canonical `cpp` 能力描述修正为真实 Sandbox C++17，并以五语言 ID/映射契约测试锁定。
 - 增加唯一 canonical language/checker registry；外部 REST 在持久化前拒绝不受 Sandbox 支持的 ID，capabilities、OpenAPI、bundle 与 compile-once gRPC 使用一致标识。
 - 增加 MySQL `CURRENT_DATE` 日执行额度账本、attempt 原子预留、case 耗时安全求和、失败释放与 lease 崩溃恢复；tenant claim 使用持久公平游标和 `SKIP LOCKED`，永久不可满足的 reservation 稳定终态失败。
 - 增加终态 job/加密源码两阶段 retention：有界幂等清理、tenant→job→source 锁序、持久 delete lease/retry-at、对象删除重试、独立审计和完整 schema v6 postcondition。
 - 增加 HTTP header/read/write/idle timeout、bundle 上传并发上限，以及轮询 `failureCode` 合约。
+- 增加独立 `external-staging/` 无主题包回收、双重 MySQL 引用核验与最长 40 分钟应用级发布 deadline；源码 reservation 和 staging 对象网络操作均移出数据库事务。
 
 - 增加 RocketMQ 与 durable REST worker 共用的 canonical compile-once batch execution core，按顺序保留 case 结果并统一 AC/WA/CE/TLE/MLE/RE/SE 映射。
 - immutable bundle manifest 增加必填时间/内存限制；tenant policy 与 capabilities 增加对应上限，上传在平台或租户 ceiling 外 fail closed。
@@ -59,6 +62,13 @@
 
 ### Changed
 
+- 取消或编译失败在缺少可信 case 计量时扣除完整日额度 reservation；只有平台基础设施失败和过期执行 lease 退款，避免客户端主动中止绕过额度。
+- MySQL 1205/1213 作为可恢复竞争重试，不再导致整个 worker Pod 退出；schema v6 启动后置校验覆盖额度/attempt/source/audit 约束与索引属性。
+- 终态 retention 改为短事务的 tenant→job→source `SKIP LOCKED` 领取，对象删除和上传 admission 的 Redis/MinIO I/O 全部在事务外执行。
+- 源码对象 PUT 增加独立 2 分钟应用级 deadline，确保远早于 reservation lease 与孤儿回收安全窗口；callback 在事务外 admission 后由提交事务再次权威校验。
+- 任务提交从认证后的 body 读取到 Redis admission、MySQL/MinIO 发布均受端到端 deadline 约束；容量拒绝立即终止未读 socket，读取超时返回可重试 `408`，关闭期与超时统一返回 RFC 9457。
+- worker 在单次 claim 事务内只读取一次 MySQL 记账日期，源码读取具有独立对象存储 deadline；schema v6 同时校验关键外键的 `RESTRICT` 更新/删除动作。
+- staging GC 只保护仍可能发布的 `PENDING`/`PUBLISHING` 引用，并为 List、引用查询与删除分别设置新 deadline；已过期幂等记录不再阻塞终态数据保留清理。
 - `Capabilities` 初始化现在拒绝不符合 v1 公共契约的 language metadata、非正数 bundle/case limits 与超过 256 的 case count，并把未配置的 judge mode/checker 规范化为空 JSON 数组。
 - `JudgeService` 不再模拟 Accepted；它从 EndpointSlice 轮询调度器选择 Ready sandbox，使用题目限制执行真实源码，并通过后端内部 API 发布结果。
 - 移除判题服务的 MySQL 写路径；数据库仅用于只读提交、不可变题目版本与测试包元数据，结果事务、CAS 和计数由后端统一处理。

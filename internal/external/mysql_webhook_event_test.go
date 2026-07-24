@@ -10,8 +10,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	mysqlDriver "github.com/go-sql-driver/mysql"
 )
 
 func TestMySQLTerminalTransitionsAtomicallyCreateStableWebhookEvents(t *testing.T) {
@@ -417,7 +415,7 @@ FROM t_external_tenant WHERE external_id = ?`, callbackID, tenantID); err != nil
 	}
 }
 
-func TestMySQLSubmitLocksAdmittedCallbackUntilCommit(t *testing.T) {
+func TestMySQLSubmitRechecksCallbackAfterExternalAdmission(t *testing.T) {
 	database := openMySQLIntegration(t)
 	prepareExternalJobDatabase(t, database)
 	tenantID := strings.Repeat("x", 26)
@@ -431,7 +429,7 @@ func TestMySQLSubmitLocksAdmittedCallbackUntilCommit(t *testing.T) {
 	go func() {
 		_, err := repository.MySQLJobRepository.Submit(context.Background(), tenantID, "callback-lock-submit", JudgeJobRequest{
 			BundleID: bundleID, Language: "cpp", SourceCode: []byte("int main(){}"), CallbackID: callbackID,
-		}, func() error {
+		}, func(context.Context) error {
 			close(admitted)
 			<-release
 			return nil
@@ -458,19 +456,27 @@ func TestMySQLSubmitLocksAdmittedCallbackUntilCommit(t *testing.T) {
 		"UPDATE t_external_callback SET disabled_at = CURRENT_TIMESTAMP(3) WHERE external_id = ?", callbackID)
 	connection.Close()
 	close(release)
-	if submitErr := <-submitResult; submitErr != nil {
-		t.Fatalf("submit error=%v", submitErr)
+	if submitErr := <-submitResult; !errors.Is(submitErr, ErrExternalJobInvalid) {
+		t.Fatalf("submit error=%v want invalid callback", submitErr)
 	}
-	var mysqlError *mysqlDriver.MySQLError
-	if !errors.As(updateErr, &mysqlError) || mysqlError.Number != 1205 {
-		t.Fatalf("concurrent callback disable error=%v want lock timeout", updateErr)
+	if updateErr != nil {
+		t.Fatalf("disable callback during external admission: %v", updateErr)
 	}
 	var disabledAt sql.NullTime
 	if err := database.QueryRow("SELECT disabled_at FROM t_external_callback WHERE external_id = ?", callbackID).Scan(&disabledAt); err != nil {
 		t.Fatal(err)
 	}
-	if disabledAt.Valid {
-		t.Fatal("callback was disabled before admitted submission committed")
+	if !disabledAt.Valid {
+		t.Fatal("callback disable did not commit before authoritative submission recheck")
+	}
+	for table, query := range map[string]string{
+		"jobs":        "SELECT COUNT(*) FROM t_external_job",
+		"sources":     "SELECT COUNT(*) FROM t_external_source_object",
+		"idempotency": "SELECT COUNT(*) FROM t_external_idempotency",
+	} {
+		if got := mustCount(t, database, query); got != 0 {
+			t.Fatalf("%s after callback race=%d want=0", table, got)
+		}
 	}
 }
 

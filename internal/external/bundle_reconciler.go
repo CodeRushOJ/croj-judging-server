@@ -46,15 +46,23 @@ func (reconciler *BundleReconciler) ReconcileOnce(ctx context.Context) (bool, er
 			return true, fmt.Errorf("promote bundle: %v; record failure: %w", err, recordErr)
 		}
 		if abandoned {
-			_ = reconciler.store.Discard(context.Background(), claim.StagingKey)
+			maintenanceContext, cancelMaintenance := reconciler.maintenanceContext(ctx)
+			_ = reconciler.store.Discard(maintenanceContext, claim.StagingKey)
+			cancelMaintenance()
 		}
 		return true, fmt.Errorf("promote bundle: %w", err)
 	}
 	if err := reconciler.repository.CompleteBundlePublication(ctx, claim, reconciler.now().UTC()); err != nil {
 		return true, fmt.Errorf("complete reconciled bundle publication: %w", err)
 	}
-	_ = reconciler.store.Discard(context.Background(), claim.StagingKey)
+	maintenanceContext, cancelMaintenance := reconciler.maintenanceContext(ctx)
+	_ = reconciler.store.Discard(maintenanceContext, claim.StagingKey)
+	cancelMaintenance()
 	return true, nil
+}
+
+func (reconciler *BundleReconciler) maintenanceContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, reconciler.config.MaintenanceTimeout)
 }
 
 func (reconciler *BundleReconciler) Run(ctx context.Context, interval time.Duration) error {

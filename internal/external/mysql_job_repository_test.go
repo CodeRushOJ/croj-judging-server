@@ -22,6 +22,46 @@ type memorySourceStore struct {
 	deletes int
 }
 
+type blockingSourceStore struct {
+	*memorySourceStore
+	createStarted chan struct{}
+	deleteStarted chan struct{}
+	releaseCreate chan struct{}
+	releaseDelete chan struct{}
+}
+
+func (store *blockingSourceStore) Create(ctx context.Context, key string, value []byte) error {
+	if store.createStarted != nil {
+		select {
+		case <-store.createStarted:
+		default:
+			close(store.createStarted)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-store.releaseCreate:
+		}
+	}
+	return store.memorySourceStore.Create(ctx, key, value)
+}
+
+func (store *blockingSourceStore) Delete(ctx context.Context, key string) error {
+	if store.deleteStarted != nil {
+		select {
+		case <-store.deleteStarted:
+		default:
+			close(store.deleteStarted)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-store.releaseDelete:
+		}
+	}
+	return store.memorySourceStore.Delete(ctx, key)
+}
+
 func newMemorySourceStore() *memorySourceStore {
 	return &memorySourceStore{objects: make(map[string][]byte)}
 }
@@ -93,7 +133,7 @@ func TestMySQLJobRepositoryAdmissionIsIdempotentEncryptedAndTenantOwned(t *testi
 	if first.Replayed || first.Job.Status != JobStatusQueued || first.Job.ExternalID == "" || first.Job.TenantExternalID != tenantA {
 		t.Fatalf("first submit = %+v", first)
 	}
-	replay, err := repository.MySQLJobRepository.Submit(context.Background(), tenantA, "job-submit-key-0001", request, func() error {
+	replay, err := repository.MySQLJobRepository.Submit(context.Background(), tenantA, "job-submit-key-0001", request, func(context.Context) error {
 		return errors.New("quota unavailable")
 	})
 	if err != nil {
@@ -193,7 +233,7 @@ func TestMySQLJobRepositoryConcurrentReplayCreatesOneJobAndOneObject(t *testing.
 		go func() {
 			defer wait.Done()
 			<-start
-			result, err := repository.MySQLJobRepository.Submit(context.Background(), tenantID, "concurrent-job-key", request, func() error {
+			result, err := repository.MySQLJobRepository.Submit(context.Background(), tenantID, "concurrent-job-key", request, func(context.Context) error {
 				admissionCalls.Add(1)
 				return nil
 			})
@@ -232,11 +272,275 @@ func TestMySQLJobRepositoryConcurrentReplayCreatesOneJobAndOneObject(t *testing.
 	}
 }
 
+func TestMySQLJobRepositoryContendedIdempotencyReservationFailsFastWithoutAdmission(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	tenantID := strings.Repeat("k", 26)
+	bundleID := strings.Repeat("m", 26)
+	insertTenantBundleAndCallback(t, database, tenantID, bundleID, "", 2)
+	repository := newTestMySQLJobRepository(t, database, newMemorySourceStore())
+	idempotencyKey := "contended-coordination-key"
+	keyDigest, err := DigestIdempotencyKey(idempotencyKey, repository.idempotencyPepper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinationKey, err := SourceObjectKey(tenantID, submissionSourceExternalID(tenantID, keyDigest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`
+INSERT INTO t_external_source_reservation(object_key, owner_token, lease_until)
+VALUES (?, RANDOM_BYTES(32), CURRENT_TIMESTAMP(3) + INTERVAL 25 MINUTE)`, coordinationKey); err != nil {
+		t.Fatal(err)
+	}
+	var admissionCalls atomic.Int64
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	started := time.Now()
+	_, err = repository.MySQLJobRepository.Submit(ctx, tenantID, idempotencyKey, JudgeJobRequest{
+		BundleID: bundleID, Language: "cpp", SourceCode: []byte("int main(){}"),
+	}, func(context.Context) error {
+		admissionCalls.Add(1)
+		return nil
+	})
+	if elapsed := time.Since(started); !errors.Is(err, ErrExternalJobUnavailable) || elapsed > 2*time.Second {
+		t.Fatalf("contended idempotency error=%v elapsed=%s", err, elapsed)
+	}
+	if admissionCalls.Load() != 0 {
+		t.Fatalf("contended idempotency charged admission %d times", admissionCalls.Load())
+	}
+}
+
+func TestMySQLJobRepositoryContendedIdempotencyReservationObservesCommittedReplay(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	tenantID := strings.Repeat("n", 26)
+	bundleID := strings.Repeat("p", 26)
+	insertTenantBundleAndCallback(t, database, tenantID, bundleID, "", 2)
+	repository := newTestMySQLJobRepository(t, database, newMemorySourceStore())
+	request := JudgeJobRequest{BundleID: bundleID, Language: "cpp", SourceCode: []byte("int main(){}")}
+	seed, err := repository.Submit(context.Background(), tenantID, "coordination-replay-seed", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetKey := "coordination-replay-target"
+	targetDigest, err := DigestIdempotencyKey(targetKey, repository.idempotencyPepper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinationKey, err := SourceObjectKey(tenantID, submissionSourceExternalID(tenantID, targetDigest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`
+INSERT INTO t_external_source_reservation(object_key, owner_token, lease_until)
+VALUES (?, RANDOM_BYTES(32), CURRENT_TIMESTAMP(3) + INTERVAL 25 MINUTE)`, coordinationKey); err != nil {
+		t.Fatal(err)
+	}
+	var admissionCalls atomic.Int64
+	type submitOutcome struct {
+		result SubmitJobResult
+		err    error
+	}
+	outcome := make(chan submitOutcome, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go func() {
+		result, err := repository.MySQLJobRepository.Submit(ctx, tenantID, targetKey, request, func(context.Context) error {
+			admissionCalls.Add(1)
+			return nil
+		})
+		outcome <- submitOutcome{result: result, err: err}
+	}()
+	select {
+	case early := <-outcome:
+		t.Fatalf("contended submit returned before predecessor commit: result=%+v error=%v", early.result, early.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if _, err := database.Exec(`
+UPDATE t_external_idempotency SET key_digest = ?
+WHERE operation_scope = ? AND resource_external_id = ?`, targetDigest, submitJobIdempotencyScope, seed.Job.ExternalID); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case completed := <-outcome:
+		if completed.err != nil || !completed.result.Replayed || completed.result.Job.ExternalID != seed.Job.ExternalID {
+			t.Fatalf("committed replay result=%+v error=%v", completed.result, completed.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("contended submit did not observe committed replay")
+	}
+	if admissionCalls.Load() != 0 {
+		t.Fatalf("committed replay charged admission %d times", admissionCalls.Load())
+	}
+}
+
+func TestMySQLJobRepositoryExpiredCoordinationReservationUsesRequestBoundedLease(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	tenantID := strings.Repeat("q", 26)
+	bundleID := strings.Repeat("r", 26)
+	insertTenantBundleAndCallback(t, database, tenantID, bundleID, "", 2)
+	repository := newTestMySQLJobRepository(t, database, newMemorySourceStore())
+	request := JudgeJobRequest{BundleID: bundleID, Language: "cpp", SourceCode: []byte("int main(){}")}
+	keyDigest, err := DigestIdempotencyKey("expired-coordination-key", repository.idempotencyPepper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestHash, err := CanonicalJobRequestHash(request, int64(len(request.SourceCode)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinationKey, err := SourceObjectKey(tenantID, submissionSourceExternalID(tenantID, keyDigest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`
+INSERT INTO t_external_source_reservation(object_key, owner_token, lease_until, created_at)
+VALUES (?, RANDOM_BYTES(32), CURRENT_TIMESTAMP(3) - INTERVAL 1 SECOND, CURRENT_TIMESTAMP(3) - INTERVAL 1 HOUR)`, coordinationKey); err != nil {
+		t.Fatal(err)
+	}
+	ownerToken := bytes.Repeat([]byte{0x7a}, 32)
+	if _, acquired, err := repository.acquireSubmissionCoordination(
+		context.Background(), tenantID, keyDigest, requestHash, coordinationKey, ownerToken,
+	); err != nil || !acquired {
+		t.Fatalf("expired coordination takeover acquired=%v error=%v", acquired, err)
+	}
+	var leaseSeconds int
+	if err := database.QueryRow(`
+SELECT TIMESTAMPDIFF(SECOND, CURRENT_TIMESTAMP(3), lease_until)
+FROM t_external_source_reservation WHERE object_key = ? AND owner_token = ?`, coordinationKey, ownerToken).Scan(&leaseSeconds); err != nil {
+		t.Fatal(err)
+	}
+	if leaseSeconds < 180 || leaseSeconds > 300 {
+		t.Fatalf("coordination lease=%ds, want request-bounded default near four minutes", leaseSeconds)
+	}
+}
+
+func TestMySQLJobRepositoryCoordinationLeaseEndsAfterRequestAndCompensation(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	tenantID := strings.Repeat("q", 26)
+	bundleID := strings.Repeat("r", 26)
+	insertTenantBundleAndCallback(t, database, tenantID, bundleID, "", 2)
+	repository := newTestMySQLJobRepository(t, database, newMemorySourceStore())
+	request := JudgeJobRequest{BundleID: bundleID, Language: "cpp", SourceCode: []byte("int main(){}")}
+	keyDigest, err := DigestIdempotencyKey("deadline-coordination-key", repository.idempotencyPepper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestHash, err := CanonicalJobRequestHash(request, int64(len(request.SourceCode)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinationKey, err := SourceObjectKey(tenantID, submissionSourceExternalID(tenantID, keyDigest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerToken := bytes.Repeat([]byte{0x6a}, 32)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, acquired, err := repository.acquireSubmissionCoordination(
+		ctx, tenantID, keyDigest, requestHash, coordinationKey, ownerToken,
+	); err != nil || !acquired {
+		t.Fatalf("coordination acquired=%v error=%v", acquired, err)
+	}
+	var leaseMillis int64
+	if err := database.QueryRow(`
+SELECT TIMESTAMPDIFF(MICROSECOND, CURRENT_TIMESTAMP(3), lease_until) DIV 1000
+FROM t_external_source_reservation WHERE object_key = ? AND owner_token = ?`, coordinationKey, ownerToken).Scan(&leaseMillis); err != nil {
+		t.Fatal(err)
+	}
+	if leaseMillis < 50_000 || leaseMillis > 70_000 {
+		t.Fatalf("coordination lease=%dms, want request remainder plus bounded compensation allowance", leaseMillis)
+	}
+}
+
+func TestSubmissionCoordinationLeaseUsesRemainingRequestTime(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	lease := submissionCoordinationLease(ctx, 4*time.Minute)
+	if lease < 61*time.Second || lease > 63*time.Second {
+		t.Fatalf("coordination lease=%s, want request remainder plus one-minute compensation allowance", lease)
+	}
+}
+
+func TestSubmissionOperationContextBoundsBackgroundCaller(t *testing.T) {
+	ctx, cancel := submissionOperationContext(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	if _, ok := ctx.Deadline(); !ok {
+		t.Fatal("background submission did not receive an owned operation deadline")
+	}
+	select {
+	case <-ctx.Done():
+		if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			t.Fatalf("submission context error=%v", ctx.Err())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("owned submission deadline did not expire")
+	}
+}
+
+func TestMySQLJobRepositoryBackgroundSubmitBoundsBlockingAdmission(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	tenantID := strings.Repeat("q", 26)
+	bundleID := strings.Repeat("r", 26)
+	insertTenantBundleAndCallback(t, database, tenantID, bundleID, "", 2)
+	repository := newTestMySQLJobRepository(t, database, newMemorySourceStore())
+	repository.submitOperationTimeout = 40 * time.Millisecond
+	admissionCalls := 0
+	started := time.Now()
+
+	_, err := repository.MySQLJobRepository.Submit(context.Background(), tenantID, "background-admission-key", JudgeJobRequest{
+		BundleID: bundleID, Language: "cpp", SourceCode: []byte("int main(){}"),
+	}, func(ctx context.Context) error {
+		admissionCalls++
+		<-ctx.Done()
+		return ctx.Err()
+	})
+
+	if !errors.Is(err, context.DeadlineExceeded) || admissionCalls != 1 {
+		t.Fatalf("submit error=%v admissionCalls=%d", err, admissionCalls)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("background submit exceeded owned deadline: %s", elapsed)
+	}
+	if jobs := mustCount(t, database, "SELECT COUNT(*) FROM t_external_job"); jobs != 0 {
+		t.Fatalf("jobs after timed-out admission=%d", jobs)
+	}
+}
+
+func TestLockSubmissionReservationsRejectsExpiredLease(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	firstKey := "external/" + strings.Repeat("a", 26) + "/source/" + strings.Repeat("b", 26)
+	secondKey := "external/" + strings.Repeat("a", 26) + "/source/" + strings.Repeat("c", 26)
+	firstToken := bytes.Repeat([]byte{0x21}, 32)
+	secondToken := bytes.Repeat([]byte{0x22}, 32)
+	if _, err := database.Exec(`
+INSERT INTO t_external_source_reservation(object_key, owner_token, lease_until)
+VALUES (?, ?, CURRENT_TIMESTAMP(3) - INTERVAL 1 SECOND),
+       (?, ?, CURRENT_TIMESTAMP(3) + INTERVAL 1 MINUTE)`,
+		firstKey, firstToken, secondKey, secondToken); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := database.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := lockSubmissionReservations(context.Background(), tx,
+		sourceReservationClaim{objectKey: firstKey, ownerToken: firstToken},
+		sourceReservationClaim{objectKey: secondKey, ownerToken: secondToken},
+	); err == nil {
+		t.Fatal("expired coordination lease remained eligible to publish")
+	}
+}
+
 func TestMySQLJobRepositoryAdmissionWorksWithSingleDatabaseConnection(t *testing.T) {
 	database := openMySQLIntegration(t)
 	prepareExternalJobDatabase(t, database)
-	database.SetMaxOpenConns(1)
-	database.SetMaxIdleConns(1)
 	tenantID := strings.Repeat("6", 26)
 	bundleID := strings.Repeat("7", 26)
 	insertTenantBundleAndCallback(t, database, tenantID, bundleID, "", 2)
@@ -248,6 +552,58 @@ func TestMySQLJobRepositoryAdmissionWorksWithSingleDatabaseConnection(t *testing
 	})
 	if err != nil || result.Job.Status != JobStatusQueued {
 		t.Fatalf("single-connection admission result=%+v error=%v", result, err)
+	}
+}
+
+func TestMySQLJobRepositoryRunsAdmissionAndSourceUploadWithoutDatabaseLocks(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	database.SetMaxOpenConns(1)
+	database.SetMaxIdleConns(1)
+	tenantID := strings.Repeat("6", 26)
+	bundleID := strings.Repeat("7", 26)
+	insertTenantBundleAndCallback(t, database, tenantID, bundleID, "", 2)
+	store := &blockingSourceStore{
+		memorySourceStore: newMemorySourceStore(), createStarted: make(chan struct{}), releaseCreate: make(chan struct{}),
+	}
+	repository := newTestMySQLJobRepository(t, database, store)
+
+	admissionCalled := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		_, err := repository.MySQLJobRepository.Submit(context.Background(), tenantID, "lock-free-submit-key", JudgeJobRequest{
+			BundleID: bundleID, Language: "cpp", SourceCode: []byte("int main(){}"),
+		}, func(context.Context) error {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if _, err := database.ExecContext(ctx, "UPDATE t_external_tenant SET status = status WHERE external_id = ?", tenantID); err != nil {
+				return fmt.Errorf("admission ran while tenant lock was held: %w", err)
+			}
+			close(admissionCalled)
+			return nil
+		})
+		result <- err
+	}()
+	select {
+	case <-admissionCalled:
+	case err := <-result:
+		t.Fatalf("submit failed before admission completed: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("admission remained blocked behind the submit transaction")
+	}
+	select {
+	case <-store.createStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("source upload did not start")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := database.ExecContext(ctx, "UPDATE t_external_tenant SET updated_at = updated_at WHERE external_id = ?", tenantID); err != nil {
+		t.Fatalf("source upload retained tenant database lock: %v", err)
+	}
+	close(store.releaseCreate)
+	if err := <-result; err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -306,6 +662,35 @@ WHERE external_id = ?`, tenantID); err != nil {
 	}
 	if _, err := repository.Submit(context.Background(), tenantID, "policy-new-key-001", request); !errors.Is(err, ErrExternalJobInvalid) {
 		t.Fatalf("new oversized request error = %v", err)
+	}
+}
+
+func TestMySQLJobRepositoryCanReuseIdempotencyKeyAfterRetentionExpiry(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	tenantID := strings.Repeat("e", 26)
+	bundleID := strings.Repeat("f", 26)
+	insertTenantBundleAndCallback(t, database, tenantID, bundleID, "", 3)
+	store := newMemorySourceStore()
+	repository := newTestMySQLJobRepository(t, database, store)
+	request := JudgeJobRequest{BundleID: bundleID, Language: "cpp", SourceCode: []byte("int main(){}")}
+	first, err := repository.Submit(context.Background(), tenantID, "reusable-submit-key", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec("DELETE FROM t_external_idempotency WHERE operation_scope = ?", submitJobIdempotencyScope); err != nil {
+		t.Fatal(err)
+	}
+	second, err := repository.Submit(context.Background(), tenantID, "reusable-submit-key", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Replayed || second.Job.ExternalID == first.Job.ExternalID || second.Job.Source.ObjectKey == first.Job.Source.ObjectKey {
+		t.Fatalf("expired key did not create an independent job: first=%+v second=%+v", first, second)
+	}
+	objects, puts, deletes := store.snapshot()
+	if len(objects) != 2 || puts != 2 || deletes != 0 {
+		t.Fatalf("source lifecycle after key reuse: objects=%d puts=%d deletes=%d", len(objects), puts, deletes)
 	}
 }
 
@@ -453,6 +838,72 @@ object_key, owner_token, lease_until, created_at
 	}
 }
 
+func TestSourceReservationSweepDeletesOutsideReservationTransaction(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	store := &blockingSourceStore{
+		memorySourceStore: newMemorySourceStore(), deleteStarted: make(chan struct{}), releaseDelete: make(chan struct{}),
+	}
+	repository := newTestMySQLJobRepository(t, database, store)
+	tenantID := strings.Repeat("2", 26)
+	sourceID := strings.Repeat("4", 26)
+	objectKey, err := SourceObjectKey(tenantID, sourceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Create(context.Background(), objectKey, []byte("opaque ciphertext")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT INTO t_external_source_reservation(
+object_key, owner_token, lease_until, created_at
+) VALUES (?, RANDOM_BYTES(32), CURRENT_TIMESTAMP(3) - INTERVAL 1 HOUR, CURRENT_TIMESTAMP(3) - INTERVAL 1 HOUR)`, objectKey); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := repository.SweepSourceReservations(context.Background(), time.Minute, 1)
+		done <- err
+	}()
+	select {
+	case <-store.deleteStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("reservation deletion did not start")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	tx, err := database.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.QueryRowContext(ctx, "SELECT object_key FROM t_external_source_reservation WHERE object_key = ? FOR UPDATE", objectKey).Scan(new(string)); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("object deletion retained reservation row lock: %v", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	close(store.releaseDelete)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+type mysqlNumberedError struct{ Number uint16 }
+
+func (err *mysqlNumberedError) Error() string { return fmt.Sprintf("mysql error %d", err.Number) }
+
+func TestRepositoryUnavailablePreservesUnderlyingErrorChain(t *testing.T) {
+	root := &mysqlNumberedError{Number: 1213}
+	err := repositoryUnavailable("lock tenant", root)
+	if !errors.Is(err, ErrExternalJobUnavailable) {
+		t.Fatalf("availability classification lost: %v", err)
+	}
+	var recovered *mysqlNumberedError
+	if !errors.As(err, &recovered) || recovered != root {
+		t.Fatalf("database error chain lost: %v", err)
+	}
+}
+
 func TestMySQLJobRepositoryCancellationIsTenantSafeAndIdempotent(t *testing.T) {
 	database := openMySQLIntegration(t)
 	prepareExternalJobDatabase(t, database)
@@ -513,10 +964,108 @@ ADD CONSTRAINT chk_test_reject_source CHECK (external_id <> external_id)`); err 
 	}
 }
 
+func TestMySQLJobRepositoryBoundsSourceObjectCreate(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	tenantID := strings.Repeat("v", 26)
+	bundleID := strings.Repeat("w", 26)
+	insertTenantBundleAndCallback(t, database, tenantID, bundleID, "", 2)
+	store := &blockingSourceStore{
+		memorySourceStore: newMemorySourceStore(),
+		createStarted:     make(chan struct{}),
+		releaseCreate:     make(chan struct{}),
+	}
+	repository := newTestMySQLJobRepository(t, database, store)
+	repository.sourceObjectOperationTimeout = 50 * time.Millisecond
+	started := time.Now()
+	_, err := repository.Submit(context.Background(), tenantID, "bounded-source-create", JudgeJobRequest{
+		BundleID: bundleID, Language: "go", SourceCode: []byte("package main\nfunc main(){}"),
+	})
+	if !errors.Is(err, ErrExternalJobUnavailable) {
+		t.Fatalf("submit error=%v want source storage unavailable", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("source create was not bounded: %s", elapsed)
+	}
+	if got := mustCount(t, database, "SELECT COUNT(*) FROM t_external_source_reservation"); got != 2 {
+		t.Fatalf("ambiguous create reservations=%d want=2", got)
+	}
+}
+
+func TestMySQLJobRepositoryOwnedDeadlineBoundsSourceObjectCreate(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	tenantID := strings.Repeat("v", 26)
+	bundleID := strings.Repeat("w", 26)
+	insertTenantBundleAndCallback(t, database, tenantID, bundleID, "", 2)
+	store := &blockingSourceStore{
+		memorySourceStore: newMemorySourceStore(),
+		createStarted:     make(chan struct{}),
+		releaseCreate:     make(chan struct{}),
+	}
+	repository := newTestMySQLJobRepository(t, database, store)
+	repository.submitOperationTimeout = 50 * time.Millisecond
+	repository.sourceObjectOperationTimeout = 2 * time.Minute
+	started := time.Now()
+
+	_, err := repository.Submit(context.Background(), tenantID, "owned-deadline-source", JudgeJobRequest{
+		BundleID: bundleID, Language: "go", SourceCode: []byte("package main\nfunc main(){}"),
+	})
+
+	if !errors.Is(err, ErrExternalJobUnavailable) {
+		t.Fatalf("submit error=%v want source storage unavailable", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("owned submit deadline did not cap source create: %s", elapsed)
+	}
+}
+
+func TestMySQLJobRepositoryOwnedDeadlineBoundsFinalDatabaseLockAndCompensates(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	tenantID := strings.Repeat("x", 26)
+	bundleID := strings.Repeat("y", 26)
+	insertTenantBundleAndCallback(t, database, tenantID, bundleID, "", 2)
+	blocker, err := database.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := blocker.QueryRow("SELECT id FROM t_external_tenant WHERE external_id = ? FOR UPDATE", tenantID).Scan(new(uint64)); err != nil {
+		_ = blocker.Rollback()
+		t.Fatal(err)
+	}
+	defer func() { _ = blocker.Rollback() }()
+	store := newMemorySourceStore()
+	repository := newTestMySQLJobRepository(t, database, store)
+	repository.submitOperationTimeout = 50 * time.Millisecond
+	started := time.Now()
+
+	_, err = repository.Submit(context.Background(), tenantID, "owned-deadline-database", JudgeJobRequest{
+		BundleID: bundleID, Language: "cpp", SourceCode: []byte("int main(){}"),
+	})
+
+	if !errors.Is(err, ErrExternalJobUnavailable) {
+		t.Fatalf("submit error=%v want repository unavailable", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("owned submit deadline did not cap final database lock: %s", elapsed)
+	}
+	objects, puts, deletes := store.snapshot()
+	if len(objects) != 0 || puts != 1 || deletes != 1 {
+		t.Fatalf("source compensation objects=%d puts=%d deletes=%d", len(objects), puts, deletes)
+	}
+	if reservations := mustCount(t, database, "SELECT COUNT(*) FROM t_external_source_reservation"); reservations != 2 {
+		t.Fatalf("fenced reservations after database timeout=%d want=2 for reconciliation", reservations)
+	}
+	if jobs := mustCount(t, database, "SELECT COUNT(*) FROM t_external_job"); jobs != 0 {
+		t.Fatalf("jobs after database timeout=%d", jobs)
+	}
+}
+
 type testMySQLJobRepository struct{ *MySQLJobRepository }
 
 func (repository *testMySQLJobRepository) Submit(ctx context.Context, tenantID, idempotencyKey string, request JudgeJobRequest) (SubmitJobResult, error) {
-	return repository.MySQLJobRepository.Submit(ctx, tenantID, idempotencyKey, request, func() error { return nil })
+	return repository.MySQLJobRepository.Submit(ctx, tenantID, idempotencyKey, request, func(context.Context) error { return nil })
 }
 
 func newTestMySQLJobRepository(t *testing.T, database *sql.DB, store SourceObjectStore) *testMySQLJobRepository {

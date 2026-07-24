@@ -76,6 +76,9 @@ func (worker *SourceRetentionWorker) ProcessNext(ctx context.Context) error {
 	cancel()
 	if err != nil {
 		if recordErr := worker.repository.RecordSourceRetentionFailure(ctx, claim, worker.retryDelay); recordErr != nil {
+			if !errors.Is(recordErr, ErrSourceRetentionNotAvailable) && !IsTransientDatabaseError(recordErr) {
+				return recordErr
+			}
 			return errors.Join(ErrSourceRetentionDeleteFailed, recordErr)
 		}
 		return ErrSourceRetentionDeleteFailed
@@ -90,7 +93,7 @@ func (worker *SourceRetentionWorker) Run(ctx context.Context) error {
 			continue
 		}
 		if !errors.Is(err, ErrSourceRetentionNotAvailable) && !errors.Is(err, ErrSourceRetentionDeleteFailed) &&
-			!errors.Is(err, ErrExternalJobUnavailable) {
+			!IsTransientDatabaseError(err) {
 			return err
 		}
 		timer := time.NewTimer(worker.idleDelay)

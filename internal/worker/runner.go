@@ -135,26 +135,43 @@ func (runner *Runner) Run(ctx context.Context, workerID string, idleBackoff time
 	for {
 		claim, err := repository.ClaimNext(ctx, workerID, runner.config.LeaseDuration)
 		if errors.Is(err, external.ErrJobNotClaimable) {
-			timer := time.NewTimer(idleBackoff)
-			select {
-			case <-ctx.Done():
-				if !timer.Stop() {
-					<-timer.C
-				}
-				return ctx.Err()
-			case <-timer.C:
-				continue
+			if err := waitForRepositoryRetry(ctx, idleBackoff); err != nil {
+				return err
 			}
+			continue
 		}
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
+			if external.IsTransientDatabaseError(err) {
+				if err := waitForRepositoryRetry(ctx, idleBackoff); err != nil {
+					return err
+				}
+				continue
+			}
 			return fmt.Errorf("claim durable judge job: %w", err)
 		}
 		if err := runner.ExecuteClaim(ctx, claim); err != nil {
+			if external.IsTransientDatabaseError(err) {
+				if err := waitForRepositoryRetry(ctx, idleBackoff); err != nil {
+					return err
+				}
+				continue
+			}
 			return err
 		}
+	}
+}
+
+func waitForRepositoryRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	case <-timer.C:
+		return nil
 	}
 }
 
