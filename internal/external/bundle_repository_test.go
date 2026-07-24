@@ -13,7 +13,7 @@ func TestBundleCommitInputRequiresServerDerivedTenantContentAddress(t *testing.T
 	valid := BundleCommitInput{
 		TenantID: testTenantID, RequestHash: digest,
 		ObjectKey:            "external/" + testTenantID + "/sha256/" + hex.EncodeToString(digest[:]) + ".zip",
-		StagingObjectKey:     "external/" + testTenantID + "/staging/cccccccccccccccccccccccccc/" + hex.EncodeToString(digest[:]) + ".zip",
+		StagingObjectKey:     "external-staging/" + testTenantID + "/cccccccccccccccccccccccccc/" + hex.EncodeToString(digest[:]) + ".zip",
 		ManifestJSON:         []byte(`{"schemaVersion":1,"judgeMode":"ACM","checker":"exact","limits":{"timeLimitMillis":1000,"memoryLimitMiB":256},"cases":[{"id":"case-1","input":"1.in","output":"1.out","weight":1}]}`),
 		TimeLimitMillis:      1000,
 		MemoryLimitMiB:       256,

@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -150,6 +151,43 @@ func TestRuntimeBoundsAStuckWorkerShutdown(t *testing.T) {
 		t.Fatal("stuck worker exceeded shutdown bound")
 	}
 	close(release)
+}
+
+func TestRuntimeHandlerReturnsRetryableProblemWhileShuttingDown(t *testing.T) {
+	runtime, err := NewRuntime(Config{
+		Enabled: true, ListenAddress: "127.0.0.1:0", ShutdownTimeout: time.Second,
+	}, http.NotFoundHandler(), nil, healthyProductionProbes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.shuttingDown.Store(true)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/judge-jobs", strings.NewReader("{}"))
+	response := httptest.NewRecorder()
+
+	runtime.Handler().ServeHTTP(response, request)
+
+	if response.Code != http.StatusServiceUnavailable ||
+		response.Header().Get("Content-Type") != "application/problem+json" ||
+		response.Header().Get("Cache-Control") != "no-store" ||
+		response.Header().Get("Retry-After") == "" ||
+		response.Header().Get("X-Request-Id") == "" {
+		t.Fatalf("status=%d headers=%v body=%s", response.Code, response.Header(), response.Body.String())
+	}
+	var problem struct {
+		Type      string `json:"type"`
+		Title     string `json:"title"`
+		Status    int    `json:"status"`
+		Detail    string `json:"detail"`
+		RequestID string `json:"requestId"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &problem); err != nil {
+		t.Fatal(err)
+	}
+	if problem.Type != "https://coderushoj.dev/problems/shutting-down" ||
+		problem.Title == "" || problem.Detail == "" || problem.Status != http.StatusServiceUnavailable ||
+		problem.RequestID != response.Header().Get("X-Request-Id") {
+		t.Fatalf("problem=%+v headers=%v", problem, response.Header())
+	}
 }
 
 func healthyProductionProbes() map[string]Probe {

@@ -10,7 +10,7 @@ One registry owns every public language identifier, display name, runtime identi
 
 ## Daily execution accounting
 
-MySQL is authoritative. A daily tenant ledger is keyed by tenant and `CURRENT_DATE`, never application time. Claiming follows the fixed tenant → job → ledger/attempt lock order, recovers expired reservations, then atomically reserves the bundle time ceiling. Terminal success settles the reservation to measured execution milliseconds; failure/cancellation releases it, and abandoned expired attempts release their reservation before a replacement claim. Replays and process crashes are idempotent through attempt/job fencing.
+MySQL is authoritative. A daily tenant ledger is keyed by tenant and `CURRENT_DATE`, never application time. Claiming follows the fixed tenant → job → ledger/attempt lock order, recovers expired reservations, then atomically reserves the bundle time ceiling. Terminal success and cancellation with trusted case measurements settle to the overflow-safe measured total. Cancellation or compilation failure without trusted measurements consumes the full reservation to prevent deliberate quota evasion. Infrastructure and expired-lease failures refund the reservation before a replacement claim. Replays and process crashes are idempotent through attempt/job fencing.
 
 ## Fair scheduling
 
@@ -19,6 +19,8 @@ Tenant rows carry a scheduler cursor. A claim first locks one eligible tenant or
 ## Retention
 
 Terminal jobs and their encrypted source objects are retained for a configurable period. A bounded worker first marks eligible jobs/source rows using database time and reference checks, records an audit event, and commits. It then deletes the object; a second fenced transaction records deletion and redacts source metadata. Transient object-store failures leave marked rows retryable. Jobs are deleted only after webhook terminal audit retention and idempotency references permit deletion.
+
+Bundle uploads stage under the separately enumerable `external-staging/` prefix. Object-store operations happen outside MySQL transactions. A garbage collector applies a safety age longer than the bounded application upload deadline and checks authoritative bundle references both before and immediately before deletion. Operators additionally configure a longer object-store lifecycle rule for that prefix only.
 
 ## HTTP availability and contract
 

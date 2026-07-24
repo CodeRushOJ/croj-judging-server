@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/CodeRushOJ/croj-judging-server/internal/external"
 )
@@ -18,15 +19,42 @@ type RequestAuthenticator interface {
 }
 
 type Server struct {
-	authenticator    RequestAuthenticator
-	capabilities     Capabilities
-	jobs             JobService
-	jobWriteQuota    external.Quota
-	jobWriteLimit    external.QuotaLimit
-	bundles          BundleApplication
-	bundleWriteQuota external.Quota
-	bundleWriteLimit external.QuotaLimit
-	bundleUploads    chan struct{}
+	authenticator          RequestAuthenticator
+	capabilities           Capabilities
+	jobs                   JobService
+	jobWriteQuota          external.Quota
+	jobWriteLimit          external.QuotaLimit
+	bundles                BundleApplication
+	bundleWriteQuota       external.Quota
+	bundleWriteLimit       external.QuotaLimit
+	bundleUploads          chan struct{}
+	bundleOperationTimeout time.Duration
+	jobBodyReadTimeout     time.Duration
+	jobBodyReaders         chan struct{}
+	jobSubmitTimeout       time.Duration
+}
+
+const (
+	defaultBundleOperationTimeout = 20 * time.Minute
+	maximumBundleOperationTimeout = 40 * time.Minute
+	defaultJobBodyReadTimeout     = 2 * time.Minute
+	defaultJobBodyConcurrency     = 64
+	maximumJobBodyDrainBytes      = 64 << 10
+	defaultJobSubmitTimeout       = 3 * time.Minute
+	maximumJobSubmitTimeout       = 30 * time.Minute
+)
+
+// WithBundleOperationTimeout bounds multipart reading, validation, staging,
+// durable publication and response preparation. It remains shorter than the
+// staging garbage collector's one-hour minimum safety age.
+func WithBundleOperationTimeout(timeout time.Duration) ServerOption {
+	return func(server *Server) error {
+		if timeout < time.Minute || timeout > maximumBundleOperationTimeout {
+			return fmt.Errorf("bundle operation timeout must be between 1 and 40 minutes")
+		}
+		server.bundleOperationTimeout = timeout
+		return nil
+	}
 }
 
 func WithJobWriteQuota(quota external.Quota, jobSubmitLimit external.QuotaLimit) ServerOption {
@@ -64,6 +92,35 @@ func WithBundleUploadConcurrency(maximum int) ServerOption {
 		return nil
 	}
 }
+
+// WithJobBodyProtection bounds authenticated JSON body readers independently
+// from the much longer deadline required by maximum-size bundle uploads.
+func WithJobBodyProtection(readTimeout time.Duration, maximumConcurrency int) ServerOption {
+	return func(server *Server) error {
+		if readTimeout < time.Second || readTimeout > 5*time.Minute {
+			return fmt.Errorf("job body read timeout must be between 1 second and 5 minutes")
+		}
+		if maximumConcurrency < 1 || maximumConcurrency > 4096 {
+			return fmt.Errorf("job body concurrency must be between 1 and 4096")
+		}
+		server.jobBodyReadTimeout = readTimeout
+		server.jobBodyReaders = make(chan struct{}, maximumConcurrency)
+		return nil
+	}
+}
+
+// WithJobSubmitTimeout bounds distributed admission, source persistence, and
+// durable job publication after the authenticated JSON body has been read.
+func WithJobSubmitTimeout(timeout time.Duration) ServerOption {
+	return func(server *Server) error {
+		if timeout <= 0 || timeout > maximumJobSubmitTimeout {
+			return fmt.Errorf("job submit timeout must be positive and at most 30 minutes")
+		}
+		server.jobSubmitTimeout = timeout
+		return nil
+	}
+}
+
 func NewServer(authenticator RequestAuthenticator, capabilities Capabilities, options ...ServerOption) (*Server, error) {
 	if authenticator == nil {
 		return nil, fmt.Errorf("request authenticator is required")
@@ -73,7 +130,13 @@ func NewServer(authenticator RequestAuthenticator, capabilities Capabilities, op
 	if err != nil {
 		return nil, err
 	}
-	server := &Server{authenticator: authenticator, capabilities: capabilities}
+	server := &Server{
+		authenticator: authenticator, capabilities: capabilities,
+		bundleOperationTimeout: defaultBundleOperationTimeout,
+		jobBodyReadTimeout:     defaultJobBodyReadTimeout,
+		jobBodyReaders:         make(chan struct{}, defaultJobBodyConcurrency),
+		jobSubmitTimeout:       defaultJobSubmitTimeout,
+	}
 	for _, option := range options {
 		if option == nil {
 			return nil, fmt.Errorf("server option is required")
@@ -131,7 +194,17 @@ func (server *Server) handleCapabilities(response http.ResponseWriter, request *
 }
 
 func (server *Server) authenticate(response http.ResponseWriter, request *http.Request, requestID string, scope Scope) (Principal, bool) {
-	principal, err := server.authenticator.Authenticate(request.Context(), request.Header.Get("Authorization"))
+	authorization := request.Header.Values("Authorization")
+	if len(authorization) > 1 || len(authorization) == 1 && strings.Contains(authorization[0], ",") {
+		response.Header().Set("WWW-Authenticate", `Bearer realm="coderushoj-judge"`)
+		writeProblem(response, problemFor(http.StatusUnauthorized, "unauthorized", "Authentication required", "Provide a valid active API key.", requestID))
+		return Principal{}, false
+	}
+	authorizationValue := ""
+	if len(authorization) == 1 {
+		authorizationValue = authorization[0]
+	}
+	principal, err := server.authenticator.Authenticate(request.Context(), authorizationValue)
 	if err != nil {
 		if errors.Is(err, ErrAuthenticationUnavailable) {
 			response.Header().Set("Retry-After", "5")

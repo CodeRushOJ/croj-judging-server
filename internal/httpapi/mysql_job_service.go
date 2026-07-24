@@ -10,7 +10,7 @@ import (
 )
 
 type durableJobRepository interface {
-	Submit(context.Context, string, string, external.JudgeJobRequest, func() error) (external.SubmitJobResult, error)
+	Submit(context.Context, string, string, external.JudgeJobRequest, func(context.Context) error) (external.SubmitJobResult, error)
 	List(context.Context, string, external.JobListOptions) (external.JobListResult, error)
 	Get(context.Context, string, string) (external.ExternalJobRecord, error)
 	Cancel(context.Context, string, string) (external.ExternalJobRecord, error)
@@ -41,8 +41,8 @@ func (service *MySQLJobService) Submit(
 		BundleID: command.BundleID, Language: language.SandboxID, SourceCode: []byte(command.SourceCode),
 		StopOnFailure: command.StopOnFailure, CallbackID: command.CallbackID,
 		ClientReference: command.ClientReference,
-	}, func() error {
-		admissionErr = admit()
+	}, func(admissionContext context.Context) error {
+		admissionErr = admit(admissionContext)
 		return admissionErr
 	})
 	if err != nil {

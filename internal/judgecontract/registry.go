@@ -21,7 +21,7 @@ const (
 
 var canonicalLanguages = [...]LanguageDefinition{
 	{PublicID: "go", SandboxID: "go", DisplayName: "Go", Runtime: "go"},
-	{PublicID: "cpp", SandboxID: "cpp", DisplayName: "C++ 20", Runtime: "gcc"},
+	{PublicID: "cpp", SandboxID: "cpp", DisplayName: "C++ 17", Runtime: "gcc"},
 	{PublicID: "python", SandboxID: "python", DisplayName: "Python 3", Runtime: "python3"},
 	{PublicID: "java", SandboxID: "java", DisplayName: "Java", Runtime: "java"},
 	{PublicID: "javascript", SandboxID: "javascript", DisplayName: "JavaScript", Runtime: "node"},

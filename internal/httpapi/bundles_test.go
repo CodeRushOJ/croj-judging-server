@@ -17,14 +17,17 @@ import (
 )
 
 type bundleApplicationStub struct {
-	metadata external.BundleMetadata
-	replay   bool
-	err      error
-	uploaded []byte
-	tenantID string
-	key      string
-	getID    string
-	calls    int
+	metadata        external.BundleMetadata
+	replay          bool
+	err             error
+	uploaded        []byte
+	tenantID        string
+	key             string
+	getID           string
+	calls           int
+	deadline        time.Time
+	hasDeadline     bool
+	waitForDeadline bool
 }
 
 type countingReader struct {
@@ -42,15 +45,51 @@ func (application *bundleApplicationStub) UploadWithAdmission(ctx context.Contex
 	application.calls++
 	application.tenantID = tenantID
 	application.key = key
+	application.deadline, application.hasDeadline = ctx.Deadline()
 	data, err := io.ReadAll(reader)
 	if err != nil {
 		return external.BundleMetadata{}, false, err
 	}
 	application.uploaded = data
+	if application.waitForDeadline {
+		<-ctx.Done()
+		return external.BundleMetadata{}, false, ctx.Err()
+	}
 	if err := admit(ctx, int64(len(data))); err != nil {
 		return external.BundleMetadata{}, false, err
 	}
 	return application.metadata, application.replay, application.err
+}
+
+func TestBundleTimeoutWritesRetryableProblemBeforeSocketWriteDeadline(t *testing.T) {
+	application := &bundleApplicationStub{waitForDeadline: true}
+	server := newBundleTestServer(t, ScopeBundleWrite, application)
+	server.bundleOperationTimeout = 40 * time.Millisecond
+	socketServer := httptest.NewUnstartedServer(server)
+	socketServer.Config.WriteTimeout = 250 * time.Millisecond
+	socketServer.Start()
+	defer socketServer.Close()
+	body, contentType := multipartBody(t, []multipartValue{{name: "bundle", filename: "tests.zip", body: []byte("zip")}})
+	request, err := http.NewRequest(http.MethodPost, socketServer.URL+"/api/v1/bundles", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", contentType)
+	request.Header.Set("Idempotency-Key", "upload-key-00001")
+
+	response, err := socketServer.Client().Do(request)
+	if err != nil {
+		t.Fatalf("bundle timeout response was lost at the socket deadline: %v", err)
+	}
+	defer response.Body.Close()
+	encoded, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusServiceUnavailable || response.Header.Get("Retry-After") == "" ||
+		response.Header.Get("Content-Type") != "application/problem+json" || !strings.Contains(string(encoded), `"status":503`) {
+		t.Fatalf("status=%d headers=%v body=%s", response.StatusCode, response.Header, encoded)
+	}
 }
 
 func (application *bundleApplicationStub) Get(_ context.Context, tenantID, bundleID string) (external.BundleMetadata, error) {
@@ -76,6 +115,10 @@ func TestBundleUploadStreamsOneFileAndReturnsOnlyPublicMetadata(t *testing.T) {
 	}
 	if application.tenantID != "tenant-7" || application.key != "upload-key-00001" || !bytes.Equal(application.uploaded, []byte("zip-body")) {
 		t.Fatalf("application tenant=%q key=%q body=%q", application.tenantID, application.key, application.uploaded)
+	}
+	remaining := time.Until(application.deadline)
+	if !application.hasDeadline || remaining < 19*time.Minute || remaining > defaultBundleOperationTimeout {
+		t.Fatalf("bundle operation deadline configured=%v remaining=%s", application.hasDeadline, remaining)
 	}
 	var metadata external.BundleMetadata
 	if err := json.Unmarshal(response.Body.Bytes(), &metadata); err != nil {
@@ -294,7 +337,7 @@ func TestBundleUploadMapsBoundedAndIdempotencyFailures(t *testing.T) {
 		"too large":         {err: external.ErrBundleTooLarge, want: http.StatusRequestEntityTooLarge},
 		"invalid ZIP":       {err: external.ErrInvalidBundle, want: http.StatusBadRequest},
 		"key conflict":      {err: external.ErrIdempotencyConflict, want: http.StatusConflict},
-		"store unavailable": {err: errors.New("minio unavailable"), want: http.StatusServiceUnavailable},
+		"store unavailable": {err: errors.New("minio unavailable"), want: http.StatusServiceUnavailable, wantRetry: true},
 		"publishing":        {err: external.ErrBundlePublishing, want: http.StatusServiceUnavailable, wantRetry: true},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -311,6 +354,9 @@ func TestBundleUploadMapsBoundedAndIdempotencyFailures(t *testing.T) {
 			}
 			if test.wantRetry && response.Header().Get("Retry-After") == "" {
 				t.Fatal("retryable publication response omitted Retry-After")
+			}
+			if !test.wantRetry && response.Header().Get("Retry-After") != "" {
+				t.Fatalf("terminal response unexpectedly advertised retry: %q", response.Header().Get("Retry-After"))
 			}
 		})
 	}

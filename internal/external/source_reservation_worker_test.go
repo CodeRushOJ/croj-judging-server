@@ -3,14 +3,18 @@ package external
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
+
+	mysqlDriver "github.com/go-sql-driver/mysql"
 )
 
 type sourceReservationSweeperStub struct {
 	mu         sync.Mutex
 	results    []int
+	errors     []error
 	err        error
 	calls      int
 	ages       []time.Duration
@@ -34,6 +38,11 @@ func (repository *sourceReservationSweeperStub) SweepSourceReservations(
 	repository.calls++
 	repository.ages = append(repository.ages, minimumAge)
 	repository.limits = append(repository.limits, limit)
+	if len(repository.errors) > 0 {
+		err := repository.errors[0]
+		repository.errors = repository.errors[1:]
+		return 0, err
+	}
 	if repository.err != nil {
 		return 0, repository.err
 	}
@@ -152,6 +161,53 @@ func TestSourceReservationWorkerReturnsSweepFailure(t *testing.T) {
 
 	if err := worker.Run(context.Background()); !errors.Is(err, failed) {
 		t.Fatalf("Run error=%v want=%v", err, failed)
+	}
+}
+
+func TestSourceReservationWorkerBacksOffAndRetriesTransientDatabaseFailure(t *testing.T) {
+	repository := &sourceReservationSweeperStub{errors: []error{
+		fmt.Errorf("sweep reservation: %w", &mysqlDriver.MySQLError{Number: 1213, Message: "deadlock"}),
+	}}
+	worker := newSourceReservationWorkerForTest(t, repository)
+	stop := errors.New("stop after transient backoff")
+	var waited []time.Duration
+	worker.wait = func(_ context.Context, delay time.Duration) error {
+		waited = append(waited, delay)
+		return stop
+	}
+	if err := worker.Run(context.Background()); !errors.Is(err, stop) {
+		t.Fatalf("Run error=%v want=%v", err, stop)
+	}
+	if len(waited) != 1 || waited[0] != worker.revisitDelay {
+		t.Fatalf("transient waits=%v want=[%s]", waited, worker.revisitDelay)
+	}
+}
+
+func TestSourceReservationWorkerBacksOffAndRetriesTransientObjectStoreFailure(t *testing.T) {
+	repository := &sourceReservationSweeperStub{errors: []error{
+		fmt.Errorf("sweep source reservation: %w", ErrSourceObjectStoreUnavailable),
+	}}
+	worker := newSourceReservationWorkerForTest(t, repository)
+	stop := errors.New("stop after object store backoff")
+	var waited []time.Duration
+	worker.wait = func(_ context.Context, delay time.Duration) error {
+		waited = append(waited, delay)
+		return stop
+	}
+	if err := worker.Run(context.Background()); !errors.Is(err, stop) {
+		t.Fatalf("Run error=%v want=%v", err, stop)
+	}
+	if len(waited) != 1 || waited[0] != worker.revisitDelay {
+		t.Fatalf("transient waits=%v want=[%s]", waited, worker.revisitDelay)
+	}
+}
+
+func TestSourceReservationWorkerReturnsPermanentObjectStoreContractFailure(t *testing.T) {
+	permanent := errors.New("source object key contract is invalid")
+	repository := &sourceReservationSweeperStub{err: permanent}
+	worker := newSourceReservationWorkerForTest(t, repository)
+	if err := worker.Run(context.Background()); !errors.Is(err, permanent) {
+		t.Fatalf("Run error=%v want=%v", err, permanent)
 	}
 }
 

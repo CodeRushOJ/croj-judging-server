@@ -179,7 +179,13 @@ func (worker *WebhookWorker) Run(ctx context.Context) error {
 		if now := worker.now().UTC(); !now.Before(nextSweep) {
 			drained, err := worker.sweepTerminal(ctx)
 			if err != nil {
-				return err
+				if !IsTransientDatabaseError(err) {
+					return err
+				}
+				if err := waitWebhookWorker(ctx, worker.idleDelay); err != nil {
+					return err
+				}
+				continue
 			}
 			if drained {
 				nextSweep = now.Add(webhookRetentionSweepInterval)
@@ -191,18 +197,23 @@ func (worker *WebhookWorker) Run(ctx context.Context) error {
 		if err == nil {
 			continue
 		}
-		if !errors.Is(err, ErrWebhookNotAvailable) {
+		if !errors.Is(err, ErrWebhookNotAvailable) && !IsTransientDatabaseError(err) {
 			return err
 		}
-		timer := time.NewTimer(worker.idleDelay)
-		select {
-		case <-ctx.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
-			return context.Cause(ctx)
-		case <-timer.C:
+		if err := waitWebhookWorker(ctx, worker.idleDelay); err != nil {
+			return err
 		}
+	}
+}
+
+func waitWebhookWorker(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	case <-timer.C:
+		return nil
 	}
 }
 

@@ -60,7 +60,7 @@ The API never accepts a caller-provided object URL. This prevents SSRF, DNS rebi
 ```json
 {
   "bundleId": "bnd_01...",
-  "language": "cpp20",
+  "language": "cpp",
   "sourceCode": "#include <iostream>...",
   "stopOnFailure": true,
   "callbackId": "cb_01...",

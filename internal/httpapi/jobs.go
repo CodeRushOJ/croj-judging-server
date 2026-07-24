@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -85,7 +87,7 @@ type JobListPage struct {
 // JobAdmission must be invoked exactly once only after an implementation has
 // serialized the Idempotency-Key and established that the request creates a
 // new job. Replays and conflicts must return without invoking admission.
-type JobAdmission func() error
+type JobAdmission func(context.Context) error
 
 type JobService interface {
 	Submit(context.Context, string, string, SubmitJobCommand, JobAdmission) (JobView, bool, error)
@@ -129,33 +131,84 @@ func (server *Server) handleJobSubmit(response http.ResponseWriter, request *htt
 	if !authenticated {
 		return
 	}
+	controller := http.NewResponseController(response)
+	deadlineSupported := true
+	if err := controller.SetReadDeadline(time.Now().Add(server.jobBodyReadTimeout)); err != nil {
+		if errors.Is(err, http.ErrNotSupported) {
+			deadlineSupported = false
+		} else {
+			closeUnreadRequestBody(response, request, controller)
+			response.Header().Set("Retry-After", "1")
+			writeProblem(response, problemFor(http.StatusServiceUnavailable, "submit-read-protection-unavailable", "Submit read protection unavailable", "Retry the judge job submission later.", requestID))
+			return
+		}
+	}
+	select {
+	case server.jobBodyReaders <- struct{}{}:
+	default:
+		closeUnreadRequestBody(response, request, controller)
+		response.Header().Set("Retry-After", "1")
+		writeProblem(response, problemFor(http.StatusServiceUnavailable, "submit-capacity-exhausted", "Submit capacity exhausted", "Retry the judge job submission later.", requestID))
+		return
+	}
+	var finishBodyReadOnce sync.Once
+	finishBodyRead := func() {
+		finishBodyReadOnce.Do(func() {
+			if !deadlineSupported {
+				closeUnreadRequestBody(response, request, controller)
+			} else if drainAndCloseRequestBody(request.Body) {
+				_ = controller.SetReadDeadline(time.Time{})
+			} else {
+				response.Header().Set("Connection", "close")
+			}
+			<-server.jobBodyReaders
+		})
+	}
+	defer finishBodyRead()
+	if !hasApplicationJSONContentType(request.Header.Values("Content-Type")) {
+		finishBodyRead()
+		writeProblem(response, problemFor(http.StatusUnsupportedMediaType, "unsupported-media-type", "Unsupported media type", "Use Content-Type: application/json for judge job submissions.", requestID))
+		return
+	}
 	idempotencyValues := request.Header.Values("Idempotency-Key")
 	if len(idempotencyValues) != 1 {
+		finishBodyRead()
 		writeProblem(response, problemFor(http.StatusBadRequest, "invalid-idempotency-key", "Invalid Idempotency-Key", "Provide exactly one Idempotency-Key header.", requestID))
 		return
 	}
 	idempotencyKey := idempotencyValues[0]
 	if err := external.ValidateIdempotencyKey(idempotencyKey); err != nil {
+		finishBodyRead()
 		writeProblem(response, problemFor(http.StatusBadRequest, "invalid-idempotency-key", "Invalid Idempotency-Key", "Provide 16 to 128 visible ASCII characters.", requestID))
 		return
 	}
 	var command SubmitJobCommand
-	if err := decodeStrictJSON(response, request, &command, maximumJobRequestBytes(server.capabilities.Limits.MaxSourceBytes)); err != nil {
+	decodeErr := decodeStrictJSON(response, request, &command, maximumJobRequestBytes(server.capabilities.Limits.MaxSourceBytes))
+	finishBodyRead()
+	if decodeErr != nil {
+		if isRequestBodyTimeout(decodeErr) {
+			response.Header().Set("Connection", "close")
+			response.Header().Set("Retry-After", "1")
+			writeProblem(response, problemFor(http.StatusRequestTimeout, "request-body-timeout", "Request body timeout", "Retry the request with a complete JSON body before the read deadline.", requestID))
+			return
+		}
 		writeProblem(response, problemFor(http.StatusBadRequest, "invalid-json", "Invalid request body", "Provide one JSON object containing only documented fields.", requestID))
 		return
 	}
+	submitContext, cancelSubmit := context.WithTimeout(request.Context(), server.jobSubmitTimeout)
+	defer cancelSubmit()
 	var admissionOnce sync.Once
 	var admissionErr error
-	admit := func() error {
+	admit := func(admissionContext context.Context) error {
 		admissionOnce.Do(func() {
-			decision, err := server.jobWriteQuota.Allow(request.Context(), external.QuotaRequest{
+			decision, err := server.jobWriteQuota.Allow(admissionContext, external.QuotaRequest{
 				TenantID: principal.TenantID,
 				Kind:     external.QuotaJudgeSubmit,
 				Cost:     1,
 				Limit:    server.jobWriteLimit,
 			})
 			if err != nil {
-				if errors.Is(err, external.ErrQuotaUnavailable) {
+				if errors.Is(err, external.ErrQuotaUnavailable) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 					admissionErr = &jobQuotaAdmissionError{unavailable: true}
 					return
 				}
@@ -168,8 +221,11 @@ func (server *Server) handleJobSubmit(response http.ResponseWriter, request *htt
 		})
 		return admissionErr
 	}
-	view, replayed, err := server.jobs.Submit(request.Context(), principal.TenantID, idempotencyKey, command, admit)
+	view, replayed, err := server.jobs.Submit(submitContext, principal.TenantID, idempotencyKey, command, admit)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			err = ErrJobUnavailable
+		}
 		server.writeJobError(response, requestID, err)
 		return
 	}
@@ -181,6 +237,53 @@ func (server *Server) handleJobSubmit(response http.ResponseWriter, request *htt
 		response.Header().Set("Idempotent-Replay", "true")
 	}
 	writeJSON(response, http.StatusAccepted, view)
+}
+
+func drainAndCloseRequestBody(body io.ReadCloser) bool {
+	if body == nil {
+		return true
+	}
+	_, readErr := io.CopyN(io.Discard, body, maximumJobBodyDrainBytes+1)
+	closeErr := body.Close()
+	return errors.Is(readErr, io.EOF) && closeErr == nil
+}
+
+func closeUnreadRequestBody(response http.ResponseWriter, request *http.Request, controller *http.ResponseController) {
+	response.Header().Set("Connection", "close")
+	// Force an already-declared but unsent HTTP/1 body read to fail now. Calling
+	// Close with the normal read deadline can otherwise make net/http drain up
+	// to 256 KiB synchronously, bypassing the body-reader semaphore on a
+	// capacity rejection.
+	if controller != nil {
+		_ = controller.SetReadDeadline(time.Now())
+	}
+	if request.Body != nil {
+		_ = request.Body.Close()
+	}
+}
+
+func isRequestBodyTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var networkError net.Error
+	return errors.As(err, &networkError) && networkError.Timeout()
+}
+
+func hasApplicationJSONContentType(values []string) bool {
+	if len(values) != 1 {
+		return false
+	}
+	mediaType, parameters, err := mime.ParseMediaType(values[0])
+	if err != nil || !strings.EqualFold(mediaType, "application/json") {
+		return false
+	}
+	for name, value := range parameters {
+		if !strings.EqualFold(name, "charset") || !strings.EqualFold(value, "utf-8") {
+			return false
+		}
+	}
+	return true
 }
 
 func (server *Server) handleJobList(response http.ResponseWriter, request *http.Request, requestID string) {

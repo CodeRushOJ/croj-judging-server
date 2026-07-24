@@ -206,6 +206,29 @@ type atomicMemoryObjectStore struct {
 	failNext     int
 }
 
+type blockingDiscardBundleStore struct {
+	*atomicMemoryObjectStore
+	discardDeadline time.Time
+	discardStarted  chan struct{}
+}
+
+type deadlineRecordingBundleStore struct {
+	*atomicMemoryObjectStore
+	discardHadDeadline bool
+}
+
+func (store *deadlineRecordingBundleStore) Discard(ctx context.Context, key string) error {
+	_, store.discardHadDeadline = ctx.Deadline()
+	return store.atomicMemoryObjectStore.Discard(ctx, key)
+}
+
+func (store *blockingDiscardBundleStore) Discard(ctx context.Context, _ string) error {
+	store.discardDeadline, _ = ctx.Deadline()
+	close(store.discardStarted)
+	<-ctx.Done()
+	return ctx.Err()
+}
+
 type blockingMemoryObjectStore struct {
 	inner   *atomicMemoryObjectStore
 	started chan struct{}
@@ -315,6 +338,30 @@ func TestBundleServiceDiscardsStagingAfterDefinitiveCommitRejection(t *testing.T
 	}
 }
 
+func TestBundleServiceBoundsDefinitiveStagingCompensation(t *testing.T) {
+	repository := newMemoryBundleRepository()
+	repository.commitErr = ErrInvalidBundle
+	store := &blockingDiscardBundleStore{atomicMemoryObjectStore: &atomicMemoryObjectStore{}, discardStarted: make(chan struct{})}
+	service := newTestBundleService(t, repository, store, t.TempDir(), 1<<20, bundle.DefaultArchiveLimits())
+	service.config.MaintenanceTimeout = 10 * time.Millisecond
+	started := time.Now()
+	_, _, err := service.Upload(context.Background(), testTenantID, "upload-key-00001", bytes.NewReader(validExternalBundle(t, "input")))
+	if !errors.Is(err, ErrInvalidBundle) {
+		t.Fatalf("Upload error=%v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("bounded staging compensation took %s", elapsed)
+	}
+	select {
+	case <-store.discardStarted:
+	default:
+		t.Fatal("staging compensation did not run")
+	}
+	if store.discardDeadline.IsZero() {
+		t.Fatal("staging compensation had no deadline")
+	}
+}
+
 func TestBundleServiceAdmitsActualBytesBeforeCreatingDurableArtifacts(t *testing.T) {
 	repository := newMemoryBundleRepository()
 	store := &atomicMemoryObjectStore{}
@@ -370,6 +417,27 @@ func TestBundleReconcilerCompletesPublicationWithoutClientReplay(t *testing.T) {
 		if _, err := service.Get(context.Background(), testTenantID, metadata.BundleID); err != nil {
 			t.Fatalf("reconciled metadata unavailable: %v", err)
 		}
+	}
+}
+
+func TestBundleReconcilerBoundsStagingCleanup(t *testing.T) {
+	repository := newMemoryBundleRepository()
+	store := &deadlineRecordingBundleStore{atomicMemoryObjectStore: &atomicMemoryObjectStore{failNext: 1}}
+	service := newTestBundleService(t, repository, store, t.TempDir(), 1<<20, bundle.DefaultArchiveLimits())
+	body := validExternalBundle(t, "input")
+	if _, _, err := service.Upload(context.Background(), testTenantID, "upload-key-00001", bytes.NewReader(body)); err == nil {
+		t.Fatal("expected initial publication failure")
+	}
+	reconciler, err := NewBundleReconciler(service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconciler.now = func() time.Time { return service.now().Add(service.config.PublicationRetry) }
+	if processed, err := reconciler.ReconcileOnce(context.Background()); err != nil || !processed {
+		t.Fatalf("processed=%v error=%v", processed, err)
+	}
+	if !store.discardHadDeadline {
+		t.Fatal("reconciler staging cleanup had no deadline")
 	}
 }
 

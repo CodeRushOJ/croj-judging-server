@@ -78,3 +78,21 @@ func TestExternalOnlyModeDoesNotInitializeLegacyDependencies(t *testing.T) {
 		t.Fatalf("external-only legacy runtime = %+v", runtime)
 	}
 }
+
+func TestValidateExternalOperationTimeoutsPreservesResponseMargin(t *testing.T) {
+	if err := validateExternalOperationTimeouts(20*time.Minute, 2*time.Minute, 3*time.Minute, 15*time.Minute); err != nil {
+		t.Fatalf("production timeout budget rejected: %v", err)
+	}
+	for name, test := range map[string]struct {
+		write, body, submit, bundle time.Duration
+	}{
+		"bundle reaches write deadline":           {20 * time.Minute, 2 * time.Minute, 3 * time.Minute, 20 * time.Minute},
+		"submit plus body reaches write deadline": {5 * time.Minute, 2 * time.Minute, 3 * time.Minute, 4 * time.Minute},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := validateExternalOperationTimeouts(test.write, test.body, test.submit, test.bundle); err == nil {
+				t.Fatal("unsafe operation timeout budget accepted")
+			}
+		})
+	}
+}

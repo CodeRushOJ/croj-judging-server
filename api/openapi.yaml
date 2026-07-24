@@ -15,6 +15,10 @@ info:
     Resource lookup is tenant scoped, so an unknown ID and another tenant's ID
     both return the same `404` response.
 
+    Send exactly one `Authorization` field. Judge-job submissions require an
+    `application/json` Content-Type and are read through a dedicated short,
+    bounded admission pool; the longer bundle-upload deadline is not reused.
+
     A configured webhook is delivered at-least-once. Consumers must deduplicate
     by `X-CodeRushOJ-Event-Id`. The v1 signature framing is
     `v1\n<event-id-byte-length>\n<event-id>\n<timestamp>\n<raw-body>`: the event
@@ -68,7 +72,7 @@ paths:
                     displayName: Go
                     runtime: go
                   - id: cpp
-                    displayName: C++ 20
+                    displayName: C++ 17
                     runtime: gcc
                   - id: python
                     displayName: Python 3
@@ -231,7 +235,9 @@ paths:
         Source code exists only in this request and is never echoed by a public
         response. A same-request replay returns the original job with
         `Idempotent-Replay: true`; a different request using the key returns
-        `409`.
+        `409`. The request must carry exactly one `Content-Type` whose media
+        type is `application/json`; only an optional UTF-8 charset parameter is
+        accepted.
 
         ```bash
         API_KEY='dummy-not-a-real-key'
@@ -286,8 +292,12 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/JobNotFound'
+        '408':
+          $ref: '#/components/responses/JobRequestTimeout'
         '409':
           $ref: '#/components/responses/JobConflict'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
         '422':
           $ref: '#/components/responses/UnprocessableEntity'
         '429':
@@ -448,7 +458,8 @@ components:
       description: |
         Operator-issued opaque API key. Keys are tenant bound and grant one or
         more of `capabilities:read`, `bundle:write`, `bundle:read`, `job:submit`,
-        `job:read`, and `job:cancel`.
+        `job:read`, and `job:cancel`. Send exactly one Authorization field;
+        repeated or comma-combined credentials are rejected as ambiguous.
   parameters:
     IdempotencyKey:
       name: Idempotency-Key
@@ -725,6 +736,42 @@ components:
             status: 413
             detail: The bundle exceeds the configured upload limit.
             requestId: unavailable
+    JobRequestTimeout:
+      description: The complete judge-job JSON body was not received before the authenticated read deadline.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://coderushoj.dev/problems/request-body-timeout
+            title: Request body timeout
+            status: 408
+            detail: Retry the request with a complete JSON body before the read deadline.
+            requestId: unavailable
+    UnsupportedMediaType:
+      description: Judge-job submissions require an application/json request body.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControl'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://coderushoj.dev/problems/unsupported-media-type
+            title: Unsupported media type
+            status: 415
+            detail: 'Use Content-Type: application/json for judge job submissions.'
+            requestId: unavailable
     UnprocessableEntity:
       description: A syntactically valid job violates tenant or judge policy.
       headers:
@@ -868,7 +915,7 @@ components:
                 detail: The bundle operation could not be completed.
                 requestId: unavailable
     JobSubmitUnavailable:
-      description: Authentication, submit quota, or job storage is temporarily unavailable.
+      description: Authentication, body-reader admission, submit quota, or job storage is temporarily unavailable.
       headers:
         X-Request-Id:
           $ref: '#/components/headers/XRequestId'
@@ -894,6 +941,13 @@ components:
                 title: Quota temporarily unavailable
                 status: 503
                 detail: Retry the request later.
+                requestId: unavailable
+            submitCapacityExhausted:
+              value:
+                type: https://coderushoj.dev/problems/submit-capacity-exhausted
+                title: Submit capacity exhausted
+                status: 503
+                detail: Retry the judge job submission later.
                 requestId: unavailable
             jobServiceUnavailable:
               value:

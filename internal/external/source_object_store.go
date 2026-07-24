@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"path"
 	"strings"
 
@@ -13,6 +14,8 @@ import (
 )
 
 const maximumEncryptedSourceObjectBytes = 64 << 20
+
+var ErrSourceObjectStoreUnavailable = errors.New("source object store is temporarily unavailable")
 
 // MaximumSourceBytes is the largest plaintext that can be encrypted with the
 // v1 AES-GCM envelope and still satisfy the source object transport bound.
@@ -80,8 +83,13 @@ func (store *MinIOSourceObjectStore) Delete(ctx context.Context, key string) err
 		return fmt.Errorf("encrypted source object delete request is invalid")
 	}
 	if err := store.client.RemoveObject(ctx, store.bucket, key, minio.RemoveObjectOptions{}); err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		if errors.Is(err, context.Canceled) {
 			return err
+		}
+		response := minio.ToErrorResponse(err)
+		if errors.Is(err, context.DeadlineExceeded) || response.StatusCode == 0 || response.StatusCode == http.StatusRequestTimeout ||
+			response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= http.StatusInternalServerError {
+			return fmt.Errorf("%w: encrypted source object delete failed", ErrSourceObjectStoreUnavailable)
 		}
 		return fmt.Errorf("encrypted source object delete failed")
 	}

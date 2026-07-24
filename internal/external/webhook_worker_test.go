@@ -4,19 +4,24 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
 	"sync"
 	"testing"
 	"time"
+
+	mysqlDriver "github.com/go-sql-driver/mysql"
 )
 
 type webhookRepositoryStub struct {
 	claim       WebhookClaim
 	claimErr    error
+	claimErrs   []error
 	settleErr   error
 	sweepErr    error
+	sweepErrs   []error
 	claimHook   func()
 	sweepCounts []int64
 	claims      int
@@ -26,6 +31,11 @@ type webhookRepositoryStub struct {
 
 func (repository *webhookRepositoryStub) SweepTerminal(context.Context, time.Duration, int) (int64, error) {
 	repository.sweeps++
+	if len(repository.sweepErrs) > 0 {
+		err := repository.sweepErrs[0]
+		repository.sweepErrs = repository.sweepErrs[1:]
+		return 0, err
+	}
 	if len(repository.sweepCounts) > 0 {
 		count := repository.sweepCounts[0]
 		repository.sweepCounts = repository.sweepCounts[1:]
@@ -38,6 +48,11 @@ func (repository *webhookRepositoryStub) ClaimNextWebhook(context.Context, strin
 	repository.claims++
 	if repository.claimHook != nil {
 		repository.claimHook()
+	}
+	if len(repository.claimErrs) > 0 {
+		err := repository.claimErrs[0]
+		repository.claimErrs = repository.claimErrs[1:]
+		return WebhookClaim{}, err
 	}
 	return repository.claim, repository.claimErr
 }
@@ -456,6 +471,56 @@ func TestWebhookWorkerRunIdlesWithContextAndReturnsRepositoryError(t *testing.T)
 	worker = newWorkerForTest(t, &webhookRepositoryStub{sweepErr: want}, &callbackDecryptorStub{}, &delivererFactoryStub{}, time.Now().UTC(), bytes.NewReader(make([]byte, 8)), 2)
 	if err := worker.Run(context.Background()); !errors.Is(err, want) {
 		t.Fatalf("retention repository error=%v", err)
+	}
+}
+
+func TestWebhookWorkerRetriesTransientDatabaseFailuresWithBoundedBackoff(t *testing.T) {
+	transient := fmt.Errorf("webhook repository: %w", &mysqlDriver.MySQLError{Number: 1213, Message: "deadlock"})
+	for _, test := range []struct {
+		name       string
+		repository *webhookRepositoryStub
+		calls      func(*webhookRepositoryStub) int
+	}{
+		{
+			name: "retention sweep",
+			repository: &webhookRepositoryStub{
+				sweepErrs: []error{transient}, claimErr: ErrWebhookNotAvailable,
+			},
+			calls: func(repository *webhookRepositoryStub) int { return repository.sweeps },
+		},
+		{
+			name: "outbox claim",
+			repository: &webhookRepositoryStub{
+				claimErrs: []error{transient, ErrWebhookNotAvailable},
+			},
+			calls: func(repository *webhookRepositoryStub) int { return repository.claims },
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			test.repository.claimHook = func() {
+				if test.repository.claims >= 2 || (test.name == "retention sweep" && test.repository.sweeps >= 2) {
+					cancel()
+				}
+			}
+			worker := newWorkerForTest(t, test.repository, &callbackDecryptorStub{}, &delivererFactoryStub{}, time.Now().UTC(), bytes.NewReader(make([]byte, 8)), 2)
+			worker.idleDelay = time.Millisecond
+			done := make(chan error, 1)
+			go func() { done <- worker.Run(ctx) }()
+			select {
+			case err := <-done:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("transient database error stopped worker: %v", err)
+				}
+			case <-time.After(time.Second):
+				cancel()
+				<-done
+				t.Fatal("worker did not retry transient database error")
+			}
+			if calls := test.calls(test.repository); calls < 2 {
+				t.Fatalf("repository calls=%d want retry", calls)
+			}
+		})
 	}
 }
 

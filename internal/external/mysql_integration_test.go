@@ -98,6 +98,91 @@ func TestValidateMigrationsRejectsDurableWebhookSchemaDrift(t *testing.T) {
 	}
 }
 
+func TestValidateMigrationsRejectsExecutionAccountingRetentionContractDrift(t *testing.T) {
+	mutations := map[string]string{
+		"forced index invisible":    `ALTER TABLE t_external_tenant ALTER INDEX idx_external_tenant_fair_claim INVISIBLE`,
+		"forced index prefix":       `ALTER TABLE t_external_tenant DROP INDEX idx_external_tenant_fair_claim, ADD INDEX idx_external_tenant_fair_claim(status(4), last_claimed_at, id)`,
+		"attempt default":           `ALTER TABLE t_external_job_attempt ALTER COLUMN consumed_execution_millis SET DEFAULT 1`,
+		"daily accounting day null": `ALTER TABLE t_external_execution_daily MODIFY COLUMN accounting_day DATE NULL DEFAULT NULL`,
+		"daily foreign key":         `ALTER TABLE t_external_execution_daily DROP FOREIGN KEY fk_external_execution_daily_tenant`,
+		"audit external id width":   `ALTER TABLE t_external_retention_audit MODIFY COLUMN job_external_id CHAR(25) CHARACTER SET ascii COLLATE ascii_bin NOT NULL`,
+		"audit event type width":    `ALTER TABLE t_external_retention_audit MODIFY COLUMN event_type VARCHAR(31) NOT NULL`,
+		"audit check":               `ALTER TABLE t_external_retention_audit DROP CHECK chk_external_retention_audit_event`,
+	}
+	for name, mutation := range mutations {
+		t.Run(name, func(t *testing.T) {
+			database := openMySQLIntegration(t)
+			resetMySQLIntegrationSchema(t, database)
+			defer resetMySQLIntegrationSchema(t, database)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			if err := ApplyMigrations(ctx, database); err != nil {
+				t.Fatal(err)
+			}
+			if err := ValidateMigrations(ctx, database); err != nil {
+				t.Fatalf("valid schema rejected: %v", err)
+			}
+			if _, err := database.ExecContext(ctx, mutation); err != nil {
+				t.Fatal(err)
+			}
+			if err := ValidateMigrations(ctx, database); err == nil {
+				t.Fatalf("v6 schema drift %q was accepted", name)
+			}
+		})
+	}
+}
+
+func TestValidateMigrationsRejectsExecutionAccountingRetentionForeignKeyActionDrift(t *testing.T) {
+	mutations := map[string][]string{
+		"daily delete cascade": {
+			`ALTER TABLE t_external_execution_daily DROP FOREIGN KEY fk_external_execution_daily_tenant`,
+			`ALTER TABLE t_external_execution_daily ADD CONSTRAINT fk_external_execution_daily_tenant
+  FOREIGN KEY (tenant_id) REFERENCES t_external_tenant(id) ON DELETE CASCADE`,
+		},
+		"attempt update cascade": {
+			`ALTER TABLE t_external_job_attempt DROP FOREIGN KEY fk_external_attempt_job_tenant`,
+			`ALTER TABLE t_external_job_attempt ADD CONSTRAINT fk_external_attempt_job_tenant
+  FOREIGN KEY (job_id, tenant_id) REFERENCES t_external_job(id, tenant_id) ON UPDATE CASCADE`,
+		},
+		"source delete cascade": {
+			`ALTER TABLE t_external_source_object DROP FOREIGN KEY fk_external_source_tenant`,
+			`ALTER TABLE t_external_source_object ADD CONSTRAINT fk_external_source_tenant
+  FOREIGN KEY (tenant_id) REFERENCES t_external_tenant(id) ON DELETE CASCADE`,
+		},
+		"source delete set null": {
+			`ALTER TABLE t_external_source_object DROP FOREIGN KEY fk_external_source_tenant`,
+			`ALTER TABLE t_external_source_object MODIFY COLUMN tenant_id BIGINT UNSIGNED NULL`,
+			`ALTER TABLE t_external_source_object ADD CONSTRAINT fk_external_source_tenant
+  FOREIGN KEY (tenant_id) REFERENCES t_external_tenant(id) ON DELETE SET NULL`,
+		},
+		"audit update cascade": {
+			`ALTER TABLE t_external_retention_audit DROP FOREIGN KEY fk_external_retention_audit_tenant`,
+			`ALTER TABLE t_external_retention_audit ADD CONSTRAINT fk_external_retention_audit_tenant
+  FOREIGN KEY (tenant_id) REFERENCES t_external_tenant(id) ON UPDATE CASCADE`,
+		},
+	}
+	for name, statements := range mutations {
+		t.Run(name, func(t *testing.T) {
+			database := openMySQLIntegration(t)
+			resetMySQLIntegrationSchema(t, database)
+			defer resetMySQLIntegrationSchema(t, database)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			if err := ApplyMigrations(ctx, database); err != nil {
+				t.Fatal(err)
+			}
+			for _, statement := range statements {
+				if _, err := database.ExecContext(ctx, statement); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := ValidateMigrations(ctx, database); err == nil {
+				t.Fatalf("foreign key action drift %q was accepted", name)
+			}
+		})
+	}
+}
+
 func TestDurableWebhookMigrationUpgradesLegacyRowsWithoutInventingSecrets(t *testing.T) {
 	database := openMySQLIntegration(t)
 	resetMySQLIntegrationSchema(t, database)

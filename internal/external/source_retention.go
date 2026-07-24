@@ -7,12 +7,24 @@ import (
 	"io"
 	"strings"
 	"time"
+
+	mysqlDriver "github.com/go-sql-driver/mysql"
 )
 
 var (
 	ErrSourceRetentionNotAvailable      = errors.New("source retention is not available")
 	ErrIdempotencyRetentionNotAvailable = errors.New("idempotency retention is not available")
+	errSourceRetentionContention        = errors.New("source retention claim contention")
 )
+
+// IsTransientDatabaseError identifies MySQL concurrency failures that are
+// safe to retry at a worker-loop boundary. Callers must preserve the original
+// driver error in the unwrap chain; generic availability/invariant failures
+// intentionally fail closed instead of keeping an unhealthy Pod alive.
+func IsTransientDatabaseError(err error) bool {
+	var mysqlError *mysqlDriver.MySQLError
+	return errors.As(err, &mysqlError) && (mysqlError.Number == 1205 || mysqlError.Number == 1213)
+}
 
 type SourceRetentionClaim struct {
 	TenantInternalID uint64
@@ -87,6 +99,77 @@ func (repository *MySQLJobRepository) ClaimSourceRetention(ctx context.Context, 
 	if repository == nil || retention <= 0 || retention > 365*24*time.Hour || leaseDuration <= 0 || leaseDuration > 15*time.Minute {
 		return SourceRetentionClaim{}, ErrSourceRetentionNotAvailable
 	}
+	candidates, err := repository.sourceRetentionCandidates(ctx, retention, 32)
+	if err != nil {
+		return SourceRetentionClaim{}, err
+	}
+	for _, candidate := range candidates {
+		claim, err := repository.claimSourceRetentionCandidate(ctx, candidate, retention, leaseDuration)
+		if errors.Is(err, errSourceRetentionContention) || errors.Is(err, ErrSourceRetentionNotAvailable) {
+			continue
+		}
+		return claim, err
+	}
+	return SourceRetentionClaim{}, ErrSourceRetentionNotAvailable
+}
+
+func (repository *MySQLJobRepository) sourceRetentionCandidates(ctx context.Context, retention time.Duration, limit int) ([]SourceRetentionClaim, error) {
+	rows, err := repository.database.QueryContext(ctx, `
+SELECT tenant_id, job_id, source_id, job_external_id, source_external_id, object_key
+FROM (
+    SELECT job.tenant_id, job.id AS job_id, source.id AS source_id,
+           job.external_id AS job_external_id, source.external_id AS source_external_id,
+           source.object_key, job.completed_at,
+           ROW_NUMBER() OVER (PARTITION BY job.tenant_id ORDER BY job.completed_at, job.id) AS tenant_rank
+    FROM t_external_job AS job FORCE INDEX (idx_external_job_retention)
+    JOIN t_external_source_object AS source
+      ON source.id = job.source_object_id AND source.tenant_id = job.tenant_id
+    WHERE job.status IN ('SUCCEEDED','FAILED','CANCELLED')
+      AND job.completed_at <= CURRENT_TIMESTAMP(3) - INTERVAL ? MICROSECOND
+      AND source.deleted_at IS NULL
+      AND (source.delete_marked_at IS NULL OR
+           (source.delete_next_attempt_at <= CURRENT_TIMESTAMP(3) AND source.delete_lease_until <= CURRENT_TIMESTAMP(3)))
+      AND NOT EXISTS (SELECT 1 FROM t_external_webhook_outbox AS outbox WHERE outbox.job_id = job.id)
+      AND NOT EXISTS (
+          SELECT 1 FROM t_external_idempotency AS idem
+          WHERE idem.tenant_id = job.tenant_id AND idem.resource_type = 'judge-job'
+            AND idem.resource_external_id = job.external_id
+            AND idem.expires_at > CURRENT_TIMESTAMP(3)
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM t_external_job AS another
+          WHERE another.source_object_id = source.id AND another.id <> job.id
+      )
+) AS candidate
+WHERE tenant_rank = 1
+ORDER BY completed_at, job_id
+LIMIT ?`, retention.Microseconds(), limit)
+	if err != nil {
+		return nil, repositoryUnavailable("select retained source candidates", err)
+	}
+	defer rows.Close()
+	candidates := make([]SourceRetentionClaim, 0, limit)
+	for rows.Next() {
+		var claim SourceRetentionClaim
+		if err := rows.Scan(
+			&claim.TenantInternalID, &claim.JobInternalID, &claim.SourceInternalID,
+			&claim.JobExternalID, &claim.SourceExternalID, &claim.ObjectKey,
+		); err != nil {
+			return nil, repositoryUnavailable("scan retained source candidate", err)
+		}
+		candidates = append(candidates, claim)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, repositoryUnavailable("iterate retained source candidates", err)
+	}
+	return candidates, nil
+}
+
+func (repository *MySQLJobRepository) claimSourceRetentionCandidate(
+	ctx context.Context,
+	claim SourceRetentionClaim,
+	retention, leaseDuration time.Duration,
+) (SourceRetentionClaim, error) {
 	tx, err := repository.database.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return SourceRetentionClaim{}, repositoryUnavailable("begin source retention claim", err)
@@ -96,50 +179,19 @@ func (repository *MySQLJobRepository) ClaimSourceRetention(ctx context.Context, 
 	if err != nil {
 		return SourceRetentionClaim{}, err
 	}
-	var claim SourceRetentionClaim
-	err = tx.QueryRowContext(ctx, `
-SELECT job.tenant_id, job.id, source.id, job.external_id, source.external_id, source.object_key
-FROM t_external_job AS job FORCE INDEX (idx_external_job_retention)
-JOIN t_external_source_object AS source
-  ON source.id = job.source_object_id AND source.tenant_id = job.tenant_id
-WHERE job.status IN ('SUCCEEDED','FAILED','CANCELLED') AND job.completed_at <= ?
-  AND source.deleted_at IS NULL
-  AND (source.delete_marked_at IS NULL OR
-       (source.delete_next_attempt_at <= ? AND source.delete_lease_until <= ?))
-  AND NOT EXISTS (SELECT 1 FROM t_external_webhook_outbox AS outbox WHERE outbox.job_id = job.id)
-  AND NOT EXISTS (
-      SELECT 1 FROM t_external_idempotency AS idem
-      WHERE idem.tenant_id = job.tenant_id AND idem.resource_type = 'judge-job'
-        AND idem.resource_external_id = job.external_id
-  )
-  AND NOT EXISTS (
-      SELECT 1 FROM t_external_job AS another
-      WHERE another.source_object_id = source.id AND another.id <> job.id
-  )
-ORDER BY job.completed_at, job.id
-LIMIT 1`, now.Add(-retention), now, now).Scan(
-		&claim.TenantInternalID, &claim.JobInternalID, &claim.SourceInternalID,
-		&claim.JobExternalID, &claim.SourceExternalID, &claim.ObjectKey,
-	)
-	if errors.Is(err, sql.ErrNoRows) {
-		return SourceRetentionClaim{}, ErrSourceRetentionNotAvailable
-	}
-	if err != nil {
-		return SourceRetentionClaim{}, repositoryUnavailable("select retained source candidate", err)
-	}
-	if err := lockRetentionTenantJob(ctx, tx, claim, now.Add(-retention)); err != nil {
+	if err := lockRetentionTenantJobForClaim(ctx, tx, claim, now.Add(-retention)); err != nil {
 		return SourceRetentionClaim{}, err
 	}
 	var markedAt sql.NullTime
 	err = tx.QueryRowContext(ctx, `
 SELECT external_id, object_key, delete_marked_at
-FROM t_external_source_object FORCE INDEX (idx_external_source_delete)
+FROM t_external_source_object
 WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL
   AND (delete_marked_at IS NULL OR (delete_next_attempt_at <= ? AND delete_lease_until <= ?))
 FOR UPDATE SKIP LOCKED`, claim.SourceInternalID, claim.TenantInternalID, now, now).
 		Scan(&claim.SourceExternalID, &claim.ObjectKey, &markedAt)
 	if errors.Is(err, sql.ErrNoRows) {
-		return SourceRetentionClaim{}, ErrSourceRetentionNotAvailable
+		return SourceRetentionClaim{}, errSourceRetentionContention
 	}
 	if err != nil {
 		return SourceRetentionClaim{}, repositoryUnavailable("lock retained source", err)
@@ -178,6 +230,37 @@ WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`,
 		return SourceRetentionClaim{}, repositoryUnavailable("commit source retention claim", err)
 	}
 	return claim, nil
+}
+
+// lockRetentionTenantJobForClaim keeps the global tenant -> job -> source
+// mutation order while making multi-replica contention non-blocking. The
+// source row is deliberately locked by the caller only after this succeeds.
+func lockRetentionTenantJobForClaim(ctx context.Context, tx *sql.Tx, claim SourceRetentionClaim, completedBefore time.Time) error {
+	var tenantID uint64
+	if err := tx.QueryRowContext(ctx, "SELECT id FROM t_external_tenant WHERE id = ? FOR UPDATE SKIP LOCKED", claim.TenantInternalID).Scan(&tenantID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return errSourceRetentionContention
+		}
+		return repositoryUnavailable("lock source retention tenant claim", err)
+	}
+	var jobExternalID, status string
+	var sourceID uint64
+	var completedAt sql.NullTime
+	if err := tx.QueryRowContext(ctx, `
+SELECT external_id, status, source_object_id, completed_at
+FROM t_external_job
+WHERE id = ? AND tenant_id = ? FOR UPDATE SKIP LOCKED`, claim.JobInternalID, claim.TenantInternalID).
+		Scan(&jobExternalID, &status, &sourceID, &completedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return errSourceRetentionContention
+		}
+		return repositoryUnavailable("lock retained terminal job claim", err)
+	}
+	terminal := status == string(JobStatusSucceeded) || status == string(JobStatusFailed) || status == string(JobStatusCancelled)
+	if !terminal || sourceID != claim.SourceInternalID || jobExternalID != claim.JobExternalID || !completedAt.Valid || completedAt.Time.After(completedBefore) {
+		return ErrSourceRetentionNotAvailable
+	}
+	return nil
 }
 
 func (repository *MySQLJobRepository) RecordSourceRetentionFailure(ctx context.Context, claim SourceRetentionClaim, retryDelay time.Duration) error {
@@ -311,7 +394,8 @@ func retentionBlockers(ctx context.Context, tx *sql.Tx, claim SourceRetentionCla
 	if err := tx.QueryRowContext(ctx, `
 SELECT (SELECT COUNT(*) FROM t_external_webhook_outbox WHERE job_id = ?) +
        (SELECT COUNT(*) FROM t_external_idempotency
-        WHERE tenant_id = ? AND resource_type = 'judge-job' AND resource_external_id = ?) +
+        WHERE tenant_id = ? AND resource_type = 'judge-job' AND resource_external_id = ?
+          AND expires_at > CURRENT_TIMESTAMP(3)) +
        (SELECT COUNT(*) FROM t_external_job WHERE source_object_id = ? AND id <> ?)`,
 		claim.JobInternalID, claim.TenantInternalID, claim.JobExternalID,
 		claim.SourceInternalID, claim.JobInternalID).Scan(&blockers); err != nil {

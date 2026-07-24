@@ -27,7 +27,7 @@ func NewIdempotencyRetentionWorker(repository IdempotencyRetentionRepository, ba
 func (worker *IdempotencyRetentionWorker) Run(ctx context.Context) error {
 	for {
 		count, err := worker.repository.ExpireIdempotencyBatch(ctx, worker.batch)
-		if err != nil && !errors.Is(err, ErrIdempotencyRetentionNotAvailable) {
+		if err != nil && !errors.Is(err, ErrIdempotencyRetentionNotAvailable) && !IsTransientDatabaseError(err) {
 			return err
 		}
 		if err == nil && count == int64(worker.batch) {

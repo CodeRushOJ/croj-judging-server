@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	mysqlDriver "github.com/go-sql-driver/mysql"
 )
 
 type flakyRetentionStore struct {
@@ -20,10 +22,28 @@ type transientRetentionRepository struct {
 	retried chan struct{}
 }
 
+func TestTransientDatabaseErrorClassificationUsesMySQLCodesThroughWrapping(t *testing.T) {
+	for _, number := range []uint16{1205, 1213} {
+		err := repositoryUnavailable("repository operation", &mysqlDriver.MySQLError{Number: number, Message: "retry"})
+		if !IsTransientDatabaseError(err) {
+			t.Fatalf("MySQL %d was not classified transient", number)
+		}
+	}
+	for _, err := range []error{
+		&mysqlDriver.MySQLError{Number: 1062, Message: "duplicate"},
+		ErrExternalJobUnavailable,
+		errors.New("invariant violated"),
+	} {
+		if IsTransientDatabaseError(err) {
+			t.Fatalf("permanent error classified transient: %v", err)
+		}
+	}
+}
+
 func (repository *transientRetentionRepository) ClaimSourceRetention(context.Context, time.Duration, time.Duration) (SourceRetentionClaim, error) {
 	repository.calls++
 	if repository.calls == 1 {
-		return SourceRetentionClaim{}, repositoryUnavailable("injected transient retention error", errors.New("deadlock"))
+		return SourceRetentionClaim{}, fmt.Errorf("injected transient retention error: %w", &mysqlDriver.MySQLError{Number: 1213, Message: "deadlock"})
 	}
 	select {
 	case <-repository.retried:
@@ -31,6 +51,53 @@ func (repository *transientRetentionRepository) ClaimSourceRetention(context.Con
 		close(repository.retried)
 	}
 	return SourceRetentionClaim{}, ErrSourceRetentionNotAvailable
+}
+
+type failingRetentionRepository struct{ err error }
+
+func (repository failingRetentionRepository) ClaimSourceRetention(context.Context, time.Duration, time.Duration) (SourceRetentionClaim, error) {
+	return SourceRetentionClaim{}, repository.err
+}
+func (failingRetentionRepository) RecordSourceRetentionFailure(context.Context, SourceRetentionClaim, time.Duration) error {
+	return nil
+}
+func (failingRetentionRepository) FinalizeSourceRetention(context.Context, SourceRetentionClaim) error {
+	return nil
+}
+
+type retentionRecordFailureRepository struct{ err error }
+
+func (repository retentionRecordFailureRepository) ClaimSourceRetention(context.Context, time.Duration, time.Duration) (SourceRetentionClaim, error) {
+	return SourceRetentionClaim{ObjectKey: "external/tenant/sources/source.bin"}, nil
+}
+func (repository retentionRecordFailureRepository) RecordSourceRetentionFailure(context.Context, SourceRetentionClaim, time.Duration) error {
+	return repository.err
+}
+func (retentionRecordFailureRepository) FinalizeSourceRetention(context.Context, SourceRetentionClaim) error {
+	return nil
+}
+
+type idempotencyRetentionStub struct {
+	errors  []error
+	calls   int
+	retried chan struct{}
+}
+
+func (repository *idempotencyRetentionStub) ExpireIdempotencyBatch(context.Context, int) (int64, error) {
+	repository.calls++
+	if len(repository.errors) > 0 {
+		err := repository.errors[0]
+		repository.errors = repository.errors[1:]
+		return 0, err
+	}
+	if repository.retried != nil {
+		select {
+		case <-repository.retried:
+		default:
+			close(repository.retried)
+		}
+	}
+	return 0, ErrIdempotencyRetentionNotAvailable
 }
 
 func (*transientRetentionRepository) RecordSourceRetentionFailure(context.Context, SourceRetentionClaim, time.Duration) error {
@@ -136,6 +203,73 @@ func TestSourceRetentionWorkerRetriesTransientRepositoryErrors(t *testing.T) {
 	}
 }
 
+func TestSourceRetentionWorkerReturnsPermanentRepositoryInvariant(t *testing.T) {
+	permanent := fmt.Errorf("%w: accounting invariant", ErrExternalJobUnavailable)
+	worker, err := NewSourceRetentionWorker(SourceRetentionWorkerConfig{
+		Repository: failingRetentionRepository{err: permanent}, Objects: newMemorySourceStore(), Retention: time.Hour,
+		IdleDelay: time.Millisecond, DeleteTimeout: time.Second, ClaimLease: 2 * time.Second, RetryDelay: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := worker.Run(ctx); !errors.Is(err, permanent) {
+		t.Fatalf("permanent repository error=%v", err)
+	}
+}
+
+func TestSourceRetentionWorkerDoesNotHidePermanentRetryRecordFailure(t *testing.T) {
+	permanent := fmt.Errorf("%w: retention fence invariant", ErrExternalJobUnavailable)
+	store := &flakyRetentionStore{memorySourceStore: newMemorySourceStore(), failures: 1}
+	worker, err := NewSourceRetentionWorker(SourceRetentionWorkerConfig{
+		Repository: retentionRecordFailureRepository{err: permanent}, Objects: store, Retention: time.Hour,
+		IdleDelay: time.Millisecond, DeleteTimeout: time.Second, ClaimLease: 2 * time.Second, RetryDelay: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.Run(context.Background()); !errors.Is(err, permanent) {
+		t.Fatalf("permanent retry-record error=%v", err)
+	}
+}
+
+func TestIdempotencyRetentionWorkerRetriesTransientDatabaseError(t *testing.T) {
+	repository := &idempotencyRetentionStub{
+		errors:  []error{fmt.Errorf("expire batch: %w", &mysqlDriver.MySQLError{Number: 1205, Message: "lock wait timeout"})},
+		retried: make(chan struct{}),
+	}
+	worker, err := NewIdempotencyRetentionWorker(repository, 100, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- worker.Run(ctx) }()
+	select {
+	case <-repository.retried:
+		cancel()
+	case err := <-done:
+		t.Fatalf("transient database error stopped idempotency retention: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("idempotency retention did not retry transient database error")
+	}
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("worker shutdown error=%v", err)
+	}
+}
+
+func TestIdempotencyRetentionWorkerReturnsPermanentRepositoryInvariant(t *testing.T) {
+	permanent := fmt.Errorf("%w: retention invariant", ErrExternalJobUnavailable)
+	worker, err := NewIdempotencyRetentionWorker(&idempotencyRetentionStub{errors: []error{permanent}}, 100, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.Run(context.Background()); !errors.Is(err, permanent) {
+		t.Fatalf("permanent repository error=%v", err)
+	}
+}
+
 func TestSourceRetentionDoesNotMarkReferencedOrRecentSources(t *testing.T) {
 	database := openMySQLIntegration(t)
 	prepareExternalJobDatabase(t, database)
@@ -196,6 +330,103 @@ func TestSourceRetentionLeasePreventsConcurrentTokenOverwrite(t *testing.T) {
 	}
 }
 
+func TestSourceRetentionClaimSkipsLockedTenantWithoutWaiting(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	tenantID, bundleID := strings.Repeat("4", 26), strings.Repeat("5", 26)
+	insertTenantBundleAndCallback(t, database, tenantID, bundleID, "", 2)
+	repository := newTestMySQLJobRepository(t, database, newMemorySourceStore())
+	submitted, err := repository.Submit(context.Background(), tenantID, "retention-skip-locked", JudgeJobRequest{
+		BundleID: bundleID, Language: "cpp", SourceCode: []byte("int main(){}"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobClaim, err := repository.ClaimNext(context.Background(), "retention-skip-judge", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Complete(context.Background(), jobClaim, DurableJobResult{Verdict: "ACCEPTED", CompileStatus: "SUCCEEDED"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`UPDATE t_external_job SET completed_at = CURRENT_TIMESTAMP(3) - INTERVAL 2 HOUR WHERE id = ?`, jobClaim.Job.InternalID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`UPDATE t_external_idempotency SET expires_at = CURRENT_TIMESTAMP(3) - INTERVAL 1 SECOND WHERE resource_external_id = ?`, submitted.Job.ExternalID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.ExpireIdempotencyBatch(context.Background(), 1000); err != nil {
+		t.Fatal(err)
+	}
+
+	blocking, err := database.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocking.Rollback()
+	var lockedTenant uint64
+	if err := blocking.QueryRow(`SELECT id FROM t_external_tenant WHERE external_id = ? FOR UPDATE`, tenantID).Scan(&lockedTenant); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	started := time.Now()
+	_, err = repository.ClaimSourceRetention(ctx, time.Hour, time.Minute)
+	if elapsed := time.Since(started); !errors.Is(err, ErrSourceRetentionNotAvailable) || elapsed > 500*time.Millisecond {
+		t.Fatalf("locked tenant claim error=%v elapsed=%s", err, elapsed)
+	}
+}
+
+func TestSourceRetentionClaimSkipsLockedOldestCandidateAndClaimsAnotherTenant(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	repository := newTestMySQLJobRepository(t, database, newMemorySourceStore())
+	prepareCandidate := func(tenantID, bundleID, idempotencyKey, workerID string, ageHours int) WorkerJobClaim {
+		t.Helper()
+		insertTenantBundleAndCallback(t, database, tenantID, bundleID, "", 2)
+		submitted, err := repository.Submit(context.Background(), tenantID, idempotencyKey, JudgeJobRequest{
+			BundleID: bundleID, Language: "cpp", SourceCode: []byte("int main(){}"),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		jobClaim, err := repository.ClaimNext(context.Background(), workerID, time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := repository.Complete(context.Background(), jobClaim, DurableJobResult{Verdict: "ACCEPTED", CompileStatus: "SUCCEEDED"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := database.Exec(`UPDATE t_external_job SET completed_at = CURRENT_TIMESTAMP(3) - INTERVAL ? HOUR WHERE id = ?`, ageHours, jobClaim.Job.InternalID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := database.Exec(`DELETE FROM t_external_idempotency WHERE resource_external_id = ?`, submitted.Job.ExternalID); err != nil {
+			t.Fatal(err)
+		}
+		return jobClaim
+	}
+	oldest := prepareCandidate(strings.Repeat("a", 26), strings.Repeat("b", 26), "retention-oldest-locked", "retention-oldest-worker", 3)
+	claimable := prepareCandidate(strings.Repeat("c", 26), strings.Repeat("d", 26), "retention-second-unlocked", "retention-second-worker", 2)
+
+	blocking, err := database.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocking.Rollback()
+	if err := blocking.QueryRow(`SELECT id FROM t_external_tenant WHERE id = ? FOR UPDATE`, oldest.Job.TenantInternalID).Scan(new(uint64)); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	retentionClaim, err := repository.ClaimSourceRetention(ctx, time.Hour, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retentionClaim.JobInternalID != claimable.Job.InternalID {
+		t.Fatalf("claimed job=%d want unlocked candidate=%d", retentionClaim.JobInternalID, claimable.Job.InternalID)
+	}
+}
+
 func TestSourceRetentionExpiresIdempotencyInBoundedBatches(t *testing.T) {
 	database := openMySQLIntegration(t)
 	prepareExternalJobDatabase(t, database)
@@ -222,7 +453,7 @@ func TestSourceRetentionExpiresIdempotencyInBoundedBatches(t *testing.T) {
 	}
 	for index := 0; index < 1000; index++ {
 		digest := sha256.Sum256([]byte(fmt.Sprintf("retention-expired-%04d", index)))
-		if _, err := tx.Exec(`INSERT INTO t_external_idempotency(tenant_id, operation_scope, key_digest, request_hash, resource_type, resource_external_id, response_status, response_json, expires_at) SELECT id, 'retention-test', ?, ?, 'none', ?, 200, JSON_OBJECT(), CURRENT_TIMESTAMP(3) - INTERVAL 1 SECOND FROM t_external_tenant WHERE external_id = ?`, digest[:], digest[:], strings.Repeat("z", 26), tenantID); err != nil {
+		if _, err := tx.Exec(`INSERT INTO t_external_idempotency(tenant_id, operation_scope, key_digest, request_hash, resource_type, resource_external_id, response_status, response_json, expires_at) SELECT id, 'retention-test', ?, ?, 'none', ?, 200, JSON_OBJECT(), CURRENT_TIMESTAMP(3) - INTERVAL 2 SECOND FROM t_external_tenant WHERE external_id = ?`, digest[:], digest[:], strings.Repeat("z", 26), tenantID); err != nil {
 			_ = tx.Rollback()
 			t.Fatal(err)
 		}

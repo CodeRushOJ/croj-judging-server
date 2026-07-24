@@ -19,6 +19,28 @@ type mutableClock struct {
 	now   time.Time
 }
 
+type blockingGetSourceStore struct {
+	SourceObjectStore
+	deadlineObserved chan time.Time
+}
+
+func (store *blockingGetSourceStore) Get(ctx context.Context, _ string, _ int64) ([]byte, error) {
+	deadline, ok := ctx.Deadline()
+	if ok {
+		store.deadlineObserved <- deadline
+	} else {
+		store.deadlineObserved <- time.Time{}
+	}
+	safety := time.NewTimer(750 * time.Millisecond)
+	defer safety.Stop()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-safety.C:
+		return nil, errors.New("source object Get was not bounded")
+	}
+}
+
 func (clock *mutableClock) Now() time.Time {
 	clock.mutex.Lock()
 	defer clock.mutex.Unlock()
@@ -198,6 +220,91 @@ func TestMySQLWorkerDailyExecutionReservationsUseDatabaseDateAndRecover(t *testi
 	}
 }
 
+func TestMySQLWorkerClaimUsesOneAccountingDayForReserveAttemptDeferAndWake(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	tenantID, bundleID := strings.Repeat("4", 26), strings.Repeat("5", 26)
+	insertTenantBundleAndCallback(t, database, tenantID, bundleID, "", 4)
+	if _, err := database.Exec(`UPDATE t_external_tenant
+SET policy_json = JSON_SET(policy_json, '$.maxRunningJobs', 2, '$.dailyExecutionMillis', 1600)
+WHERE external_id = ?`, tenantID); err != nil {
+		t.Fatal(err)
+	}
+	repository := newTestMySQLJobRepository(t, database, newMemorySourceStore())
+	for index := 0; index < 2; index++ {
+		if _, err := repository.Submit(context.Background(), tenantID, fmt.Sprintf("fixed-day-key-%04d", index), JudgeJobRequest{
+			BundleID: bundleID, Language: "cpp", SourceCode: []byte("int main(){}"),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	accountingDay := time.Date(2037, time.December, 31, 0, 0, 0, 0, time.UTC)
+	transactionClock := mysqlTransactionClock{
+		now:           accountingDay.Add(23*time.Hour + 59*time.Minute),
+		accountingDay: accountingDay,
+	}
+	readClockCalls := 0
+	readClock := func(context.Context, *sql.Tx) (mysqlTransactionClock, error) {
+		readClockCalls++
+		return transactionClock, nil
+	}
+	first, retry, err := repository.claimOneWithClock(context.Background(), "fixed-day-worker-a", time.Minute, readClock)
+	if err != nil || retry {
+		t.Fatalf("first claim=%+v retry=%v error=%v", first, retry, err)
+	}
+	if readClockCalls != 1 {
+		t.Fatalf("transaction clock reads=%d want=1", readClockCalls)
+	}
+	readClockCalls = 0
+	if _, retry, err := repository.claimOneWithClock(context.Background(), "fixed-day-worker-b", time.Minute, readClock); err != nil || !retry {
+		t.Fatalf("deferred claim retry=%v error=%v", retry, err)
+	}
+	if readClockCalls != 1 {
+		t.Fatalf("deferred transaction clock reads=%d want=1", readClockCalls)
+	}
+
+	var ledgerDay, attemptDay, deferredUntil time.Time
+	if err := database.QueryRow(`
+SELECT ledger.accounting_day, attempt.accounting_day, queued.next_attempt_at
+FROM t_external_execution_daily AS ledger
+JOIN t_external_job_attempt AS attempt
+  ON attempt.tenant_id = ledger.tenant_id AND attempt.accounting_day = ledger.accounting_day
+JOIN t_external_job AS queued
+  ON queued.tenant_id = ledger.tenant_id AND queued.status = 'QUEUED'
+WHERE ledger.tenant_id = ?`, first.Job.TenantInternalID).Scan(&ledgerDay, &attemptDay, &deferredUntil); err != nil {
+		t.Fatal(err)
+	}
+	if !ledgerDay.Equal(accountingDay) || !attemptDay.Equal(accountingDay) {
+		t.Fatalf("ledger day=%s attempt day=%s want=%s", ledgerDay, attemptDay, accountingDay)
+	}
+	wantDeferredUntil := accountingDay.AddDate(0, 0, 1)
+	if !deferredUntil.Equal(wantDeferredUntil) {
+		t.Fatalf("deferred until=%s want=%s", deferredUntil, wantDeferredUntil)
+	}
+
+	if err := repository.Complete(context.Background(), first, DurableJobResult{
+		Verdict: "ACCEPTED", CompileStatus: "SUCCEEDED", TimeMillis: 400,
+		Cases: []DurableCaseResult{{CaseID: "case-1", Verdict: "ACCEPTED", TimeMillis: 400}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var reserved, consumed int64
+	if err := database.QueryRow(`
+SELECT ledger.accounting_day, ledger.reserved_millis, ledger.consumed_millis, queued.next_attempt_at
+FROM t_external_execution_daily AS ledger
+JOIN t_external_job AS queued ON queued.tenant_id = ledger.tenant_id AND queued.status = 'QUEUED'
+WHERE ledger.tenant_id = ?`, first.Job.TenantInternalID).Scan(&ledgerDay, &reserved, &consumed, &deferredUntil); err != nil {
+		t.Fatal(err)
+	}
+	if !ledgerDay.Equal(accountingDay) || reserved != 0 || consumed != 400 {
+		t.Fatalf("settled ledger day=%s reserved=%d consumed=%d", ledgerDay, reserved, consumed)
+	}
+	if !deferredUntil.Before(wantDeferredUntil) {
+		t.Fatalf("settlement did not wake deferred job: next_attempt_at=%s", deferredUntil)
+	}
+}
+
 func TestMySQLWorkerDailyExecutionSettlementCapsOverflowingCaseSumAtReservation(t *testing.T) {
 	database := openMySQLIntegration(t)
 	prepareExternalJobDatabase(t, database)
@@ -227,6 +334,99 @@ func TestMySQLWorkerDailyExecutionSettlementCapsOverflowingCaseSumAtReservation(
 	}
 	if reserved != 0 || consumed != 1000 {
 		t.Fatalf("overflow-safe settlement reserved=%d consumed=%d", reserved, consumed)
+	}
+}
+
+func TestMySQLWorkerCancellationBillsTrustedCasesWithoutPublishingResultAndIsFenced(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	tenantID, bundleID := strings.Repeat("q", 26), strings.Repeat("r", 26)
+	insertTenantBundleAndCallback(t, database, tenantID, bundleID, "", 2)
+	repository := newTestMySQLJobRepository(t, database, newMemorySourceStore())
+	job, err := repository.Submit(context.Background(), tenantID, "cancel-accounting-cases", JudgeJobRequest{
+		BundleID: bundleID, Language: "cpp", SourceCode: []byte("int main(){}"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := repository.ClaimNext(context.Background(), "cancel-accounting-worker", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.Cancel(context.Background(), tenantID, job.Job.ExternalID); err != nil {
+		t.Fatal(err)
+	}
+	result := DurableJobResult{
+		Verdict: "WRONG_ANSWER", CompileStatus: "SUCCEEDED", TimeMillis: 300,
+		Cases: []DurableCaseResult{
+			{CaseID: "case-1", Verdict: "ACCEPTED", TimeMillis: 120},
+			{CaseID: "case-2", Verdict: "WRONG_ANSWER", TimeMillis: 180},
+		},
+	}
+	if err := repository.Complete(context.Background(), claim, result); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Complete(context.Background(), claim, result); !errors.Is(err, ErrStaleJobClaim) {
+		t.Fatalf("duplicate fenced settlement error=%v", err)
+	}
+	settled, err := repository.Get(context.Background(), tenantID, job.Job.ExternalID)
+	if err != nil || settled.Status != JobStatusCancelled || settled.Result != nil {
+		t.Fatalf("cancelled job=%+v error=%v", settled, err)
+	}
+	assertExecutionAccounting(t, database, 0, 300)
+}
+
+func TestMySQLWorkerCancellationAndCompileErrorWithoutCasesBillFullReservation(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		cancel     bool
+		result     DurableJobResult
+		wantStatus JobStatus
+	}{
+		{name: "cancelled", cancel: true, result: DurableJobResult{Verdict: "ACCEPTED", CompileStatus: "SUCCEEDED"}, wantStatus: JobStatusCancelled},
+		{name: "compile error", result: DurableJobResult{Verdict: "COMPILE_ERROR", CompileStatus: "FAILED"}, wantStatus: JobStatusSucceeded},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			database := openMySQLIntegration(t)
+			prepareExternalJobDatabase(t, database)
+			tenantID, bundleID := strings.Repeat("g", 26), strings.Repeat("h", 26)
+			insertTenantBundleAndCallback(t, database, tenantID, bundleID, "", 2)
+			repository := newTestMySQLJobRepository(t, database, newMemorySourceStore())
+			job, err := repository.Submit(context.Background(), tenantID, "full-reservation-"+strings.ReplaceAll(test.name, " ", "-"), JudgeJobRequest{
+				BundleID: bundleID, Language: "cpp", SourceCode: []byte("int main(){}"),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			claim, err := repository.ClaimNext(context.Background(), "full-reservation-worker", time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.cancel {
+				if _, err := repository.Cancel(context.Background(), tenantID, job.Job.ExternalID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := repository.Complete(context.Background(), claim, test.result); err != nil {
+				t.Fatal(err)
+			}
+			settled, err := repository.Get(context.Background(), tenantID, job.Job.ExternalID)
+			if err != nil || settled.Status != test.wantStatus || (test.cancel && settled.Result != nil) {
+				t.Fatalf("settled job=%+v error=%v", settled, err)
+			}
+			assertExecutionAccounting(t, database, 0, 1000)
+		})
+	}
+}
+
+func assertExecutionAccounting(t *testing.T, database *sql.DB, wantReserved, wantConsumed int64) {
+	t.Helper()
+	var reserved, consumed int64
+	if err := database.QueryRow(`SELECT reserved_millis, consumed_millis FROM t_external_execution_daily`).Scan(&reserved, &consumed); err != nil {
+		t.Fatal(err)
+	}
+	if reserved != wantReserved || consumed != wantConsumed {
+		t.Fatalf("daily ledger reserved=%d consumed=%d, want reserved=%d consumed=%d", reserved, consumed, wantReserved, wantConsumed)
 	}
 }
 
@@ -734,6 +934,46 @@ func TestMySQLWorkerLoadsCanonicalInputOnlyForActiveClaim(t *testing.T) {
 	}
 	if secondInput.Bundle.Manifest.Limits.TimeLimitMillis != 2750 || secondInput.Bundle.Manifest.Limits.MemoryLimitMiB != 640 || !secondInput.StopOnFailure {
 		t.Fatalf("second bundle canonical input = %+v", secondInput)
+	}
+}
+
+func TestMySQLWorkerBoundsSourceObjectGetWithRepositoryTimeout(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	tenantID, bundleID := strings.Repeat("k", 26), strings.Repeat("m", 26)
+	insertTenantBundleAndCallback(t, database, tenantID, bundleID, "", 2)
+	store := newMemorySourceStore()
+	repository := newTestMySQLJobRepository(t, database, store)
+	if _, err := repository.Submit(context.Background(), tenantID, "bounded-source-get", JudgeJobRequest{
+		BundleID: bundleID, Language: "go126", SourceCode: []byte("package main"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := repository.ClaimNext(context.Background(), "bounded-get-worker", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadlineObserved := make(chan time.Time, 1)
+	repository.sourceObjects = &blockingGetSourceStore{
+		SourceObjectStore: store,
+		deadlineObserved:  deadlineObserved,
+	}
+	repository.sourceObjectOperationTimeout = 50 * time.Millisecond
+
+	started := time.Now()
+	if _, err := repository.LoadClaimInput(context.Background(), claim); !errors.Is(err, ErrSourceEncryption) {
+		t.Fatalf("load error=%v want source encryption failure", err)
+	}
+	elapsed := time.Since(started)
+	deadline := <-deadlineObserved
+	if deadline.IsZero() {
+		t.Fatal("source object Get context had no deadline")
+	}
+	if elapsed > 250*time.Millisecond {
+		t.Fatalf("source object Get was not bounded promptly: %s", elapsed)
+	}
+	if remaining := deadline.Sub(started); remaining <= 0 || remaining > 200*time.Millisecond {
+		t.Fatalf("source object Get deadline=%s after start, want repository timeout", remaining)
 	}
 }
 
