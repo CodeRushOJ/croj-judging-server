@@ -50,11 +50,17 @@ flowchart LR
 
 对象必须是确定性 ZIP，必须包含根目录 `manifest.json`。ZIP 全文件 SHA-256、压缩大小和 `manifest.json` 规范结构必须分别与 `t_test_bundle.sha256`、`size_bytes`、`manifest_json` 一致；任何一项不一致都返回 `SYSTEM_ERROR`，不会选择其中一份覆盖另一份。
 
+`internal/bundle/testdata/backend-v1` 只提供 Judging 仓内的最小回归 fixture。真正的跨仓门禁通过 `CROJ_BACKEND_TEST_BUNDLE_V1` 接收 Backend 正式导入代码刚生成的绝对路径 ZIP，并直接检查、打开和读取同一个文件；CI 不会用两份手写 fixture 相同来推断兼容。
+
 ```json
 {
   "schemaVersion": 1,
   "judgeMode": "ACM",
   "checker": "exact",
+  "limits": {
+    "timeLimitMillis": 1000,
+    "memoryLimitMiB": 64
+  },
   "cases": [
     {"id": "case-01", "input": "cases/01.in", "output": "cases/01.out", "weight": 1}
   ]

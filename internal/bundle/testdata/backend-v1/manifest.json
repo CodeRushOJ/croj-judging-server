@@ -1,0 +1,1 @@
+{"schemaVersion":1,"judgeMode":"ACM","checker":"exact","limits":{"timeLimitMillis":1000,"memoryLimitMiB":64},"cases":[{"id":"1","input":"cases/1.in","output":"cases/1.out","weight":1}]}

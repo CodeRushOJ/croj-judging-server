@@ -94,8 +94,16 @@ func (pipeline *BatchBundlePipeline) ExecuteArtifact(
 	executionConfig ExecutionConfig,
 	artifact CaseArtifact,
 ) (callback.Result, error) {
-	if submission == nil || artifact == nil || executionConfig.TimeLimitMillis <= 0 || executionConfig.MemoryLimitMB <= 0 {
-		return callback.Result{}, fmt.Errorf("submission, immutable execution config, and test artifact are required")
+	if submission == nil || artifact == nil {
+		return callback.Result{}, fmt.Errorf("submission and test artifact are required")
+	}
+	if executionConfig.TimeLimitMillis <= 0 || executionConfig.MemoryLimitMB <= 0 {
+		return systemErrorResult("immutable execution limits must be positive"), nil
+	}
+	manifestLimits := artifact.Manifest().Limits
+	if manifestLimits.TimeLimitMillis != executionConfig.TimeLimitMillis ||
+		manifestLimits.MemoryLimitMiB != executionConfig.MemoryLimitMB {
+		return systemErrorResult("immutable execution limits disagree with test bundle manifest"), nil
 	}
 	result, err := pipeline.ExecuteCanonical(ctx, CanonicalExecutionRequest{
 		Language: submission.Language, SourceCode: submission.Code, StopOnFailure: true,

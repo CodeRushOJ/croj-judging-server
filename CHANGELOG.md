@@ -6,6 +6,7 @@
 
 ### Added
 
+- 增加 Backend→Judging TestBundle v1 producer-to-consumer 测试入口；跨仓 CI 可把 Backend 正式导入代码生成的原始 ZIP 直接交给 Judging，锁定 limits、checker、字符串 case ID、内嵌 manifest 与隐藏用例读取契约。
 - 外部 REST 拒绝重复或合并的 `Authorization`，任务提交严格要求 `application/json`，并使用独立 2 分钟读取截止时间与有界并发槽防止认证后 Slowloris；bundle 长上传窗口保持隔离。
 - 所有可重试 bundle `503` 与 OpenAPI 一致返回 `Retry-After`；canonical `cpp` 能力描述修正为真实 Sandbox C++17，并以五语言 ID/映射契约测试锁定。
 - 增加唯一 canonical language/checker registry；外部 REST 在持久化前拒绝不受 Sandbox 支持的 ID，capabilities、OpenAPI、bundle 与 compile-once gRPC 使用一致标识。
