@@ -34,7 +34,7 @@ flowchart LR
 
 发现器只读取带 `kubernetes.io/service-name=croj-sandbox` 标签的 EndpointSlice，只保留 `Ready=true` 且非 `Terminating` 的 TCP 地址。Kubernetes API 暂时失败时，调度器保留最后一次成功快照；API 成功返回空集合时立即停止分配，避免继续调用已删除 Pod。
 
-每个 endpoint 复用一个 gRPC `ClientConn`；连接缓存同时受最大容量和空闲 TTL 约束。每个 case 的 `Unavailable`、`ResourceExhausted`、`Sandbox Error` 或未知状态会在有界次数内换下一个 Ready endpoint。若全部尝试都是 `Unavailable`/`ResourceExhausted`，服务保留原 gRPC code 并交给 RocketMQ 重试，不会把短暂过载发布成终态 `SYSTEM_ERROR`；sandbox 已返回但内容为空、状态未知或为 `Sandbox Error` 时才按损坏的基础设施响应终结。CE/WA/TLE/MLE/RE/OLE 等选手终态不重试。OLE 在 callback v1 暂映射为 `RUNTIME_ERROR`，正式枚举由 Issue #13 跟进。
+每个 endpoint 复用一个 gRPC `ClientConn`；连接缓存同时受最大容量和空闲 TTL 约束。每个 case 的 `Unavailable`、`ResourceExhausted`、`Sandbox Error` 或未知状态会在有界次数内换下一个 Ready endpoint。若全部尝试都是 `Unavailable`/`ResourceExhausted`，服务保留原 gRPC code 并交给 RocketMQ 重试，不会把短暂过载发布成终态 `SYSTEM_ERROR`；sandbox 已返回但内容为空、状态未知或为 `Sandbox Error` 时才按损坏的基础设施响应终结。CE/WA/TLE/MLE/RE/OLE 等选手终态不重试；OLE 以原生 `OUTPUT_LIMIT_EXCEEDED` callback 与异步 REST verdict 贯穿 Backend 和前端。
 
 消息必须是严格的 `SubmissionRequested` v1 JSON：
 

@@ -111,7 +111,7 @@ func TestMapSandboxStatus(t *testing.T) {
 		"Time Limit Exceeded":   model.StatusTimeLimitExceeded,
 		"Memory Limit Exceeded": model.StatusMemoryLimitExceeded,
 		"Runtime Error":         model.StatusRuntimeError,
-		"Output Limit Exceeded": model.StatusSystemError,
+		"Output Limit Exceeded": model.StatusOutputLimitExceeded,
 		"Sandbox Error":         model.StatusSystemError,
 		"Unknown":               model.StatusSystemError,
 	}

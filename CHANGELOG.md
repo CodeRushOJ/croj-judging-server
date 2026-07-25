@@ -7,6 +7,7 @@
 ### Added
 
 - 增加 legacy RocketMQ consumer 启动监督：NameServer 尚未传播 topic route 时丢弃不可复用的 client、重建 consumer 并持续重试；瞬时 bootstrap 竞争不再取消异步 REST listener 或触发 Pod CrashLoop。
+- 增加原生 `OUTPUT_LIMIT_EXCEEDED` callback、durable REST 与 legacy 状态映射，不再把输出超限伪装成运行错误。
 - 增加 immutable bundle manifest v2：`ACM`/`OI`、exact/token/special checker、正权重总分不变量与 v1 永久兼容。
 - 增加隔离特殊判题 ABI：checker 源码由 bundle 路径与 SHA-256 固定，通过第二个 `ExecuteBatchV1` 编译一次并逐 case 判定，任何畸形输出或 checker 故障 fail closed。
 - 增加 OI 全 case 确定性计分，以及内部 callback、外部异步 REST、持久 job/webhook 的可选总分/分项分数契约。
@@ -82,7 +83,6 @@
 - HTTP callback 禁止自动跟随重定向，避免服务 token 被 3xx 转发至非预期地址。
 - callback 文本按后端 Java UTF-16 code unit 边界截断和校验，非 BMP 字符不会导致合法 Go 载荷被后端永久拒绝。
 - 判题从单次空 stdin 兼容请求切换为 problem-version 固定的隐藏测试包；缺失、损坏、SPJ/OI 均明确发布 `SYSTEM_ERROR`。
-- `Output Limit Exceeded` 在 callback v1 暂映射为 `RUNTIME_ERROR` 且不重试，等待 Issue #13 的正式枚举。
 - 全部 endpoint 均返回 `Unavailable`/`ResourceExhausted` 时保留 gRPC 状态交由 RocketMQ 重试，不再错误发布终态 `SYSTEM_ERROR`。
 - 隐藏包判题不再透传 sandbox 的自由文本编译诊断，防止异常 sandbox 通过 callback 回显源码或 hidden input/output。
 - 隐藏包从逐 case unary RPC 切换为版本化 batch RPC；短暂过载/断连只重试完整 batch，选手终态不重试。

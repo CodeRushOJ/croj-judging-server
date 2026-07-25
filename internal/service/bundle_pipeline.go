@@ -147,9 +147,6 @@ func isKnownContestantStatus(value string) bool {
 }
 
 func mapBundleStatus(value string) callback.Status {
-	if value == "Output Limit Exceeded" {
-		return callback.StatusRuntimeError
-	}
 	return mapCallbackStatus(value)
 }
 

@@ -200,6 +200,15 @@ func TestValidateResultAllowsCombinedContestantAndSpecialJudgeTime(t *testing.T)
 	}
 }
 
+func TestValidateResultAcceptsOutputLimitExceeded(t *testing.T) {
+	result := validResult()
+	result.Status = StatusOutputLimitExceeded
+	result.ExitCode = 137
+	if err := validateResult(result); err != nil {
+		t.Fatalf("OUTPUT_LIMIT_EXCEEDED rejected: %v", err)
+	}
+}
+
 func validResult() Result {
 	return Result{
 		ResultID:       "50f75fdf-fdea-473f-a156-bf1ed60acf58",

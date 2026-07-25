@@ -22,6 +22,7 @@ const (
 	StatusTimeLimitExceeded   Status = "TIME_LIMIT_EXCEEDED"
 	StatusMemoryLimitExceeded Status = "MEMORY_LIMIT_EXCEEDED"
 	StatusRuntimeError        Status = "RUNTIME_ERROR"
+	StatusOutputLimitExceeded Status = "OUTPUT_LIMIT_EXCEEDED"
 	StatusSystemError         Status = "SYSTEM_ERROR"
 )
 
@@ -177,7 +178,7 @@ func validateResult(result Result) error {
 	}
 	switch result.Status {
 	case StatusAccepted, StatusCompileError, StatusWrongAnswer, StatusTimeLimitExceeded,
-		StatusMemoryLimitExceeded, StatusRuntimeError, StatusSystemError:
+		StatusMemoryLimitExceeded, StatusRuntimeError, StatusOutputLimitExceeded, StatusSystemError:
 	default:
 		return fmt.Errorf("unsupported judge result status %q", result.Status)
 	}

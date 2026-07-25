@@ -14,6 +14,7 @@ const (
 	StatusMemoryLimitExceeded SubmissionStatus = 5 // 内存超限
 	StatusRuntimeError        SubmissionStatus = 6 // 运行错误
 	StatusSystemError         SubmissionStatus = 7 // 系统错误
+	StatusOutputLimitExceeded SubmissionStatus = 8 // 输出超限
 	// 可以根据需要添加内部状态，但这需要数据库模式支持或在服务逻辑中处理
 	// StatusJudging          SubmissionStatus = 10 // 判题中 (内部状态)
 	// StatusDispatched       SubmissionStatus = 11 // 已分发 (内部状态)

@@ -326,7 +326,7 @@ func durableVerdict(status callback.Status) bool {
 	switch status {
 	case callback.StatusAccepted, callback.StatusWrongAnswer, callback.StatusCompileError,
 		callback.StatusTimeLimitExceeded, callback.StatusMemoryLimitExceeded,
-		callback.StatusRuntimeError:
+		callback.StatusRuntimeError, callback.StatusOutputLimitExceeded:
 		return true
 	default:
 		return false

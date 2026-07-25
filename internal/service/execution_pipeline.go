@@ -103,6 +103,8 @@ func mapCallbackStatus(status string) callback.Status {
 		return callback.StatusMemoryLimitExceeded
 	case "Runtime Error":
 		return callback.StatusRuntimeError
+	case "Output Limit Exceeded":
+		return callback.StatusOutputLimitExceeded
 	default:
 		return callback.StatusSystemError
 	}
@@ -122,6 +124,8 @@ func MapSandboxStatus(status string) model.SubmissionStatus {
 		return model.StatusMemoryLimitExceeded
 	case "Runtime Error":
 		return model.StatusRuntimeError
+	case "Output Limit Exceeded":
+		return model.StatusOutputLimitExceeded
 	default:
 		return model.StatusSystemError
 	}

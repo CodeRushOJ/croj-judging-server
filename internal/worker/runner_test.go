@@ -52,6 +52,12 @@ func TestDurableResultRejectsInfrastructureSystemError(t *testing.T) {
 	}
 }
 
+func TestDurableVerdictAcceptsOutputLimitExceeded(t *testing.T) {
+	if !durableVerdict(callback.StatusOutputLimitExceeded) {
+		t.Fatal("OUTPUT_LIMIT_EXCEEDED must be a durable contestant verdict")
+	}
+}
+
 func TestRunnerPropagatesCancellationToCanonicalCoreAndFencedCompletion(t *testing.T) {
 	claim := external.WorkerJobClaim{Job: external.ExternalJobRecord{InternalID: 7}, WorkerID: "worker-a", AttemptNo: 1, LeaseToken: make([]byte, 32), LeaseUntil: time.Now().Add(time.Minute)}
 	repository := &runnerRepository{input: external.WorkerExecutionInput{

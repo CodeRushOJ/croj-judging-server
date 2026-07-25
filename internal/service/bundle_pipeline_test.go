@@ -186,7 +186,7 @@ func TestBundlePipelineStopsAtFirstContestantVerdict(t *testing.T) {
 	}
 }
 
-func TestBundlePipelineMapsOutputLimitToRuntimeErrorWithoutRetry(t *testing.T) {
+func TestBundlePipelinePreservesOutputLimitWithoutRetry(t *testing.T) {
 	artifact := exactArtifact(1)
 	executor := &sequenceExecutor{responses: []*sandboxpb.ExecuteResponse{
 		{Status: "Output Limit Exceeded", TimeUsed: 8, MemoryUsed: 100},
@@ -197,7 +197,7 @@ func TestBundlePipelineMapsOutputLimitToRuntimeErrorWithoutRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Status != callback.StatusRuntimeError || len(executor.requests) != 1 || !strings.Contains(result.Stderr, "Output Limit Exceeded") {
+	if result.Status != callback.StatusOutputLimitExceeded || len(executor.requests) != 1 || !strings.Contains(result.Stderr, "Output Limit Exceeded") {
 		t.Fatalf("result=%+v calls=%d", result, len(executor.requests))
 	}
 }
