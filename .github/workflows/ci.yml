@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
+    tags: ["v*"]
 
 permissions:
   contents: read
@@ -12,6 +13,9 @@ jobs:
   test:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
     services:
       redis:
         image: redis:8.4-alpine@sha256:61ea466e4022f3803b9f019e01f7738aac694f01989aee35a013724921d8e742
@@ -40,12 +44,34 @@ jobs:
         run: go test -race -count=10 -run '^TestClientUsesGRPCRoundRobinAcrossResolvedHeadlessServiceEndpoints$' ./internal/sandbox
       - name: Vet
         run: go vet ./...
+      - name: Scan reachable Go vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
       - name: Build binary
         run: CGO_ENABLED=0 go build -trimpath ./cmd ./cmd/judge-admin
       - name: Build container image
         run: docker build -t coderushoj/judging-server:ci .
       - name: Verify runtime and migration binaries in image
         run: bash scripts/ci/test-image-contract.sh coderushoj/judging-server:ci
+      - name: Generate Trivy SARIF report
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: coderushoj/judging-server:ci
+          format: sarif
+          output: trivy-results.sarif
+          severity: HIGH,CRITICAL
+          exit-code: "0"
+      - name: Upload Trivy SARIF
+        if: ${{ always() && hashFiles('trivy-results.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@7188fc363630916deb702c7fdcf4e481b751f97a # v4
+        with:
+          sarif_file: trivy-results.sarif
+      - name: Fail on HIGH or CRITICAL image vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: coderushoj/judging-server:ci
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: "1"
 
   mysql84-bundle-integration:
     runs-on: ubuntu-24.04
@@ -99,3 +125,82 @@ jobs:
         run: |
           bash scripts/ci/test-webhook-mysql84-contract.sh
           bash scripts/ci/test-webhook-mysql84-contract-self-test.sh
+
+  publish-image:
+    name: Publish attested release image
+    if: ${{ github.ref_type == 'tag' }}
+    needs: [test, mysql84-bundle-integration]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - name: Check out the complete tag history
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - name: Verify annotated SemVer release tag
+        run: |
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          git rev-parse "$GITHUB_REF_NAME^{tag}" >/dev/null
+          test "$(git rev-parse "$GITHUB_REF_NAME^{commit}")" = "$GITHUB_SHA"
+          git fetch --no-tags origin main
+          test "$GITHUB_SHA" = "$(git rev-parse origin/main)"
+      - name: Set up QEMU for cross-architecture builds
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Log in to GHCR
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish immutable multi-architecture image
+        id: push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/coderushoj/croj-judging-server:${{ github.ref_name }}
+            ghcr.io/coderushoj/croj-judging-server:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+      - name: Attest image provenance with GitHub OIDC
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
+        with:
+          subject-name: ghcr.io/coderushoj/croj-judging-server
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+      - name: Record immutable image manifest
+        env:
+          IMAGE_REPOSITORY: ghcr.io/coderushoj/croj-judging-server
+          IMAGE_TAG: ${{ github.ref_name }}
+          IMAGE_REVISION: ${{ github.sha }}
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          test "${IMAGE_DIGEST#sha256:}" != "$IMAGE_DIGEST"
+          jq -n \
+            --arg repository "$IMAGE_REPOSITORY" \
+            --arg tag "$IMAGE_TAG" \
+            --arg revision "$IMAGE_REVISION" \
+            --arg digest "$IMAGE_DIGEST" \
+            --argjson platforms '["linux/amd64","linux/arm64"]' \
+            '{repository:$repository,tag:$tag,revision:$revision,digest:$digest,platforms:$platforms}' \
+            > judging-server-image.json
+      - name: Upload immutable image manifest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: judging-server-image-${{ github.sha }}
+          path: judging-server-image.json
+          if-no-files-found: error

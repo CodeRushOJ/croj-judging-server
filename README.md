@@ -328,7 +328,7 @@ docker stop croj-job-mysql
 docker build -t coderushoj/judging-server:dev .
 ```
 
-镜像使用多阶段构建与 distroless non-root 运行时，不包含编译器、包管理器或 shell。正式镜像由 CI 生成并由 `croj-platform` Helm values 固定 digest。
+镜像使用多阶段构建与 distroless non-root 运行时，不包含编译器、包管理器或 shell。推送指向当前 commit 的 annotated `vX.Y.Z` tag 后，CI 必须先通过 Go、MySQL 8.4 与容器合同，再发布 `linux/amd64`、`linux/arm64` GHCR manifest，并附带 BuildKit SBOM、max provenance、GitHub OIDC keyless provenance 与 `judging-server-image.json` digest 清单；`croj-platform` 只消费该不可变 digest。
 
 ## Kubernetes 权限
 

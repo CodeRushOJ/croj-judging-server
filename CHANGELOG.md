@@ -6,6 +6,7 @@
 
 ### Added
 
+- Annotated SemVer tag 发布双架构 GHCR 镜像、SBOM/max provenance、GitHub OIDC keyless provenance，以及供平台 digest-only 发布使用的镜像 JSON 清单。
 - 增加 legacy RocketMQ consumer 启动监督：NameServer 尚未传播 topic route 时丢弃不可复用的 client、重建 consumer 并持续重试；瞬时 bootstrap 竞争不再取消异步 REST listener 或触发 Pod CrashLoop。
 - 增加原生 `OUTPUT_LIMIT_EXCEEDED` callback、durable REST 与 legacy 状态映射，不再把输出超限伪装成运行错误。
 - 增加 immutable bundle manifest v2：`ACM`/`OI`、exact/token/special checker、正权重总分不变量与 v1 永久兼容。
