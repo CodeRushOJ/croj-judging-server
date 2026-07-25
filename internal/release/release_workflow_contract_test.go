@@ -17,6 +17,7 @@ func TestAnnotatedTagPublishesOidcAttestedMultiArchitectureImage(t *testing.T) {
 		`if: ${{ github.ref_type == 'tag' }}`,
 		`packages: write`,
 		`id-token: write`,
+		`attestations: write`,
 		"Check out the complete tag history\n        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6",
 		`test "$(git rev-parse "$GITHUB_REF_NAME^{commit}")" = "$GITHUB_SHA"`,
 		`git fetch --no-tags origin main`,
