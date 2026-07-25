@@ -6,6 +6,9 @@
 
 ### Added
 
+- 增加 immutable bundle manifest v2：`ACM`/`OI`、exact/token/special checker、正权重总分不变量与 v1 永久兼容。
+- 增加隔离特殊判题 ABI：checker 源码由 bundle 路径与 SHA-256 固定，通过第二个 `ExecuteBatchV1` 编译一次并逐 case 判定，任何畸形输出或 checker 故障 fail closed。
+- 增加 OI 全 case 确定性计分，以及内部 callback、外部异步 REST、持久 job/webhook 的可选总分/分项分数契约。
 - 增加 Backend→Judging TestBundle v1 producer-to-consumer 测试入口；跨仓 CI 可把 Backend 正式导入代码生成的原始 ZIP 直接交给 Judging，锁定 limits、checker、字符串 case ID、内嵌 manifest 与隐藏用例读取契约。
 - 外部 REST 拒绝重复或合并的 `Authorization`，任务提交严格要求 `application/json`，并使用独立 2 分钟读取截止时间与有界并发槽防止认证后 Slowloris；bundle 长上传窗口保持隔离。
 - 所有可重试 bundle `503` 与 OpenAPI 一致返回 `Retry-After`；canonical `cpp` 能力描述修正为真实 Sandbox C++17，并以五语言 ID/映射契约测试锁定。
@@ -85,6 +88,7 @@
 
 ### Fixed
 
+- 租户自带 special checker 的编译、运行、协议或资源边界故障现在直接终态失败并扣满本 attempt 的选手+checker reservation；平台基础设施故障仍退款重试，daily ledger 与 attempt 审计保持同一 consumed 值。
 - bundle 上传默认 read/write deadline 从不兼容 512 MiB 上限的 30 秒调整为 15/20 分钟；启动时按最低 1 MiB/s、2 分钟 framing 余量和 5 分钟发布响应余量校验，防止对象已提交但客户端收到 EOF 后重试。
 - 正常结束但事件畸形的 batch 流不再换 Endpoint 重编译，只将传输层 `Unavailable`/`ResourceExhausted` 视为可切换容量故障
 - token checker 读取 expected 后只保留规范化 SHA-256，在 sandbox 内恢复首错早停，并在 judging 侧用同一 hash-only 规则复核
@@ -93,8 +97,6 @@
 - 整批 failover 记录已尝试 endpoint，EndpointSlice 更新与并发轮询时也不会在一次逻辑判题中重复选中同一 sandbox
 
 ### Known limitations
-
-- SPJ/OI 尚未支持并返回 `SYSTEM_ERROR`；Issue #12 跟进版本化能力。
 - exact checker 上线依赖 `croj-sandbox#10` 先移除 WA expected/actual 日志，避免 hidden data 泄露。
 - 任务结果缓存是进程级优化，进程重启后的最终幂等由后端 result receipt 保证。
 

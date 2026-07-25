@@ -2,9 +2,9 @@
 
 Go 判题编排服务，负责消费 `submission-topic`、读取提交快照、发现可用沙箱、执行代码并把结果幂等回调给后端。仓库正在从早期 ZooKeeper + 模拟判题原型演进为 Kubernetes 原生的真实判题控制面。
 
-> 当前状态：Kubernetes EndpointSlice 发现、版本化消息、认证幂等结果回调和不可变 ACM 隐藏测试包链路已经接通。上线 exact checker 前必须先合入 [`croj-sandbox#10`](https://github.com/CodeRushOJ/croj-sandbox/issues/10) 的日志脱敏修复，否则旧 sandbox 会把 WA 的 expected/actual 写入 Pod 日志。
+> 当前状态：Kubernetes EndpointSlice 发现、版本化消息、认证幂等结果回调、不可变隐藏测试包、compile-once、OI 计分和隔离 SPJ 链路已经接通。生产环境必须使用已完成日志脱敏与 fail-closed 隔离的当前 `croj-sandbox` 发布版本。
 
-面向外部 OJ 的版本化异步 REST 适配器正在 Draft PR #24 中实施。已有切片包括 RFC 9457 错误、请求 ID、不透明 API Key 的 peppered HMAC 验证与 scope、`GET /api/v1/capabilities`、Judge 自有 MySQL 迁移、租户/密钥预置、不可变 hidden bundle 上传/元数据端点，以及 `POST /api/v1/judge-jobs`、任务列表/详情/取消的脱敏 HTTP 合约和 lease/attempt 状态机。Webhook 已具备精确载荷 HMAC 签名、禁止重定向、状态重试矩阵及 DNS rebinding/私网 SSRF 防护；Redis 原子令牌桶使用服务端时间，在多副本间统一限制任务提交和 bundle 实际上传字节，配额不可用时新写入 fail closed 为 `503`，读取继续可用。MySQL job/outbox repository、delivery worker、key-ring rotation、生产 runtime wiring 和 E2E 门禁已经完成。
+面向外部 OJ 的版本化异步 REST 适配器已经内置。它包括 RFC 9457 错误、请求 ID、不透明 API Key 的 peppered HMAC 验证与 scope、`GET /api/v1/capabilities`、Judge 自有 MySQL 迁移、租户/密钥预置、不可变 hidden bundle 上传/元数据端点，以及 `POST /api/v1/judge-jobs`、任务列表/详情/取消的脱敏 HTTP 合约和 lease/attempt 状态机。Webhook 已具备精确载荷 HMAC 签名、禁止重定向、状态重试矩阵及 DNS rebinding/私网 SSRF 防护；Redis 原子令牌桶使用服务端时间，在多副本间统一限制任务提交和 bundle 实际上传字节，配额不可用时新写入 fail closed 为 `503`，读取继续可用。MySQL job/outbox repository、delivery worker、key-ring rotation、生产 runtime wiring 和 E2E 门禁已经完成。
 
 ## 外部 OJ 接入（Draft）
 
@@ -12,7 +12,7 @@ Go 判题编排服务，负责消费 `submission-topic`、读取提交快照、�
 
 此契约仍处于 Draft/beta。外部 listener 默认关闭；只有完成 schema migration、Secret/依赖接线并显式设置 `EXTERNAL_API_ENABLED=true` 才会启动 REST、durable job/outbox worker 与健康检查。未启用时不暴露外部端口。
 
-外部 v1 的语言 ID 与 Sandbox compile-once 协议共用一个注册表：`go`、`cpp`、`python`、`java`、`javascript`；其中 `cpp` 明确对应当前真实 Sandbox 的 C++17 工具链，不宣称 C++20。checker 只使用 bundle manifest 接受的小写 `exact`、`token`。服务会在创建源码对象和 MySQL job 前拒绝其他 ID，客户端不得把显示名称或编译器版本当作 `language`。
+外部 v1 的语言 ID 与 Sandbox compile-once 协议共用一个注册表：`go`、`cpp`、`python`、`java`、`javascript`；其中 `cpp` 明确对应当前真实 Sandbox 的 C++17 工具链，不宣称 C++20。checker 使用 bundle manifest 接受的小写 `exact`、`token`、`special`，judge mode 为 `ACM` 或 `OI`。服务会在创建源码对象和 MySQL job 前拒绝其他 ID，客户端不得把显示名称或编译器版本当作 `language`。
 
 ## 架构
 
@@ -67,7 +67,36 @@ flowchart LR
 }
 ```
 
-仅支持 `ACM` 的 `exact` 与 `token`。SPJ/OI 会明确返回 `SYSTEM_ERROR`，由 Issue #12 跟进。`exact` 与 sandbox 保持相同规则：CRLF/CR 统一为 LF，每行 `TrimSpace` 后再移除整体首尾空白；`token` 在 judging 侧按 Unicode whitespace 分词比较。token expected 在读取时立即规范化为长度前缀 token 序列的 SHA-256，批次结构只保留 digest。sandbox 用同一 hash 在首个 token WA 时早停，judging 收到结果后再对 actual 做同样的 hash-only 复核。一个提交把有序 case 作为单个 `ExecuteBatchV1` 请求发送到同一 sandbox，在一个私有执行生命周期中只编译一次；每个 case 仍启动独立受限进程。首个选手错误早停，最终时间/内存取所有已完成 case 的最大值。
+v1 只支持 `ACM` 的 `exact` 与 `token`，保持永久向后兼容。`exact` 与 sandbox 保持相同规则：CRLF/CR 统一为 LF，每行 `TrimSpace` 后再移除整体首尾空白；`token` 在 judging 侧按 Unicode whitespace 分词比较。token expected 在读取时立即规范化为长度前缀 token 序列的 SHA-256，批次结构只保留 digest。sandbox 用同一 hash 在首个 token WA 时早停，judging 收到结果后再对 actual 做同样的 hash-only 复核。一个提交把有序 case 作为单个 `ExecuteBatchV1` 请求发送到同一 sandbox，在一个私有执行生命周期中只编译一次；每个 case 仍启动独立受限进程。首个选手错误早停，最终时间/内存取所有已完成 case 的最大值。
+
+## 隐藏测试包 v2：OI 与特殊判题
+
+v2 保留 v1 的 `limits` 与有序 `cases`，增加 `OI` 权重及 `special` checker。OI 的 `totalScore` 必须严格等于所有正整数 case weight 之和；判题会执行全部 case，按 manifest 顺序确定性累加，通过全部分数才是 `ACCEPTED`，否则为带部分分数的 `WRONG_ANSWER`。内部 callback、外部 REST 轮询结果与 webhook 都使用可选 `score`/`totalScore`，ACM 响应保持原结构。
+
+特殊判题源码是 ZIP 中被 manifest 引用的 UTF-8 文件，最多 4 MiB，并由小写 SHA-256 固定。内部 OJ 还会要求不可变 problem-version 中的 checker 语言和源码与 bundle 完全一致。checker 通过第二个 `ExecuteBatchV1` 在现有 non-root、cgroup/seccomp、禁网 sandbox 中编译一次；不会在 judging 进程或宿主机直接执行。
+
+```json
+{
+  "schemaVersion": 2,
+  "judgeMode": "OI",
+  "checker": "special",
+  "limits": {"timeLimitMillis": 1000, "memoryLimitMiB": 64},
+  "totalScore": 100,
+  "specialJudge": {
+    "language": "cpp",
+    "source": "checker/main.cpp",
+    "sourceSha256": "<64 lowercase hex characters>",
+    "timeLimitMillis": 2000,
+    "memoryLimitMiB": 128
+  },
+  "cases": [
+    {"id": "case-01", "input": "cases/01.in", "output": "cases/01.out", "weight": 30},
+    {"id": "case-02", "input": "cases/02.in", "output": "cases/02.out", "weight": 70}
+  ]
+}
+```
+
+checker 的 stdin 是单个有界 JSON：`schemaVersion`、`caseId`、`input`、`expectedOutput`、`actualOutput`；stdout 必须是且只能是 `{"schemaVersion":1,"accepted":true|false,"message":"可选"}`。未知字段、尾随 JSON、超限内容、编译或运行失败全部以脱敏的系统故障 fail closed；外部租户自带 checker 的确定性故障不会重试，并扣除本 attempt 完整 reservation，只有平台基础设施故障才退款并按策略重试。checker source、诊断、隐藏输入/答案及选手输出都不会进入 callback、REST、webhook 或日志。
 
 批量流严格校验 case ID/顺序、已知状态、编译事件和最终完成事件。v1 每批最多 256 个 case，protobuf 请求最多 64 MiB；请求按 case 增量校验 wire size，超限会停止读取后续测试数据，并在 RPC 前确定性返回 `SYSTEM_ERROR`。客户端在接收过程中限制最多 `case 数 + 1` 个事件和 64 MiB 累计 protobuf 响应，这可容纳 256 个 case 同时达到默认 stdout/stderr 上限及协议开销，但仍保持硬上限。缺失终结事件或超限时立即取消并丢弃全部部分结果。只有 `Unavailable`/`ResourceExhausted` 会丢弃不完整流并在本次尚未尝试的 Ready Endpoint 上有界重试完整 batch；正常结束但畸形的事件流直接确定性 `SYSTEM_ERROR`，不重新编译。选手终态不重试。sandbox PR 必须先于 judging-server 部署，回滚顺序相反。旧 unary `Execute` 客户端仍保留用于兼容，但隐藏测试主链路不再调用它。
 
@@ -134,6 +163,16 @@ docker run --rm \
   -w /workspace golang:1.26.3 \
   go test -race ./...
 ```
+
+若需要更快的宿主机增量开发，可安装与 CI 主版本一致的工具链：
+
+```bash
+brew install go
+go version
+GOPROXY=https://proxy.golang.org,direct go test ./...
+```
+
+在网络无法稳定访问官方 module proxy 的地区，可只对当前命令使用组织批准的可信镜像，例如 `GOPROXY=https://goproxy.cn,direct`；生产 CI 应使用可审计的固定代理策略。
 
 `internal/integration/judge_sandbox_contract_test.go` 使用一次性的 fake Kubernetes API、真实 TCP gRPC server 和 HTTP callback 验证完整进程内契约：EndpointSlice churn、过载换节点、不可变 ZIP/SHA-256、隐藏 case 执行和 callback 脱敏。测试不要求也不会启动持久集群或服务。
 
@@ -256,7 +295,7 @@ Judge 自有 schema v6 依次提供 job/attempt 256-bit lease token、租户执�
 
 源码先使用 AES-256-GCM 加密，tenant ID、source ID 和 key version 作为 AAD；MySQL 仅保存 digest、长度、nonce、key version 和不可公开的对象引用。明文策略上限为 `64 MiB - 16 bytes`，为 GCM tag 预留空间并与对象传输硬上限一致。对象读写由 `SourceObjectStore` 抽象提供；MinIO/S3 实现以 `If-None-Match: *` 原子创建，拒绝随机 ID 碰撞覆盖，并按数据库密文长度有界读取。源码 PUT 有独立的 2 分钟应用级 deadline，早于 25 分钟 reservation lease 和 1 小时回收安全窗口，避免失联对象存储请求越过 fencing 后产生永久孤儿。每次上传前先提交带 owner token/lease 的 durable reservation，admission 事务会锁住它并在发布 metadata/job 时原子删除；明确回滚会立即补偿删除，`COMMIT`/对象写入结果不确定时由生产 runtime 中有界运行的 reservation sweeper 在 lease 与安全窗口都过期后对照权威 source metadata 清除孤儿，已引用或仍被 admission 锁住的对象绝不删除。worker 读取源码前会用 job ID、attempt、worker ID、lease token 和未过期 lease 回查 MySQL 的权威元数据，不信任内存 claim 携带的 object key。
 
-worker 按“最久未服务 tenant”领取并使用 `FOR UPDATE SKIP LOCKED`，锁序固定为 tenant → job → daily ledger/attempt；多副本会跳过已锁 tenant，额度不足的 deferral 也推进公平游标，不会同时挤在单一 backlog。每次领取创建单独 attempt，并按 bundle 的 `timeLimitMillis × caseCount` 在 `t_external_execution_daily` 以 MySQL `CURRENT_DATE` 原子预留 `dailyExecutionMillis`；成功或带可信 case 计量的取消按全部已执行 case 耗时的溢出安全总和结算并封顶于 reservation，缺少可信 case 计量的取消/编译失败扣除完整 reservation，避免主动中止绕过日额度；基础设施失败和过期 lease 才释放 reservation，崩溃重领不会重复占额。策略下调后永远无法容纳 reservation 的任务会以 `DAILY_EXECUTION_LIMIT_TOO_LOW` 终态失败。lease 的签发、过期判断和 CAS 均以 MySQL 时钟为准，不受副本系统时钟偏差影响；heartbeat、完成和基础设施失败均以 attempt/worker/lease token 做 CAS。进程重启后只会回收过期 attempt，旧 worker 无法覆盖新结果；已请求取消的过期任务直接恢复为 `CANCELLED`，不会再次执行源码。基础设施失败按 tenant policy 有界重试，耗尽后才进入 `FAILED`。
+worker 按“最久未服务 tenant”领取并使用 `FOR UPDATE SKIP LOCKED`，锁序固定为 tenant → job → daily ledger/attempt；多副本会跳过已锁 tenant，额度不足的 deferral 也推进公平游标，不会同时挤在单一 backlog。每次领取创建单独 attempt，并按 bundle 的每 case `选手 timeLimitMillis + checker timeLimitMillis` 乘 case 数，在 `t_external_execution_daily` 以 MySQL `CURRENT_DATE` 原子预留 `dailyExecutionMillis`；成功或带可信 case 计量的取消按全部已执行 case 耗时的溢出安全总和结算并封顶于 reservation，缺少可信 case 计量的取消/编译失败和租户 checker 确定性故障扣除完整 reservation，避免主动中止绕过日额度；只有平台基础设施失败和过期 lease 释放 reservation，崩溃重领不会重复占额。租户 checker 的编译、运行或协议故障直接以 `TENANT_CHECKER_FAILED` 终态失败，不重复消耗 Sandbox；策略下调后永远无法容纳 reservation 的任务会以 `DAILY_EXECUTION_LIMIT_TOO_LOW` 终态失败。lease 的签发、过期判断和 CAS 均以 MySQL 时钟为准，不受副本系统时钟偏差影响；heartbeat、完成和基础设施失败均以 attempt/worker/lease token 做 CAS。进程重启后只会回收过期 attempt，旧 worker 无法覆盖新结果；已请求取消的过期任务直接恢复为 `CANCELLED`，不会再次执行源码。可重试的平台基础设施失败按 tenant policy 有界重试，耗尽后才进入 `FAILED`。
 
 外部 REST 与 durable worker 已接入同一个 compile-once `BatchBundlePipeline`，不会维护第二套判题实现。immutable bundle manifest 的 `limits.timeLimitMillis` / `limits.memoryLimitMiB` 是每题权威值；tenant policy 与 capabilities 只提供租户/平台上限。worker 通过完整 attempt/worker/token/未过期 lease fence 加载源码与 READY bundle，heartbeat、取消和完成仍由 MySQL CAS 最终裁决；旧 lease 不能写入结果。
 
@@ -322,7 +361,7 @@ kubectl auth can-i list endpointslices.discovery.k8s.io \
 - 需求与验收使用 GitHub Issues 管理；Kubernetes 发现见 Issue #2，真实 gRPC Execute 见 Issue #4。
 - Issue #5 交付版本化 RocketMQ payload、稳定 `resultId` 和后端 authenticated/idempotent result callback；判题进程不再直接写 MySQL。
 - Issue #10 交付不可变 ACM hidden bundles；Issue #11 交付 sandbox compile-once batch API，隐藏测试主链路一次提交只编译一次。
-- Issue #12 跟进 SPJ/OI，Issue #13 跟进原生 OLE callback 状态；未支持能力不会伪报 Accepted。
+- Issue #12 交付 manifest v2、隔离 SPJ 与 OI 确定性计分；Issue #13 跟进原生 OLE callback 状态。
 - 变更通过 `codex/*` 分支和 Draft PR 集成，不直接提交到 `main`。
 - 发布遵循 SemVer，并在 GitHub Release 与平台 `CHANGELOG.md` 中记录跨仓库兼容性。
 - 提交前必须通过 `go test -race ./...`、`go vet ./...` 和容器构建。

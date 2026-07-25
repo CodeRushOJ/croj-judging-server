@@ -221,7 +221,11 @@ func (service *BundleService) UploadWithAdmission(ctx context.Context, tenantID,
 	if len(manifest.Cases) > maxExternalBundleCasesV1 {
 		return BundleMetadata{}, false, fmt.Errorf("%w: manifest exceeds %d cases", ErrInvalidBundle, maxExternalBundleCasesV1)
 	}
-	if manifest.Limits.TimeLimitMillis > service.config.MaxTimeLimitMillis || manifest.Limits.MemoryLimitMiB > service.config.MaxMemoryLimitMiB {
+	if !manifestWithinExecutionCeilings(
+		manifest,
+		service.config.MaxTimeLimitMillis,
+		service.config.MaxMemoryLimitMiB,
+	) {
 		return BundleMetadata{}, false, fmt.Errorf("%w: execution limits exceed platform maximum", ErrInvalidBundle)
 	}
 	lookup, err := service.repository.FindBundleUpload(ctx, tenantID, idempotencyDigest)
@@ -289,6 +293,25 @@ func (service *BundleService) UploadWithAdmission(ctx context.Context, tenantID,
 		return BundleMetadata{}, false, err
 	}
 	return result.Metadata, result.Replay, nil
+}
+
+func manifestWithinExecutionCeilings(
+	manifest bundle.Manifest,
+	maxTimeLimitMillis int,
+	maxMemoryLimitMiB int,
+) bool {
+	if maxTimeLimitMillis <= 0 || maxMemoryLimitMiB <= 0 ||
+		manifest.Limits.TimeLimitMillis <= 0 ||
+		manifest.Limits.TimeLimitMillis > maxTimeLimitMillis ||
+		manifest.Limits.MemoryLimitMiB <= 0 ||
+		manifest.Limits.MemoryLimitMiB > maxMemoryLimitMiB {
+		return false
+	}
+	return manifest.SpecialJudge == nil ||
+		manifest.SpecialJudge.TimeLimitMillis > 0 &&
+			manifest.SpecialJudge.TimeLimitMillis <= maxTimeLimitMillis &&
+			manifest.SpecialJudge.MemoryLimitMiB > 0 &&
+			manifest.SpecialJudge.MemoryLimitMiB <= maxMemoryLimitMiB
 }
 
 func (service *BundleService) publishOwnedBundle(ctx context.Context, tenantID string, metadata BundleMetadata, digest [sha256.Size]byte) error {

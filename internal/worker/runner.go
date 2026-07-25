@@ -81,7 +81,7 @@ func (runner *Runner) ExecuteClaim(ctx context.Context, claim external.WorkerJob
 		if errors.Is(controlErr, external.ErrStaleJobClaim) {
 			return nil
 		}
-		return runner.failInfrastructure(ctx, claim, "LEASE_CONTROL_FAILED")
+		return runner.failInfrastructure(ctx, claim, "LEASE_CONTROL_FAILED", false, false)
 	}
 	if executionErr != nil {
 		if errors.Is(executionErr, external.ErrStaleJobClaim) {
@@ -90,7 +90,11 @@ func (runner *Runner) ExecuteClaim(ctx context.Context, claim external.WorkerJob
 		if errors.Is(executionErr, context.Canceled) && ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return runner.failInfrastructure(ctx, claim, failureCode)
+		tenantCheckerFailure := errors.Is(executionErr, service.ErrTenantCheckerFailure)
+		if tenantCheckerFailure {
+			failureCode = "TENANT_CHECKER_FAILED"
+		}
+		return runner.failInfrastructure(ctx, claim, failureCode, tenantCheckerFailure, tenantCheckerFailure)
 	}
 	return runner.complete(ctx, claim, result)
 }
@@ -240,7 +244,7 @@ func (runner *Runner) controlLoop(ctx context.Context, claim external.WorkerJobC
 func (runner *Runner) complete(ctx context.Context, claim external.WorkerJobClaim, result service.CanonicalResult) error {
 	durable, err := durableResult(result)
 	if err != nil {
-		return runner.failInfrastructure(ctx, claim, "INVALID_EXECUTION_RESULT")
+		return runner.failInfrastructure(ctx, claim, "INVALID_EXECUTION_RESULT", false, false)
 	}
 	err = runner.repository.Complete(ctx, claim, durable)
 	if errors.Is(err, external.ErrStaleJobClaim) {
@@ -249,8 +253,17 @@ func (runner *Runner) complete(ctx context.Context, claim external.WorkerJobClai
 	return err
 }
 
-func (runner *Runner) failInfrastructure(ctx context.Context, claim external.WorkerJobClaim, code string) error {
-	_, err := runner.repository.FailInfrastructure(ctx, claim, external.InfrastructureFailure{Code: code, RetryDelay: runner.config.RetryDelay})
+func (runner *Runner) failInfrastructure(
+	ctx context.Context,
+	claim external.WorkerJobClaim,
+	code string,
+	chargeFullReservation bool,
+	permanent bool,
+) error {
+	_, err := runner.repository.FailInfrastructure(ctx, claim, external.InfrastructureFailure{
+		Code: code, RetryDelay: runner.config.RetryDelay,
+		ChargeFullReservation: chargeFullReservation, Permanent: permanent,
+	})
 	if errors.Is(err, external.ErrStaleJobClaim) {
 		return nil
 	}
@@ -261,6 +274,9 @@ func durableResult(result service.CanonicalResult) (external.DurableJobResult, e
 	if !durableVerdict(result.Status) || result.TimeUsedMillis < 0 || result.MemoryUsedKB < 0 || int64(result.MemoryUsedKB) > math.MaxInt64/1024 {
 		return external.DurableJobResult{}, fmt.Errorf("canonical execution result is invalid")
 	}
+	if !validCanonicalScorePair(result.Score, result.TotalScore) {
+		return external.DurableJobResult{}, fmt.Errorf("canonical execution score is invalid")
+	}
 	compileStatus := "SUCCEEDED"
 	if result.Status == callback.StatusCompileError {
 		compileStatus = "FAILED"
@@ -268,18 +284,42 @@ func durableResult(result service.CanonicalResult) (external.DurableJobResult, e
 	durable := external.DurableJobResult{
 		Verdict: string(result.Status), CompileStatus: compileStatus,
 		TimeMillis: int64(result.TimeUsedMillis), MemoryBytes: int64(result.MemoryUsedKB) * 1024,
+		Score: copyResultScore(result.Score), TotalScore: copyResultScore(result.TotalScore),
 		Cases: make([]external.DurableCaseResult, 0, len(result.Cases)),
 	}
 	for _, item := range result.Cases {
 		if item.CaseID == "" || !durableVerdict(item.Status) || item.TimeUsedMillis < 0 || item.MemoryUsedKB < 0 || int64(item.MemoryUsedKB) > math.MaxInt64/1024 {
 			return external.DurableJobResult{}, fmt.Errorf("canonical case result is invalid")
 		}
+		if !validCanonicalScorePair(item.Score, item.MaxScore) {
+			return external.DurableJobResult{}, fmt.Errorf("canonical case score is invalid")
+		}
 		durable.Cases = append(durable.Cases, external.DurableCaseResult{
 			CaseID: item.CaseID, Verdict: string(item.Status),
 			TimeMillis: int64(item.TimeUsedMillis), MemoryBytes: int64(item.MemoryUsedKB) * 1024,
+			Score: copyResultScore(item.Score), MaxScore: copyResultScore(item.MaxScore),
 		})
 	}
+	if err := external.ValidateDurableJobResult(durable); err != nil {
+		return external.DurableJobResult{}, fmt.Errorf("canonical execution score invariants are invalid")
+	}
 	return durable, nil
+}
+
+func validCanonicalScorePair(score, maximum *int) bool {
+	if (score == nil) != (maximum == nil) {
+		return false
+	}
+	return score == nil || *maximum > 0 && *maximum <= 1_000_000_000 &&
+		*score >= 0 && *score <= *maximum
+}
+
+func copyResultScore(value *int) *int {
+	if value == nil {
+		return nil
+	}
+	copied := *value
+	return &copied
 }
 
 func durableVerdict(status callback.Status) bool {

@@ -44,6 +44,28 @@ func TestOpenAPIContractLoadsAndValidates(t *testing.T) {
 	}
 }
 
+func TestOpenAPIScoreAndManifestBoundsMatchRuntimeContract(t *testing.T) {
+	loadOpenAPIContract(t)
+	for _, field := range []struct {
+		schema   string
+		property string
+		maximum  int64
+	}{
+		{"BundleMetadata", "manifestVersion", 2},
+		{"CaseResultView", "score", 1_000_000_000},
+		{"CaseResultView", "maxScore", 1_000_000_000},
+		{"JobResultView", "score", 1_000_000_000},
+		{"JobResultView", "totalScore", 1_000_000_000},
+	} {
+		if got := openAPIIntegerScalar(
+			t,
+			"components", "schemas", field.schema, "properties", field.property, "maximum",
+		); got != field.maximum {
+			t.Errorf("%s.%s maximum = %d, want %d", field.schema, field.property, got, field.maximum)
+		}
+	}
+}
+
 func TestOpenAPILanguageAndCheckerEnumsExactlyMatchCanonicalV1Registry(t *testing.T) {
 	document := loadOpenAPIContract(t)
 	submit := document.Components.Schemas["SubmitJobRequest"].Value
@@ -61,6 +83,9 @@ func TestOpenAPILanguageAndCheckerEnumsExactlyMatchCanonicalV1Registry(t *testin
 	}
 
 	capabilities := document.Components.Schemas["Capabilities"].Value
+	if got := stringEnumValues(t, capabilities.Properties["judgeModes"].Value.Items.Value.Enum); !reflect.DeepEqual(got, []string{"ACM", "OI"}) {
+		t.Fatalf("Capabilities.judgeModes enum = %v, want [ACM OI]", got)
+	}
 	gotCheckers := stringEnumValues(t, capabilities.Properties["checkers"].Value.Items.Value.Enum)
 	wantCheckers := make([]string, 0, len(judgecontract.CanonicalCheckers()))
 	for _, checker := range judgecontract.CanonicalCheckers() {

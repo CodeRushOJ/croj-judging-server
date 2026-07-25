@@ -57,6 +57,7 @@ func (repository *durableJobRepositoryStub) Cancel(_ context.Context, tenantID, 
 
 func TestMySQLJobServiceMapsCommandsAndRedactsRepositoryInternals(t *testing.T) {
 	now := time.Date(2026, 7, 19, 14, 0, 0, 0, time.UTC)
+	score, total, caseScore, caseMaximum := 100, 100, 100, 100
 	record := external.ExternalJobRecord{
 		InternalID: 99, ExternalID: "aaaaaaaaaaaaaaaaaaaaaaaaaa",
 		TenantExternalID: "bbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -69,7 +70,8 @@ func TestMySQLJobServiceMapsCommandsAndRedactsRepositoryInternals(t *testing.T) 
 		WorkerID: "private-worker", CreatedAt: now,
 		Result: &external.DurableJobResult{
 			Verdict: "ACCEPTED", CompileStatus: "SUCCEEDED", TimeMillis: 7, MemoryBytes: 1024,
-			Cases: []external.DurableCaseResult{{CaseID: "case-1", Verdict: "ACCEPTED", TimeMillis: 7, MemoryBytes: 1024}},
+			Score: &score, TotalScore: &total,
+			Cases: []external.DurableCaseResult{{CaseID: "case-1", Verdict: "ACCEPTED", TimeMillis: 7, MemoryBytes: 1024, Score: &caseScore, MaxScore: &caseMaximum}},
 		},
 	}
 	repository := &durableJobRepositoryStub{submitResult: external.SubmitJobResult{Job: record, Replayed: true}}
@@ -86,6 +88,11 @@ func TestMySQLJobServiceMapsCommandsAndRedactsRepositoryInternals(t *testing.T) 
 	}
 	if !replayed || view.JobID != record.ExternalID || view.Status != JobSucceeded || view.Result == nil || view.Result.Verdict != "ACCEPTED" {
 		t.Fatalf("view = %+v replayed=%v", view, replayed)
+	}
+	if view.Result.Score == nil || *view.Result.Score != 100 || view.Result.TotalScore == nil ||
+		*view.Result.TotalScore != 100 || view.Result.Cases[0].Score == nil ||
+		*view.Result.Cases[0].Score != 100 {
+		t.Fatalf("score view = %+v", view.Result)
 	}
 	if repository.request.BundleID != record.BundleExternalID || string(repository.request.SourceCode) != "int main(){}" || repository.request.CallbackID == "" {
 		t.Fatalf("repository request = %+v", repository.request)

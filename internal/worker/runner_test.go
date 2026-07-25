@@ -16,11 +16,13 @@ import (
 )
 
 func TestDurableResultPreservesCanonicalVerdictCasesAndUnits(t *testing.T) {
+	score, total, firstScore, firstMax, secondScore, secondMax := 30, 100, 30, 30, 0, 70
 	result, err := durableResult(service.CanonicalResult{
 		Status: callback.StatusWrongAnswer, TimeUsedMillis: 17, MemoryUsedKB: 2048,
+		Score: &score, TotalScore: &total,
 		Cases: []service.CanonicalCaseResult{
-			{CaseID: "case-1", Status: callback.StatusAccepted, TimeUsedMillis: 11, MemoryUsedKB: 1024},
-			{CaseID: "case-2", Status: callback.StatusWrongAnswer, TimeUsedMillis: 17, MemoryUsedKB: 2048},
+			{CaseID: "case-1", Status: callback.StatusAccepted, TimeUsedMillis: 11, MemoryUsedKB: 1024, Score: &firstScore, MaxScore: &firstMax},
+			{CaseID: "case-2", Status: callback.StatusWrongAnswer, TimeUsedMillis: 17, MemoryUsedKB: 2048, Score: &secondScore, MaxScore: &secondMax},
 		},
 	})
 	if err != nil {
@@ -31,6 +33,11 @@ func TestDurableResultPreservesCanonicalVerdictCasesAndUnits(t *testing.T) {
 	}
 	if result.Cases[0].Verdict != "ACCEPTED" || result.Cases[0].MemoryBytes != 1024*1024 || result.Cases[1].CaseID != "case-2" {
 		t.Fatalf("durable cases = %+v", result.Cases)
+	}
+	if result.Score == nil || *result.Score != 30 || result.TotalScore == nil || *result.TotalScore != 100 ||
+		result.Cases[0].Score == nil || *result.Cases[0].Score != 30 ||
+		result.Cases[1].MaxScore == nil || *result.Cases[1].MaxScore != 70 {
+		t.Fatalf("durable score = %+v", result)
 	}
 
 	compile, err := durableResult(service.CanonicalResult{Status: callback.StatusCompileError, CompileError: "redacted"})
@@ -254,20 +261,47 @@ func TestRunnerTreatsInvalidBundleAsInfrastructureFailure(t *testing.T) {
 	}
 }
 
+func TestRunnerChargesTenantSpecialJudgeFailuresToTheAttemptReservation(t *testing.T) {
+	claim := external.WorkerJobClaim{
+		Job: external.ExternalJobRecord{InternalID: 14}, WorkerID: "checker-worker",
+		AttemptNo: 1, LeaseToken: make([]byte, 32), LeaseUntil: time.Now().Add(time.Second),
+	}
+	repository := &runnerRepository{input: external.WorkerExecutionInput{
+		Language: "go126", SourceCode: []byte("package main"),
+		Bundle: external.WorkerBundleInput{ObjectKey: "bundle.zip", SHA256: strings.Repeat("a", 64), SizeBytes: 1},
+	}}
+	runner, err := NewRunner(repository, staticProvider{artifact: &runnerArtifact{}},
+		errorCore{err: fmt.Errorf("%w: checker compile failed", service.ErrTenantCheckerFailure)},
+		Config{LeaseDuration: time.Second, HeartbeatInterval: 20 * time.Millisecond, ControlPollInterval: 10 * time.Millisecond, RetryDelay: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.ExecuteClaim(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	if repository.infrastructureFailures != 1 ||
+		repository.lastInfrastructureFailure.Code != "TENANT_CHECKER_FAILED" ||
+		!repository.lastInfrastructureFailure.ChargeFullReservation ||
+		!repository.lastInfrastructureFailure.Permanent {
+		t.Fatalf("infrastructure failures=%d failure=%+v", repository.infrastructureFailures, repository.lastInfrastructureFailure)
+	}
+}
+
 type runnerRepository struct {
-	input                  external.WorkerExecutionInput
-	cancelled              bool
-	completions            int
-	infrastructureFailures int
-	claim                  *external.WorkerJobClaim
-	completionSignal       chan struct{}
-	heartbeatSignal        chan struct{}
-	controlErr             error
-	controlBlock           bool
-	claimErrors            []error
-	claimCalls             int
-	claimRetried           chan struct{}
-	completeErr            error
+	input                     external.WorkerExecutionInput
+	cancelled                 bool
+	completions               int
+	infrastructureFailures    int
+	lastInfrastructureFailure external.InfrastructureFailure
+	claim                     *external.WorkerJobClaim
+	completionSignal          chan struct{}
+	heartbeatSignal           chan struct{}
+	controlErr                error
+	controlBlock              bool
+	claimErrors               []error
+	claimCalls                int
+	claimRetried              chan struct{}
+	completeErr               error
 }
 
 func (repository *runnerRepository) ClaimNext(context.Context, string, time.Duration) (external.WorkerJobClaim, error) {
@@ -321,8 +355,9 @@ func (repository *runnerRepository) Complete(_ context.Context, _ external.Worke
 	}
 	return nil
 }
-func (repository *runnerRepository) FailInfrastructure(context.Context, external.WorkerJobClaim, external.InfrastructureFailure) (external.FailureDisposition, error) {
+func (repository *runnerRepository) FailInfrastructure(_ context.Context, _ external.WorkerJobClaim, failure external.InfrastructureFailure) (external.FailureDisposition, error) {
 	repository.infrastructureFailures++
+	repository.lastInfrastructureFailure = failure
 	return external.FailureRequeued, nil
 }
 
@@ -373,4 +408,10 @@ type acceptedCore struct{}
 
 func (acceptedCore) ExecuteCanonical(context.Context, service.CanonicalExecutionRequest, service.CaseArtifact) (service.CanonicalResult, error) {
 	return service.CanonicalResult{Status: callback.StatusAccepted}, nil
+}
+
+type errorCore struct{ err error }
+
+func (core errorCore) ExecuteCanonical(context.Context, service.CanonicalExecutionRequest, service.CaseArtifact) (service.CanonicalResult, error) {
+	return service.CanonicalResult{}, core.err
 }

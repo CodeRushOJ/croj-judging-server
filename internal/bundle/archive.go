@@ -3,11 +3,15 @@ package bundle
 import (
 	"archive/zip"
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"reflect"
 	"unicode/utf8"
 )
+
+const maxSpecialJudgeSourceBytes int64 = 4 << 20
 
 type ArchiveLimits struct {
 	MaxFiles            int
@@ -19,7 +23,7 @@ type ArchiveLimits struct {
 
 func DefaultArchiveLimits() ArchiveLimits {
 	return ArchiveLimits{
-		MaxFiles:            20_001,
+		MaxFiles:            20_002,
 		MaxManifestBytes:    1 << 20,
 		MaxCaseBytes:        64 << 20,
 		MaxTotalBytes:       512 << 20,
@@ -69,6 +73,11 @@ func InspectArchive(filename string, limits ArchiveLimits) (Manifest, []byte, er
 			return Manifest{}, nil, fmt.Errorf("validate case %q output: %w", testCase.ID, err)
 		}
 	}
+	if artifact.manifest.SpecialJudge != nil {
+		if err := artifact.validateTextEntry(artifact.manifest.SpecialJudge.Source, maxSpecialJudgeSourceBytes); err != nil {
+			return Manifest{}, nil, fmt.Errorf("validate special judge source: %w", err)
+		}
+	}
 	return artifact.manifest, append([]byte(nil), artifact.manifestJSON...), nil
 }
 
@@ -99,6 +108,21 @@ func (artifact *Artifact) ReadCase(testCase Case) (string, string, error) {
 		return "", "", fmt.Errorf("read case %q output: %w", testCase.ID, err)
 	}
 	return input, output, nil
+}
+
+func (artifact *Artifact) ReadSpecialJudge() (string, error) {
+	if artifact.manifest.SpecialJudge == nil {
+		return "", fmt.Errorf("bundle does not contain a special judge")
+	}
+	source, err := artifact.readText(artifact.manifest.SpecialJudge.Source, maxSpecialJudgeSourceBytes)
+	if err != nil {
+		return "", fmt.Errorf("read special judge source: %w", err)
+	}
+	digest := sha256.Sum256([]byte(source))
+	if hex.EncodeToString(digest[:]) != artifact.manifest.SpecialJudge.SourceSHA256 {
+		return "", fmt.Errorf("special judge source digest mismatch")
+	}
+	return source, nil
 }
 
 func (artifact *Artifact) validate(expected *Manifest) error {
@@ -144,6 +168,9 @@ func (artifact *Artifact) validate(expected *Manifest) error {
 		return fmt.Errorf("artifact manifest.json disagrees with database manifest_json")
 	}
 	referenced := map[string]struct{}{"manifest.json": {}}
+	if actual.SpecialJudge != nil {
+		referenced[actual.SpecialJudge.Source] = struct{}{}
+	}
 	for _, testCase := range actual.Cases {
 		referenced[testCase.Input] = struct{}{}
 		referenced[testCase.Output] = struct{}{}
@@ -158,6 +185,11 @@ func (artifact *Artifact) validate(expected *Manifest) error {
 	}
 	artifact.manifest = actual
 	artifact.manifestJSON = append([]byte(nil), manifestBytes...)
+	if actual.SpecialJudge != nil {
+		if _, err := artifact.ReadSpecialJudge(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

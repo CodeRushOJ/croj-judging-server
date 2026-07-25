@@ -59,13 +59,17 @@ func (executor *sequenceExecutor) Execute(_ context.Context, address string, req
 }
 
 type memoryArtifact struct {
-	manifest bundle.Manifest
-	contents map[string]string
+	manifest      bundle.Manifest
+	contents      map[string]string
+	checkerSource string
 }
 
 func (artifact *memoryArtifact) Manifest() bundle.Manifest { return artifact.manifest }
 func (artifact *memoryArtifact) ReadCase(testCase bundle.Case) (string, string, error) {
 	return artifact.contents[testCase.Input], artifact.contents[testCase.Output], nil
+}
+func (artifact *memoryArtifact) ReadSpecialJudge() (string, error) {
+	return artifact.checkerSource, nil
 }
 func (artifact *memoryArtifact) Close() error { return nil }
 
@@ -278,5 +282,10 @@ func validBundleSubmission() *model.Task {
 	return &model.Task{ID: 99, Language: "go", Code: "package main"}
 }
 func validExecutionConfig() ExecutionConfig {
-	return ExecutionConfig{TimeLimitMillis: 1000, MemoryLimitMB: 64}
+	return ExecutionConfig{
+		TimeLimitMillis: 1000,
+		MemoryLimitMB:   64,
+		JudgeMode:       bundle.JudgeModeACM,
+		Checker:         bundle.CheckerExact,
+	}
 }

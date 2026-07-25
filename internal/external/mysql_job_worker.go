@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"regexp"
 	"strings"
 	"time"
@@ -17,6 +18,25 @@ import (
 )
 
 var infrastructureCodePattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
+
+func maximumManifestExecutionMillis(manifest bundle.Manifest) (int64, bool) {
+	if len(manifest.Cases) == 0 || manifest.Limits.TimeLimitMillis <= 0 {
+		return 0, false
+	}
+	perCase := int64(manifest.Limits.TimeLimitMillis)
+	if manifest.SpecialJudge != nil {
+		checkerMillis := int64(manifest.SpecialJudge.TimeLimitMillis)
+		if checkerMillis <= 0 || perCase > math.MaxInt64-checkerMillis {
+			return 0, false
+		}
+		perCase += checkerMillis
+	}
+	caseCount := int64(len(manifest.Cases))
+	if perCase > math.MaxInt64/caseCount {
+		return 0, false
+	}
+	return perCase * caseCount, true
+}
 
 type dailyReservationDecision uint8
 
@@ -87,7 +107,11 @@ WHERE job.id = ? AND job.status = 'RUNNING' AND job.attempt_no = ? AND job.worke
 	if err != nil {
 		return WorkerExecutionInput{}, repositoryUnavailable("enforce authoritative bundle limits", err)
 	}
-	if manifest.Limits.TimeLimitMillis > policy.MaxTimeLimitMillis || manifest.Limits.MemoryLimitMiB > policy.MaxMemoryLimitMiB {
+	if !manifestWithinExecutionCeilings(
+		manifest,
+		policy.MaxTimeLimitMillis,
+		policy.MaxMemoryLimitMiB,
+	) {
 		return WorkerExecutionInput{}, repositoryUnavailable("enforce authoritative bundle limits", ErrExternalJobInvalid)
 	}
 	if len(bundleDigest) != 32 {
@@ -260,10 +284,10 @@ func (repository *MySQLJobRepository) claimOneWithClock(
 	var status JobStatus
 	var attemptNo uint32
 	var cancelRequested sql.NullTime
-	var reservedExecutionMillis int64
+	var claimManifestJSON []byte
 	err = tx.QueryRowContext(ctx, `
-	SELECT job.id, job.external_id, job.status, job.attempt_no, job.cancel_requested_at,
-	       COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(bundle.manifest_json, '$.limits.timeLimitMillis')) AS UNSIGNED) * bundle.case_count, ?)
+	SELECT job.id, job.external_id, job.status, job.attempt_no,
+	       job.cancel_requested_at, bundle.manifest_json
 	FROM t_external_job AS job FORCE INDEX (idx_external_job_claim)
 	JOIN t_external_bundle AS bundle ON bundle.id = job.bundle_id AND bundle.tenant_id = job.tenant_id
 	WHERE job.tenant_id = ? AND (
@@ -271,13 +295,32 @@ func (repository *MySQLJobRepository) claimOneWithClock(
 	    (job.status = 'RUNNING' AND job.lease_until <= ?)
 	)
 	ORDER BY (job.status = 'RUNNING') DESC, job.next_attempt_at, job.created_at, job.id
-	LIMIT 1 FOR UPDATE SKIP LOCKED`, policy.MaxTimeLimitMillis, candidateTenantID, tenantStatus, leaseNow, leaseNow).
-		Scan(&jobInternalID, &jobExternalID, &status, &attemptNo, &cancelRequested, &reservedExecutionMillis)
+	LIMIT 1 FOR UPDATE SKIP LOCKED`, candidateTenantID, tenantStatus, leaseNow, leaseNow).
+		Scan(&jobInternalID, &jobExternalID, &status, &attemptNo, &cancelRequested, &claimManifestJSON)
 	if errors.Is(err, sql.ErrNoRows) {
 		return WorkerJobClaim{}, true, ErrJobNotClaimable
 	}
 	if err != nil {
 		return WorkerJobClaim{}, false, repositoryUnavailable("lock claimable job", err)
+	}
+	claimManifest, err := bundle.ParseManifest(claimManifestJSON)
+	if err != nil || tenantStatus == "ACTIVE" &&
+		!manifestWithinExecutionCeilings(
+			claimManifest,
+			policy.MaxTimeLimitMillis,
+			policy.MaxMemoryLimitMiB,
+		) {
+		return WorkerJobClaim{}, false, repositoryUnavailable(
+			"validate claim bundle execution limits",
+			ErrExternalJobInvalid,
+		)
+	}
+	reservedExecutionMillis, ok := maximumManifestExecutionMillis(claimManifest)
+	if !ok {
+		return WorkerJobClaim{}, false, repositoryUnavailable(
+			"calculate claim execution reservation",
+			ErrExternalJobInvalid,
+		)
 	}
 
 	if status == JobStatusRunning {
@@ -697,7 +740,7 @@ func (repository *MySQLJobRepository) FailInfrastructure(
 		jobStatus = JobStatusCancelled
 		failureCode = nil
 		attemptFailureCode = ""
-	} else if int(claim.AttemptNo) < policy.MaxInfrastructureTries {
+	} else if !failure.Permanent && int(claim.AttemptNo) < policy.MaxInfrastructureTries {
 		disposition = FailureRequeued
 		jobStatus = JobStatusQueued
 		failureCode = nil
@@ -717,14 +760,22 @@ WHERE id = ? AND status = 'RUNNING' AND attempt_no = ? AND worker_id = ? AND lea
 	if affected, err := jobResult.RowsAffected(); err != nil || affected != 1 {
 		return "", ErrStaleJobClaim
 	}
-	if _, err := settleAttemptReservation(ctx, tx, claim, now, nil, false); err != nil {
+	consumedMillis, err := settleAttemptReservation(
+		ctx,
+		tx,
+		claim,
+		now,
+		nil,
+		failure.ChargeFullReservation,
+	)
+	if err != nil {
 		return "", err
 	}
 	attemptStatus := "FAILED"
 	if cancelled {
 		attemptStatus = "CANCELLED"
 	}
-	if err := finishAttempt(ctx, tx, claim, attemptStatus, attemptFailureCode, 0, now); err != nil {
+	if err := finishAttempt(ctx, tx, claim, attemptStatus, attemptFailureCode, consumedMillis, now); err != nil {
 		return "", err
 	}
 	if disposition != FailureRequeued {

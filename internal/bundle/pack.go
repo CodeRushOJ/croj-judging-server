@@ -25,10 +25,17 @@ func WriteDeterministicArchive(destination io.Writer, manifest Manifest, files m
 	if err != nil {
 		return nil, fmt.Errorf("encode canonical manifest: %w", err)
 	}
-	referenced := make(map[string]struct{}, len(manifest.Cases)*2)
+	referencedCount := len(manifest.Cases) * 2
+	if manifest.SpecialJudge != nil {
+		referencedCount++
+	}
+	referenced := make(map[string]struct{}, referencedCount)
 	for _, testCase := range manifest.Cases {
 		referenced[testCase.Input] = struct{}{}
 		referenced[testCase.Output] = struct{}{}
+	}
+	if manifest.SpecialJudge != nil {
+		referenced[manifest.SpecialJudge.Source] = struct{}{}
 	}
 	if len(files) != len(referenced) {
 		return nil, fmt.Errorf("archive files do not exactly match manifest cases")

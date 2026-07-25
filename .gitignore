@@ -21,5 +21,8 @@
 go.work
 go.work.sum
 
+# Repository-local tool caches used by sandboxed CI/development commands
+.cache/
+
 # env file
 .env

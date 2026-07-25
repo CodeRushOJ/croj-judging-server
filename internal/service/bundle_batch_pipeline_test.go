@@ -3,6 +3,8 @@ package service
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -78,6 +80,39 @@ func TestBatchBundlePipelineReturnsSystemErrorWhenImmutableLimitsDisagree(t *tes
 				t.Fatalf("case reads=%d sandbox calls=%d, want immutable-boundary rejection", artifact.reads, len(executor.requests))
 			}
 		})
+	}
+}
+
+func TestBatchBundlePipelineRejectsImmutableCheckerMismatchBeforeReadingCases(t *testing.T) {
+	artifact := &countingArtifact{memoryArtifact: exactArtifact(1)}
+	executor := &batchExecutorStub{}
+	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a"}}, executor, 1)
+	config := validExecutionConfig()
+	config.Checker = bundle.CheckerToken
+	config.CheckerPinned = true
+
+	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), config, artifact)
+
+	if err != nil || result.Status != callback.StatusSystemError || artifact.reads != 0 || len(executor.requests) != 0 {
+		t.Fatalf("result=%+v error=%v reads=%d calls=%d", result, err, artifact.reads, len(executor.requests))
+	}
+}
+
+func TestBatchBundlePipelineAllowsLegacyUnpinnedTokenChecker(t *testing.T) {
+	artifact := exactArtifact(1)
+	artifact.manifest.Checker = bundle.CheckerToken
+	executor := &batchExecutorStub{events: []*sandboxpb.ExecuteBatchV1Event{
+		{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT, CaseId: "case-1", Result: &sandboxpb.ExecuteResponse{Status: "Accepted", Stdout: "one\n"}},
+		{Kind: sandboxpb.ExecuteBatchV1Event_COMPLETED},
+	}}
+	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a"}}, executor, 1)
+	config := validExecutionConfig()
+	config.CheckerPinned = false
+
+	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), config, artifact)
+
+	if err != nil || result.Status != callback.StatusAccepted || len(executor.requests) != 1 {
+		t.Fatalf("result=%+v error=%v calls=%d", result, err, len(executor.requests))
 	}
 }
 
@@ -392,4 +427,202 @@ func TestBatchBundlePipelineStopsTokenBatchAtFirstMismatch(t *testing.T) {
 	if result.Status != callback.StatusWrongAnswer || executor.requests[0].Cases[0].TokenExpectedSha256 == "" || executor.requests[0].Cases[0].ExpectedOutput != "" {
 		t.Fatalf("result=%+v request=%+v, want hash-only first-case comparison", result, executor.requests[0])
 	}
+}
+
+func TestBatchBundlePipelineScoresEveryOICaseDeterministically(t *testing.T) {
+	total := 100
+	artifact := exactArtifact(2)
+	artifact.manifest.SchemaVersion = 2
+	artifact.manifest.JudgeMode = bundle.JudgeModeOI
+	artifact.manifest.TotalScore = &total
+	artifact.manifest.Cases[0].Weight = 30
+	artifact.manifest.Cases[1].Weight = 70
+	executor := &batchExecutorStub{events: []*sandboxpb.ExecuteBatchV1Event{
+		{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT, CaseId: "case-1", Result: &sandboxpb.ExecuteResponse{Status: "Wrong Answer", TimeUsed: 8, MemoryUsed: 100}},
+		{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT, CaseId: "case-2", Result: &sandboxpb.ExecuteResponse{Status: "Accepted", Stdout: "two\n", TimeUsed: 11, MemoryUsed: 120}},
+		{Kind: sandboxpb.ExecuteBatchV1Event_COMPLETED},
+	}}
+	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a"}}, executor, 1)
+	config := validExecutionConfig()
+	config.JudgeMode, config.TotalScore = bundle.JudgeModeOI, total
+
+	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), config, artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != callback.StatusWrongAnswer || result.Score == nil || *result.Score != 70 ||
+		result.TotalScore == nil || *result.TotalScore != 100 || executor.requests[0].StopOnFailure {
+		t.Fatalf("result=%+v request=%+v", result, executor.requests[0])
+	}
+}
+
+func TestBatchBundlePipelineRunsSpecialJudgeThroughASecondSandboxBatch(t *testing.T) {
+	artifact, config := specialJudgeArtifact(t, bundle.JudgeModeACM, []int{1, 1})
+	executor := &sequenceBatchExecutor{eventSets: [][]*sandboxpb.ExecuteBatchV1Event{
+		{
+			{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT, CaseId: "case-1", Result: &sandboxpb.ExecuteResponse{Status: "Accepted", Stdout: "contestant-one", TimeUsed: 10, MemoryUsed: 100}},
+			{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT, CaseId: "case-2", Result: &sandboxpb.ExecuteResponse{Status: "Accepted", Stdout: "contestant-two", TimeUsed: 20, MemoryUsed: 100}},
+			{Kind: sandboxpb.ExecuteBatchV1Event_COMPLETED},
+		},
+		{
+			{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT, CaseId: "case-1", Result: &sandboxpb.ExecuteResponse{Status: "Accepted", Stdout: `{"schemaVersion":1,"accepted":true}`, TimeUsed: 3, MemoryUsed: 200}},
+			{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT, CaseId: "case-2", Result: &sandboxpb.ExecuteResponse{Status: "Accepted", Stdout: `{"schemaVersion":1,"accepted":false,"message":"redacted reason"}`, TimeUsed: 4, MemoryUsed: 80}},
+			{Kind: sandboxpb.ExecuteBatchV1Event_COMPLETED},
+		},
+	}}
+	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a", "sandbox-b"}}, executor, 1)
+
+	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), config, artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != callback.StatusWrongAnswer || len(executor.requests) != 2 ||
+		executor.requests[0].StopOnFailure || executor.requests[1].Language != "go" ||
+		executor.requests[1].SourceCode != artifact.checkerSource ||
+		result.TimeUsedMillis != 24 || result.MemoryUsedKB != 200 {
+		t.Fatalf("result=%+v requests=%+v", result, executor.requests)
+	}
+	var checkerInput struct {
+		SchemaVersion  int    `json:"schemaVersion"`
+		CaseID         string `json:"caseId"`
+		Input          string `json:"input"`
+		ExpectedOutput string `json:"expectedOutput"`
+		ActualOutput   string `json:"actualOutput"`
+	}
+	if err := json.Unmarshal([]byte(executor.requests[1].Cases[0].Stdin), &checkerInput); err != nil {
+		t.Fatal(err)
+	}
+	if checkerInput.SchemaVersion != 1 || checkerInput.CaseID != "case-1" ||
+		checkerInput.Input != "input-1" || checkerInput.ExpectedOutput != "one\n" ||
+		checkerInput.ActualOutput != "contestant-one" {
+		t.Fatalf("checker ABI input=%+v", checkerInput)
+	}
+	serialized := result.Stdout + result.Stderr + result.CompileError
+	for _, hidden := range []string{"input-1", "one\n", "contestant-one", "redacted reason", artifact.checkerSource} {
+		if strings.Contains(serialized, hidden) {
+			t.Fatalf("callback leaked hidden checker data %q: %+v", hidden, result)
+		}
+	}
+}
+
+func TestBatchBundlePipelineScoresSpecialJudgeOICases(t *testing.T) {
+	artifact, _ := specialJudgeArtifact(t, bundle.JudgeModeOI, []int{30, 70})
+	executor := &sequenceBatchExecutor{eventSets: [][]*sandboxpb.ExecuteBatchV1Event{
+		{
+			{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT, CaseId: "case-1", Result: &sandboxpb.ExecuteResponse{Status: "Accepted", Stdout: "contestant-one"}},
+			{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT, CaseId: "case-2", Result: &sandboxpb.ExecuteResponse{Status: "Accepted", Stdout: "contestant-two"}},
+			{Kind: sandboxpb.ExecuteBatchV1Event_COMPLETED},
+		},
+		{
+			{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT, CaseId: "case-1", Result: &sandboxpb.ExecuteResponse{Status: "Accepted", Stdout: `{"schemaVersion":1,"accepted":true}`}},
+			{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT, CaseId: "case-2", Result: &sandboxpb.ExecuteResponse{Status: "Accepted", Stdout: `{"schemaVersion":1,"accepted":false}`}},
+			{Kind: sandboxpb.ExecuteBatchV1Event_COMPLETED},
+		},
+	}}
+	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a", "sandbox-b"}}, executor, 1)
+
+	result, err := pipeline.ExecuteCanonical(
+		context.Background(),
+		CanonicalExecutionRequest{Language: "go", SourceCode: "package main\nfunc main() {}\n"},
+		artifact,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != callback.StatusWrongAnswer || result.Score == nil || *result.Score != 30 ||
+		result.TotalScore == nil || *result.TotalScore != 100 ||
+		result.Cases[0].Score == nil || *result.Cases[0].Score != 30 ||
+		result.Cases[1].Score == nil || *result.Cases[1].Score != 0 {
+		t.Fatalf("OI special-judge result = %+v", result)
+	}
+}
+
+func TestBatchBundlePipelineRejectsMalformedSpecialJudgeOutputAsInfrastructure(t *testing.T) {
+	artifact, config := specialJudgeArtifact(t, bundle.JudgeModeACM, []int{1})
+	executor := &sequenceBatchExecutor{eventSets: [][]*sandboxpb.ExecuteBatchV1Event{
+		{
+			{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT, CaseId: "case-1", Result: &sandboxpb.ExecuteResponse{Status: "Accepted", Stdout: "contestant"}},
+			{Kind: sandboxpb.ExecuteBatchV1Event_COMPLETED},
+		},
+		{
+			{Kind: sandboxpb.ExecuteBatchV1Event_CASE_RESULT, CaseId: "case-1", Result: &sandboxpb.ExecuteResponse{Status: "Accepted", Stdout: `{"schemaVersion":1,"accepted":true,"unknown":"secret"}`}},
+			{Kind: sandboxpb.ExecuteBatchV1Event_COMPLETED},
+		},
+	}}
+	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a", "sandbox-b"}}, executor, 1)
+	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), config, artifact)
+	if !errors.Is(err, ErrCanonicalInfrastructure) ||
+		!errors.Is(err, ErrTenantCheckerFailure) ||
+		result.Status != "" {
+		t.Fatalf("result=%+v error=%v", result, err)
+	}
+}
+
+func TestParseSpecialJudgeOutputRejectsInvalidUTF8(t *testing.T) {
+	if _, err := parseSpecialJudgeOutput(
+		"{\"schemaVersion\":1,\"accepted\":true,\"message\":\"" + string([]byte{0xff}) + "\"}",
+	); err == nil {
+		t.Fatal("invalid UTF-8 checker output was accepted")
+	}
+}
+
+func TestSpecialJudgeABIPreEncodeLimitRejectsOversizedComponents(t *testing.T) {
+	if !specialJudgePayloadWithinPreEncodeLimit("case-1", "input", "expected", "actual") {
+		t.Fatal("small checker ABI payload was rejected")
+	}
+	if specialJudgePayloadWithinPreEncodeLimit(
+		"case-1",
+		strings.Repeat("x", maxSpecialJudgeProtocolBytesV1),
+		"expected",
+		"actual",
+	) {
+		t.Fatal("oversized checker ABI component was accepted before JSON encoding")
+	}
+}
+
+func TestBatchBundlePipelineRejectsInternalSpecialJudgeSnapshotMismatchBeforeSandbox(t *testing.T) {
+	artifact, config := specialJudgeArtifact(t, bundle.JudgeModeACM, []int{1})
+	config.SpecialJudgeSource += "// mismatch"
+	executor := &batchExecutorStub{}
+	pipeline := NewBatchBundlePipeline(&sequenceSelector{endpoints: []string{"sandbox-a"}}, executor, 1)
+	result, err := pipeline.ExecuteArtifact(context.Background(), validBundleSubmission(), config, artifact)
+	if err != nil || result.Status != callback.StatusSystemError || len(executor.requests) != 0 {
+		t.Fatalf("result=%+v error=%v calls=%d", result, err, len(executor.requests))
+	}
+}
+
+func specialJudgeArtifact(t *testing.T, mode bundle.JudgeMode, weights []int) (*memoryArtifact, ExecutionConfig) {
+	t.Helper()
+	source := "package main\nfunc main() {}\n"
+	digest := sha256.Sum256([]byte(source))
+	manifest := bundle.Manifest{
+		SchemaVersion: 2,
+		JudgeMode:     mode,
+		Checker:       bundle.CheckerSpecial,
+		Limits:        bundle.Limits{TimeLimitMillis: 1000, MemoryLimitMiB: 64},
+		SpecialJudge: &bundle.SpecialJudge{
+			Language: "go", Source: "checker/main.go", SourceSHA256: hex.EncodeToString(digest[:]),
+			TimeLimitMillis: 2000, MemoryLimitMiB: 128,
+		},
+	}
+	contents := make(map[string]string, len(weights)*2)
+	total := 0
+	for index, weight := range weights {
+		id := fmt.Sprintf("case-%d", index+1)
+		input, output := id+".in", id+".out"
+		manifest.Cases = append(manifest.Cases, bundle.Case{ID: id, Input: input, Output: output, Weight: weight})
+		contents[input] = fmt.Sprintf("input-%d", index+1)
+		contents[output] = []string{"one\n", "two\n"}[index%2]
+		total += weight
+	}
+	config := validExecutionConfig()
+	config.SpecialJudge = true
+	config.Checker = bundle.CheckerSpecial
+	config.SpecialJudgeLanguage = "go"
+	config.SpecialJudgeSource = source
+	if mode == bundle.JudgeModeOI {
+		manifest.TotalScore = &total
+		config.JudgeMode, config.TotalScore = bundle.JudgeModeOI, total
+	}
+	return &memoryArtifact{manifest: manifest, contents: contents, checkerSource: source}, config
 }

@@ -100,17 +100,75 @@ func TestCompletionRejectsStaleWorkersAndHonorsCancellation(t *testing.T) {
 
 func TestCompletionRejectsMalformedRedactedResults(t *testing.T) {
 	now := time.Date(2026, 7, 19, 10, 0, 0, 0, time.UTC)
+	score, total, negative, above, zero, full, firstMax, secondMax := 70, 100, -1, 101, 0, 100, 30, 70
 	for name, result := range map[string]DurableJobResult{
-		"negative aggregate": {Verdict: "ACCEPTED", CompileStatus: "SUCCEEDED", TimeMillis: -1},
-		"negative case":      {Verdict: "ACCEPTED", CompileStatus: "SUCCEEDED", Cases: []DurableCaseResult{{CaseID: "1", Verdict: "ACCEPTED", MemoryBytes: -1}}},
-		"empty case id":      {Verdict: "ACCEPTED", CompileStatus: "SUCCEEDED", Cases: []DurableCaseResult{{Verdict: "ACCEPTED"}}},
-		"duplicate case":     {Verdict: "ACCEPTED", CompileStatus: "SUCCEEDED", Cases: []DurableCaseResult{{CaseID: "1", Verdict: "ACCEPTED"}, {CaseID: "1", Verdict: "WRONG_ANSWER"}}},
+		"negative aggregate":  {Verdict: "ACCEPTED", CompileStatus: "SUCCEEDED", TimeMillis: -1},
+		"negative case":       {Verdict: "ACCEPTED", CompileStatus: "SUCCEEDED", Cases: []DurableCaseResult{{CaseID: "1", Verdict: "ACCEPTED", MemoryBytes: -1}}},
+		"empty case id":       {Verdict: "ACCEPTED", CompileStatus: "SUCCEEDED", Cases: []DurableCaseResult{{Verdict: "ACCEPTED"}}},
+		"duplicate case":      {Verdict: "ACCEPTED", CompileStatus: "SUCCEEDED", Cases: []DurableCaseResult{{CaseID: "1", Verdict: "ACCEPTED"}, {CaseID: "1", Verdict: "WRONG_ANSWER"}}},
+		"score without total": {Verdict: "WRONG_ANSWER", CompileStatus: "SUCCEEDED", Score: &score},
+		"negative score":      {Verdict: "WRONG_ANSWER", CompileStatus: "SUCCEEDED", Score: &negative, TotalScore: &total},
+		"score above total":   {Verdict: "WRONG_ANSWER", CompileStatus: "SUCCEEDED", Score: &above, TotalScore: &total},
+		"accepted partial score": {
+			Verdict: "ACCEPTED", CompileStatus: "SUCCEEDED", Score: &score, TotalScore: &total,
+			Cases: []DurableCaseResult{{CaseID: "1", Verdict: "WRONG_ANSWER", Score: &zero, MaxScore: &total}},
+		},
+		"runtime error partial score": {
+			Verdict: "RUNTIME_ERROR", CompileStatus: "SUCCEEDED", Score: &firstMax, TotalScore: &total,
+			Cases: []DurableCaseResult{
+				{CaseID: "1", Verdict: "ACCEPTED", Score: &firstMax, MaxScore: &firstMax},
+				{CaseID: "2", Verdict: "WRONG_ANSWER", Score: &zero, MaxScore: &secondMax},
+			},
+		},
+		"wrong answer full score": {
+			Verdict: "WRONG_ANSWER", CompileStatus: "SUCCEEDED", Score: &full, TotalScore: &total,
+			Cases: []DurableCaseResult{{CaseID: "1", Verdict: "ACCEPTED", Score: &full, MaxScore: &total}},
+		},
+		"aggregate score mismatch": {
+			Verdict: "WRONG_ANSWER", CompileStatus: "SUCCEEDED", Score: &score, TotalScore: &total,
+			Cases: []DurableCaseResult{
+				{CaseID: "1", Verdict: "ACCEPTED", Score: &firstMax, MaxScore: &firstMax},
+				{CaseID: "2", Verdict: "WRONG_ANSWER", Score: &zero, MaxScore: &secondMax},
+			},
+		},
+		"wrong answer case receives points": {
+			Verdict: "WRONG_ANSWER", CompileStatus: "SUCCEEDED", Score: &full, TotalScore: &total,
+			Cases: []DurableCaseResult{{CaseID: "1", Verdict: "WRONG_ANSWER", Score: &full, MaxScore: &total}},
+		},
+		"ACM result contains case score": {
+			Verdict: "ACCEPTED", CompileStatus: "SUCCEEDED",
+			Cases: []DurableCaseResult{{CaseID: "1", Verdict: "ACCEPTED", Score: &full, MaxScore: &total}},
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			job := DurableJob{Status: JobStatusRunning, AttemptNo: 1, WorkerID: "worker-a", LeaseUntil: now.Add(time.Minute)}
 			err := job.Complete(JobClaim{WorkerID: "worker-a", AttemptNo: 1}, result, now)
 			if !errors.Is(err, ErrInvalidJobState) || job.Status != JobStatusRunning || job.Result != nil {
 				t.Fatalf("err=%v job=%+v", err, job)
+			}
+		})
+	}
+}
+
+func TestCompletionAcceptsConsistentOIScoresIncludingCompileFailure(t *testing.T) {
+	now := time.Date(2026, 7, 19, 10, 0, 0, 0, time.UTC)
+	zero, thirty, seventy, total := 0, 30, 70, 100
+	for name, result := range map[string]DurableJobResult{
+		"partial": {
+			Verdict: "WRONG_ANSWER", CompileStatus: "SUCCEEDED", Score: &thirty, TotalScore: &total,
+			Cases: []DurableCaseResult{
+				{CaseID: "1", Verdict: "ACCEPTED", Score: &thirty, MaxScore: &thirty},
+				{CaseID: "2", Verdict: "WRONG_ANSWER", Score: &zero, MaxScore: &seventy},
+			},
+		},
+		"compile failure": {
+			Verdict: "COMPILE_ERROR", CompileStatus: "FAILED", Score: &zero, TotalScore: &total,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			job := DurableJob{Status: JobStatusRunning, AttemptNo: 1, WorkerID: "worker-a", LeaseUntil: now.Add(time.Minute)}
+			if err := job.Complete(JobClaim{WorkerID: "worker-a", AttemptNo: 1}, result, now); err != nil {
+				t.Fatalf("complete consistent OI result: %v", err)
 			}
 		})
 	}

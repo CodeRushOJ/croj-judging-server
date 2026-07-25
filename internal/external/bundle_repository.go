@@ -496,8 +496,21 @@ func validBundleCommitInput(input BundleCommitInput) bool {
 }
 
 func bundleWithinTenantPolicy(input BundleCommitInput, policy TenantPolicy) bool {
-	return input.TimeLimitMillis > 0 && input.MemoryLimitMiB > 0 &&
-		input.TimeLimitMillis <= policy.MaxTimeLimitMillis && input.MemoryLimitMiB <= policy.MaxMemoryLimitMiB
+	if input.TimeLimitMillis <= 0 || input.MemoryLimitMiB <= 0 ||
+		input.TimeLimitMillis > policy.MaxTimeLimitMillis ||
+		input.MemoryLimitMiB > policy.MaxMemoryLimitMiB {
+		return false
+	}
+	if len(input.ManifestJSON) == 0 {
+		return true
+	}
+	manifest, err := bundle.ParseManifest(input.ManifestJSON)
+	return err == nil &&
+		manifestWithinExecutionCeilings(
+			manifest,
+			policy.MaxTimeLimitMillis,
+			policy.MaxMemoryLimitMiB,
+		)
 }
 
 func validStagingObjectKey(tenantID, key, digestHex string) bool {

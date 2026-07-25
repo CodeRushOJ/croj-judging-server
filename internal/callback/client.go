@@ -33,6 +33,8 @@ type Result struct {
 	ExitCode       int    `json:"exitCode"`
 	TimeUsedMillis int    `json:"timeUsedMillis"`
 	MemoryUsedKB   int    `json:"memoryUsedKb"`
+	Score          *int   `json:"score,omitempty"`
+	TotalScore     *int   `json:"totalScore,omitempty"`
 	Stdout         string `json:"stdout"`
 	Stderr         string `json:"stderr"`
 	CompileError   string `json:"compileError"`
@@ -148,8 +150,27 @@ func validateResult(result Result) error {
 	if result.SubmissionID <= 0 || result.AttemptNo <= 0 {
 		return fmt.Errorf("submissionId and attemptNo must be positive")
 	}
-	if result.TimeUsedMillis < 0 || result.TimeUsedMillis > 86_400_000 || result.MemoryUsedKB < 0 || result.MemoryUsedKB > 2_147_483_647 {
+	if result.TimeUsedMillis < 0 || result.TimeUsedMillis > 172_800_000 || result.MemoryUsedKB < 0 || result.MemoryUsedKB > 2_147_483_647 {
 		return fmt.Errorf("judge result metrics are outside the callback contract")
+	}
+	if (result.Score == nil) != (result.TotalScore == nil) {
+		return fmt.Errorf("OI score and totalScore must be present together")
+	}
+	if result.Score != nil && (*result.TotalScore <= 0 || *result.TotalScore > 1_000_000_000 ||
+		*result.Score < 0 || *result.Score > *result.TotalScore) {
+		return fmt.Errorf("OI score is outside the callback contract")
+	}
+	if result.Score != nil {
+		fullScore := *result.Score == *result.TotalScore
+		switch {
+		case result.Status == StatusCompileError && *result.Score != 0:
+			return fmt.Errorf("OI COMPILE_ERROR requires score=0")
+		case result.Status == StatusCompileError:
+		case fullScore && result.Status != StatusAccepted:
+			return fmt.Errorf("OI full score requires ACCEPTED")
+		case !fullScore && result.Status != StatusWrongAnswer:
+			return fmt.Errorf("OI partial score requires WRONG_ANSWER")
+		}
 	}
 	if UTF16Len(result.Stdout) > 65_536 || UTF16Len(result.Stderr) > 65_536 || UTF16Len(result.CompileError) > 32_768 {
 		return fmt.Errorf("judge result output exceeds the callback contract")

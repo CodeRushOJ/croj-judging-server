@@ -53,6 +53,8 @@ type CaseResultView struct {
 	Verdict     string `json:"verdict"`
 	TimeMillis  int64  `json:"timeMillis"`
 	MemoryBytes int64  `json:"memoryBytes"`
+	Score       *int   `json:"score,omitempty"`
+	MaxScore    *int   `json:"maxScore,omitempty"`
 }
 
 type JobResultView struct {
@@ -60,6 +62,8 @@ type JobResultView struct {
 	CompileStatus string           `json:"compileStatus"`
 	TimeMillis    int64            `json:"timeMillis"`
 	MemoryBytes   int64            `json:"memoryBytes"`
+	Score         *int             `json:"score,omitempty"`
+	TotalScore    *int             `json:"totalScore,omitempty"`
 	Cases         []CaseResultView `json:"cases"`
 }
 

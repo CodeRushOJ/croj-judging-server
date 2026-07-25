@@ -266,7 +266,7 @@ func newExternalRuntime(
 	}
 	capabilities := httpapi.Capabilities{
 		APIVersion: "v1", Languages: languages,
-		JudgeModes: []string{"ACM"}, Checkers: external.CanonicalCheckers(),
+		JudgeModes: []string{"ACM", "OI"}, Checkers: external.CanonicalCheckers(),
 		Limits: httpapi.CapabilityLimits{
 			MaxSourceBytes: external.MaximumSourceBytes, MaxBundleBytes: cfg.TestBundles.MaxObjectBytes,
 			MaxCaseBytes: cfg.TestBundles.MaxCaseBytes, MaxCaseCount: 256,

@@ -136,6 +136,70 @@ func TestNewClientRejectsUnsafeConfiguration(t *testing.T) {
 	}
 }
 
+func TestValidateResultAcceptsOnlyACompleteBoundedOIScore(t *testing.T) {
+	score, total := 70, 100
+	valid := validResult()
+	valid.Status = StatusWrongAnswer
+	valid.Score, valid.TotalScore = &score, &total
+	if err := validateResult(valid); err != nil {
+		t.Fatalf("valid OI result: %v", err)
+	}
+
+	for name, mutate := range map[string]func(*Result){
+		"score without total": func(result *Result) { result.Score, result.TotalScore = &score, nil },
+		"total without score": func(result *Result) { result.Score, result.TotalScore = nil, &total },
+		"accepted partial score": func(result *Result) {
+			result.Score, result.TotalScore = &score, &total
+		},
+		"wrong answer full score": func(result *Result) {
+			full := 100
+			result.Status = StatusWrongAnswer
+			result.Score, result.TotalScore = &full, &total
+		},
+		"time limit partial score": func(result *Result) {
+			result.Status = StatusTimeLimitExceeded
+			result.Score, result.TotalScore = &score, &total
+		},
+		"compile error partial score": func(result *Result) {
+			result.Status = StatusCompileError
+			result.Score, result.TotalScore = &score, &total
+			result.CompileError = "compile failed"
+		},
+		"negative score": func(result *Result) {
+			value := -1
+			result.Score, result.TotalScore = &value, &total
+		},
+		"score above total": func(result *Result) {
+			value := 101
+			result.Score, result.TotalScore = &value, &total
+		},
+		"zero total": func(result *Result) {
+			value := 0
+			result.Score, result.TotalScore = &value, &value
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			result := validResult()
+			mutate(&result)
+			if err := validateResult(result); err == nil {
+				t.Fatal("expected score contract error")
+			}
+		})
+	}
+}
+
+func TestValidateResultAllowsCombinedContestantAndSpecialJudgeTime(t *testing.T) {
+	result := validResult()
+	result.TimeUsedMillis = 172_800_000
+	if err := validateResult(result); err != nil {
+		t.Fatalf("combined contestant/checker boundary rejected: %v", err)
+	}
+	result.TimeUsedMillis++
+	if err := validateResult(result); err == nil {
+		t.Fatal("time above the combined contestant/checker boundary was accepted")
+	}
+}
+
 func validResult() Result {
 	return Result{
 		ResultID:       "50f75fdf-fdea-473f-a156-bf1ed60acf58",

@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/CodeRushOJ/croj-judging-server/internal/bundle"
 	"github.com/CodeRushOJ/croj-judging-server/internal/callback"
 	"github.com/CodeRushOJ/croj-judging-server/pkg/model"
 	"gorm.io/datatypes"
@@ -102,17 +103,11 @@ func TestJudgeServicePublishesSystemErrorForMissingImmutableBundle(t *testing.T)
 	}
 }
 
-func TestJudgeServiceRejectsMismatchedDraftAndUnsupportedImmutableVersions(t *testing.T) {
+func TestJudgeServiceRejectsMismatchedOrDraftImmutableVersions(t *testing.T) {
 	tests := map[string]func(*model.ProblemVersion){
 		"version mismatch": func(version *model.ProblemVersion) { version.ID = 8 },
 		"problem mismatch": func(version *model.ProblemVersion) { version.ProblemID = 999 },
 		"draft":            func(version *model.ProblemVersion) { version.State = "DRAFT" },
-		"special judge": func(version *model.ProblemVersion) {
-			version.JudgeConfigJSON = datatypes.JSON([]byte(`{"specialJudge":true,"specialJudgeCode":"x","specialJudgeLanguage":"go","judgeMode":0}`))
-		},
-		"OI": func(version *model.ProblemVersion) {
-			version.JudgeConfigJSON = datatypes.JSON([]byte(`{"specialJudge":false,"specialJudgeCode":null,"specialJudgeLanguage":null,"judgeMode":1}`))
-		},
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -126,6 +121,37 @@ func TestJudgeServiceRejectsMismatchedDraftAndUnsupportedImmutableVersions(t *te
 			}
 			if publisher.result.Status != callback.StatusSystemError || executor.calls != 0 {
 				t.Fatalf("result=%+v calls=%d", publisher.result, executor.calls)
+			}
+		})
+	}
+}
+
+func TestJudgeServicePropagatesOIAndSpecialJudgeImmutableConfig(t *testing.T) {
+	for name, mutate := range map[string]func(*model.ProblemVersion){
+		"OI": func(version *model.ProblemVersion) {
+			version.JudgeConfigJSON = datatypes.JSON([]byte(`{"specialJudge":false,"specialJudgeCode":null,"specialJudgeLanguage":null,"judgeMode":1}`))
+		},
+		"special judge": func(version *model.ProblemVersion) {
+			version.JudgeConfigJSON = datatypes.JSON([]byte(`{"specialJudge":true,"specialJudgeCode":"package main","specialJudgeLanguage":"go","judgeMode":0}`))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			store := validStore()
+			mutate(store.version)
+			executor := &fakeResultExecutor{result: callback.Result{Status: callback.StatusAccepted}}
+			publisher := &fakeResultPublisher{}
+			judgeService := NewJudgeService(store, executor, publisher, NewTaskRegistry(16, time.Hour))
+			if err := judgeService.ProcessEvent(context.Background(), validSubmissionEvent()); err != nil {
+				t.Fatal(err)
+			}
+			if executor.calls != 1 || publisher.calls != 1 {
+				t.Fatalf("executor calls=%d publisher calls=%d", executor.calls, publisher.calls)
+			}
+			if name == "OI" && (executor.config.JudgeMode != bundle.JudgeModeOI || executor.config.TotalScore != 100) {
+				t.Fatalf("OI config=%+v", executor.config)
+			}
+			if name == "special judge" && (!executor.config.SpecialJudge || executor.config.SpecialJudgeLanguage != "go") {
+				t.Fatalf("special config=%+v", executor.config)
 			}
 		})
 	}

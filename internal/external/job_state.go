@@ -33,6 +33,8 @@ type DurableCaseResult struct {
 	Verdict     string `json:"verdict"`
 	TimeMillis  int64  `json:"timeMillis"`
 	MemoryBytes int64  `json:"memoryBytes"`
+	Score       *int   `json:"score,omitempty"`
+	MaxScore    *int   `json:"maxScore,omitempty"`
 }
 
 type DurableJobResult struct {
@@ -40,6 +42,8 @@ type DurableJobResult struct {
 	CompileStatus string              `json:"compileStatus"`
 	TimeMillis    int64               `json:"timeMillis"`
 	MemoryBytes   int64               `json:"memoryBytes"`
+	Score         *int                `json:"score,omitempty"`
+	TotalScore    *int                `json:"totalScore,omitempty"`
 	Cases         []DurableCaseResult `json:"cases"`
 }
 
@@ -122,7 +126,13 @@ func (job *DurableJob) Complete(claim JobClaim, result DurableJobResult, now tim
 			return fmt.Errorf("%w: terminal result is incomplete", ErrInvalidJobState)
 		}
 		copied := result
-		copied.Cases = append([]DurableCaseResult(nil), result.Cases...)
+		copied.Score, copied.TotalScore = copyScore(result.Score), copyScore(result.TotalScore)
+		copied.Cases = make([]DurableCaseResult, len(result.Cases))
+		for index, item := range result.Cases {
+			copied.Cases[index] = item
+			copied.Cases[index].Score = copyScore(item.Score)
+			copied.Cases[index].MaxScore = copyScore(item.MaxScore)
+		}
 		job.Status = JobStatusSucceeded
 		job.Result = &copied
 	}
@@ -138,19 +148,79 @@ func validateDurableJobResult(result DurableJobResult) error {
 		result.TimeMillis < 0 || result.MemoryBytes < 0 || len(result.Cases) > 256 {
 		return ErrInvalidJobState
 	}
+	if !validScorePair(result.Score, result.TotalScore) {
+		return ErrInvalidJobState
+	}
 	caseIDs := make(map[string]struct{}, len(result.Cases))
+	var caseScoreSum, caseMaximumSum int64
 	for _, item := range result.Cases {
 		if strings.TrimSpace(item.CaseID) == "" || len(item.CaseID) > 128 ||
 			strings.TrimSpace(item.Verdict) == "" || len(item.Verdict) > 64 ||
 			item.TimeMillis < 0 || item.MemoryBytes < 0 {
 			return ErrInvalidJobState
 		}
+		if !validScorePair(item.Score, item.MaxScore) {
+			return ErrInvalidJobState
+		}
+		if result.Score == nil {
+			if item.Score != nil {
+				return ErrInvalidJobState
+			}
+		} else {
+			if item.Score == nil ||
+				(item.Verdict == "ACCEPTED" && *item.Score != *item.MaxScore) ||
+				(item.Verdict != "ACCEPTED" && *item.Score != 0) {
+				return ErrInvalidJobState
+			}
+			caseScoreSum += int64(*item.Score)
+			caseMaximumSum += int64(*item.MaxScore)
+		}
 		if _, exists := caseIDs[item.CaseID]; exists {
 			return ErrInvalidJobState
 		}
 		caseIDs[item.CaseID] = struct{}{}
 	}
+	if result.Score == nil {
+		return nil
+	}
+	if result.CompileStatus == "FAILED" {
+		if result.Verdict != "COMPILE_ERROR" || *result.Score != 0 || len(result.Cases) != 0 {
+			return ErrInvalidJobState
+		}
+		return nil
+	}
+	if result.CompileStatus != "SUCCEEDED" ||
+		caseScoreSum != int64(*result.Score) ||
+		caseMaximumSum != int64(*result.TotalScore) {
+		return ErrInvalidJobState
+	}
+	if (*result.Score == *result.TotalScore && result.Verdict != "ACCEPTED") ||
+		(*result.Score < *result.TotalScore && result.Verdict != "WRONG_ANSWER") {
+		return ErrInvalidJobState
+	}
 	return nil
+}
+
+// ValidateDurableJobResult exposes the persistence invariant to the canonical
+// worker boundary so malformed scores cannot cross either layer.
+func ValidateDurableJobResult(result DurableJobResult) error {
+	return validateDurableJobResult(result)
+}
+
+func validScorePair(score, maximum *int) bool {
+	if (score == nil) != (maximum == nil) {
+		return false
+	}
+	return score == nil || *maximum > 0 && *maximum <= 1_000_000_000 &&
+		*score >= 0 && *score <= *maximum
+}
+
+func copyScore(value *int) *int {
+	if value == nil {
+		return nil
+	}
+	copied := *value
+	return &copied
 }
 
 func (job *DurableJob) FailInfrastructure(

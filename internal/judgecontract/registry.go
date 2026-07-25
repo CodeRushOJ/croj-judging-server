@@ -15,8 +15,9 @@ type LanguageDefinition struct {
 type Checker string
 
 const (
-	CheckerExact Checker = "exact"
-	CheckerToken Checker = "token"
+	CheckerExact   Checker = "exact"
+	CheckerToken   Checker = "token"
+	CheckerSpecial Checker = "special"
 )
 
 var canonicalLanguages = [...]LanguageDefinition{
@@ -27,7 +28,7 @@ var canonicalLanguages = [...]LanguageDefinition{
 	{PublicID: "javascript", SandboxID: "javascript", DisplayName: "JavaScript", Runtime: "node"},
 }
 
-var canonicalCheckers = [...]Checker{CheckerExact, CheckerToken}
+var canonicalCheckers = [...]Checker{CheckerExact, CheckerToken, CheckerSpecial}
 
 func CanonicalLanguages() []LanguageDefinition {
 	return append([]LanguageDefinition(nil), canonicalLanguages[:]...)

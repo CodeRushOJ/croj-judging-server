@@ -1074,6 +1074,59 @@ SET next_attempt_at = CURRENT_TIMESTAMP(3) - INTERVAL 1 SECOND WHERE id = ?`, cl
 	}
 }
 
+func TestMySQLWorkerChargesTenantControlledInfrastructureFailure(t *testing.T) {
+	database := openMySQLIntegration(t)
+	prepareExternalJobDatabase(t, database)
+	tenantID := strings.Repeat("v", 26)
+	bundleID := strings.Repeat("w", 26)
+	insertTenantBundleAndCallback(t, database, tenantID, bundleID, "", 2)
+	repository := newTestMySQLJobRepository(t, database, newMemorySourceStore())
+	if _, err := repository.Submit(context.Background(), tenantID, "tenant-checker-charge", JudgeJobRequest{
+		BundleID: bundleID, Language: "go126", SourceCode: []byte("package main"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := repository.ClaimNext(context.Background(), "checker-worker", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reserved int64
+	if err := database.QueryRow(`
+SELECT reserved_execution_millis FROM t_external_job_attempt
+WHERE job_id = ? AND attempt_no = ?`, claim.Job.InternalID, claim.AttemptNo).Scan(&reserved); err != nil {
+		t.Fatal(err)
+	}
+	if reserved <= 0 {
+		t.Fatalf("reserved execution millis=%d", reserved)
+	}
+	disposition, err := repository.FailInfrastructure(context.Background(), claim, InfrastructureFailure{
+		Code: "TENANT_CHECKER_FAILED", ChargeFullReservation: true, Permanent: true,
+	})
+	if err != nil || disposition != FailureTerminal {
+		t.Fatalf("disposition=%s error=%v", disposition, err)
+	}
+	var consumed int64
+	if err := database.QueryRow(`
+SELECT consumed_millis FROM t_external_execution_daily
+WHERE tenant_id = ? AND accounting_day = CURRENT_DATE`,
+		claim.Job.TenantInternalID).Scan(&consumed); err != nil {
+		t.Fatal(err)
+	}
+	if consumed != reserved {
+		t.Fatalf("consumed millis=%d want full reservation=%d", consumed, reserved)
+	}
+	var attemptConsumed int64
+	if err := database.QueryRow(`
+SELECT consumed_execution_millis FROM t_external_job_attempt
+WHERE job_id = ? AND attempt_no = ?`,
+		claim.Job.InternalID, claim.AttemptNo).Scan(&attemptConsumed); err != nil {
+		t.Fatal(err)
+	}
+	if attemptConsumed != reserved {
+		t.Fatalf("attempt consumed millis=%d want full reservation=%d", attemptConsumed, reserved)
+	}
+}
+
 func TestMySQLWorkerCancelAndInfrastructureFailureShareTenantJobLockOrder(t *testing.T) {
 	database := openMySQLIntegration(t)
 	prepareExternalJobDatabase(t, database)

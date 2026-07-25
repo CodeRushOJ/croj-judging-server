@@ -184,6 +184,7 @@ func TestServerRejectsCapabilitiesOutsideThePublishedV1Contract(t *testing.T) {
 		"invalid language id":     func(value *Capabilities) { value.Languages[0].ID = "C++" },
 		"unsupported language id": func(value *Capabilities) { value.Languages[0].ID = "cpp20" },
 		"unsupported checker":     func(value *Capabilities) { value.Checkers[0] = "EXACT" },
+		"unsupported judge mode":  func(value *Capabilities) { value.JudgeModes[0] = "INTERACTIVE" },
 		"empty display name":      func(value *Capabilities) { value.Languages[0].DisplayName = "" },
 		"empty runtime":           func(value *Capabilities) { value.Languages[0].Runtime = "" },
 		"zero bundle limit":       func(value *Capabilities) { value.Limits.MaxBundleBytes = 0 },

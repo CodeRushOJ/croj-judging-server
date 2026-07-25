@@ -83,8 +83,8 @@ paths:
                   - id: javascript
                     displayName: JavaScript
                     runtime: node
-                judgeModes: [ACM]
-                checkers: [exact, token]
+                judgeModes: [ACM, OI]
+                checkers: [exact, token, special]
                 limits:
                   maxSourceBytes: 1048576
                   maxBundleBytes: 67108864
@@ -1050,11 +1050,12 @@ components:
           type: array
           items:
             type: string
+            enum: [ACM, OI]
         checkers:
           type: array
           items:
             type: string
-            enum: [exact, token]
+            enum: [exact, token, special]
         limits:
           $ref: '#/components/schemas/CapabilityLimits'
     BundleUpload:
@@ -1087,6 +1088,7 @@ components:
         manifestVersion:
           type: integer
           minimum: 1
+          maximum: 2
         createdAt:
           type: string
           format: date-time
@@ -1118,6 +1120,13 @@ components:
     CaseResultView:
       type: object
       additionalProperties: false
+      description: >-
+        Redacted per-case result. score and maxScore are either both absent
+        (ACM) or both present (OI). An ACCEPTED OI case has score=maxScore;
+        every other OI case has score=0.
+      dependentRequired:
+        score: [maxScore]
+        maxScore: [score]
       required: [caseId, verdict, timeMillis, memoryBytes]
       properties:
         caseId:
@@ -1132,9 +1141,26 @@ components:
           type: integer
           format: int64
           minimum: 0
+        score:
+          type: integer
+          minimum: 0
+          maximum: 1000000000
+        maxScore:
+          type: integer
+          minimum: 1
+          maximum: 1000000000
     JobResultView:
       type: object
       additionalProperties: false
+      description: >-
+        Redacted terminal result. score and totalScore are either both absent
+        (ACM) or both present (OI). For a successfully compiled OI result,
+        aggregate values equal the sums of the case values and ACCEPTED is
+        returned exactly at full score. OI compile failure has score=0 and no
+        case results.
+      dependentRequired:
+        score: [totalScore]
+        totalScore: [score]
       required: [verdict, compileStatus, timeMillis, memoryBytes, cases]
       properties:
         verdict:
@@ -1149,6 +1175,14 @@ components:
           type: integer
           format: int64
           minimum: 0
+        score:
+          type: integer
+          minimum: 0
+          maximum: 1000000000
+        totalScore:
+          type: integer
+          minimum: 1
+          maximum: 1000000000
         cases:
           type: array
           items:

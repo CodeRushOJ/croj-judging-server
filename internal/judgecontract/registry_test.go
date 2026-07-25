@@ -28,7 +28,7 @@ func TestCanonicalV1RegistryPublishesTheExactLanguageAndCheckerSets(t *testing.T
 			t.Errorf("unsupported alias %q resolved to %+v", unsupported, language)
 		}
 	}
-	if got, want := judgecontract.CanonicalCheckers(), []judgecontract.Checker{judgecontract.CheckerExact, judgecontract.CheckerToken}; !reflect.DeepEqual(got, want) {
+	if got, want := judgecontract.CanonicalCheckers(), []judgecontract.Checker{judgecontract.CheckerExact, judgecontract.CheckerToken, judgecontract.CheckerSpecial}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("canonical checkers = %v, want %v", got, want)
 	}
 

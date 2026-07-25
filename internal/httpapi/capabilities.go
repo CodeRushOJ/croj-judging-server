@@ -62,6 +62,11 @@ func normalizeCapabilities(value Capabilities) (Capabilities, error) {
 			return Capabilities{}, fmt.Errorf("checker capabilities must match bundle manifest identifiers")
 		}
 	}
+	for _, mode := range value.JudgeModes {
+		if mode != "ACM" && mode != "OI" {
+			return Capabilities{}, fmt.Errorf("judge mode capabilities must match bundle manifest identifiers")
+		}
+	}
 	value.Languages = append([]LanguageCapability(nil), value.Languages...)
 	value.JudgeModes = append([]string{}, value.JudgeModes...)
 	value.Checkers = append([]string{}, value.Checkers...)

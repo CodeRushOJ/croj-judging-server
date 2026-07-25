@@ -105,16 +105,26 @@ func publicJobView(job external.ExternalJobRecord) (JobView, error) {
 		view.Result = &JobResultView{
 			Verdict: job.Result.Verdict, CompileStatus: job.Result.CompileStatus,
 			TimeMillis: job.Result.TimeMillis, MemoryBytes: job.Result.MemoryBytes,
+			Score: copyPublicScore(job.Result.Score), TotalScore: copyPublicScore(job.Result.TotalScore),
 			Cases: make([]CaseResultView, 0, len(job.Result.Cases)),
 		}
 		for _, item := range job.Result.Cases {
 			view.Result.Cases = append(view.Result.Cases, CaseResultView{
 				CaseID: item.CaseID, Verdict: item.Verdict,
 				TimeMillis: item.TimeMillis, MemoryBytes: item.MemoryBytes,
+				Score: copyPublicScore(item.Score), MaxScore: copyPublicScore(item.MaxScore),
 			})
 		}
 	}
 	return view, nil
+}
+
+func copyPublicScore(value *int) *int {
+	if value == nil {
+		return nil
+	}
+	copied := *value
+	return &copied
 }
 
 func publicJobStatus(status external.JobStatus) (JobStatus, error) {

@@ -2,6 +2,8 @@ package bundle
 
 import (
 	"archive/zip"
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,6 +27,40 @@ func TestOpenArchiveReadsValidatedCases(t *testing.T) {
 	}
 	if input != "2 3\n" || output != "5\n" {
 		t.Fatalf("case contents = %q %q", input, output)
+	}
+}
+
+func TestOpenArchiveReadsAndVerifiesSpecialJudgeSource(t *testing.T) {
+	source := "package main\nfunc main() {}\n"
+	digest := sha256.Sum256([]byte(source))
+	manifest := `{"schemaVersion":2,"judgeMode":"ACM","checker":"special","limits":{"timeLimitMillis":1500,"memoryLimitMiB":256},"specialJudge":{"language":"go","source":"checker/main.go","sourceSha256":"` +
+		hex.EncodeToString(digest[:]) +
+		`","timeLimitMillis":2000,"memoryLimitMiB":128},"cases":[{"id":"case-01","input":"cases/01.in","output":"cases/01.out","weight":1}]}`
+	path := writeZIP(t, []zipEntry{
+		{name: "manifest.json", body: manifest},
+		{name: "checker/main.go", body: source},
+		{name: "cases/01.in", body: "2 3\n"},
+		{name: "cases/01.out", body: "5\n"},
+	})
+	artifact, err := OpenArchive(path, []byte(manifest), DefaultArchiveLimits())
+	if err != nil {
+		t.Fatalf("OpenArchive: %v", err)
+	}
+	defer artifact.Close()
+	got, err := artifact.ReadSpecialJudge()
+	if err != nil || got != source {
+		t.Fatalf("ReadSpecialJudge = %q, %v", got, err)
+	}
+
+	tampered := writeZIP(t, []zipEntry{
+		{name: "manifest.json", body: manifest},
+		{name: "checker/main.go", body: source + "// tampered"},
+		{name: "cases/01.in", body: "2 3\n"},
+		{name: "cases/01.out", body: "5\n"},
+	})
+	if artifact, err := OpenArchive(tampered, []byte(manifest), DefaultArchiveLimits()); err == nil {
+		artifact.Close()
+		t.Fatal("expected special-judge digest mismatch")
 	}
 }
 

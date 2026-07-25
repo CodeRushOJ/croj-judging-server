@@ -117,8 +117,10 @@ func (claim WorkerJobClaim) String() string {
 func (claim WorkerJobClaim) GoString() string { return claim.String() }
 
 type InfrastructureFailure struct {
-	Code       string
-	RetryDelay time.Duration
+	Code                  string
+	RetryDelay            time.Duration
+	ChargeFullReservation bool
+	Permanent             bool
 }
 
 type FailureDisposition string
