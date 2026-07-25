@@ -194,7 +194,15 @@ INSERT INTO t_external_bundle(
     manifest_version, manifest_json, publication_status, ready_at
 )
 SELECT ?, tenant.id, UNHEX(SHA2(?, 256)), ?, 128, 1,
-       1, JSON_OBJECT('schemaVersion', 1, 'cases', JSON_ARRAY()), 'READY', CURRENT_TIMESTAMP(3)
+       1, JSON_OBJECT(
+           'schemaVersion', 1,
+           'judgeMode', 'ACM',
+           'checker', 'exact',
+           'limits', JSON_OBJECT('timeLimitMillis', 1000, 'memoryLimitMiB', 64),
+           'cases', JSON_ARRAY(JSON_OBJECT(
+               'id', 'case-1', 'input', 'case-1.in', 'output', 'case-1.out', 'weight', 1
+           ))
+       ), 'READY', CURRENT_TIMESTAMP(3)
 FROM t_external_tenant AS tenant WHERE tenant.external_id = ?`,
 		bundleID, bundleID, "external/"+tenantID+"/sha256/"+bundleID+".zip", tenantID); err != nil {
 		t.Fatal(err)
