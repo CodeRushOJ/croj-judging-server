@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/apache/rocketmq-client-go/v2 v2.1.2
-	github.com/getkin/kin-openapi v0.142.0
+	github.com/getkin/kin-openapi v0.144.0
 	github.com/go-sql-driver/mysql v1.8.1
 	github.com/google/uuid v1.6.0
 	github.com/minio/minio-go/v7 v7.2.1

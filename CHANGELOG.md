@@ -70,6 +70,7 @@
 
 ### Changed
 
+- 将 `github.com/getkin/kin-openapi` 提升到 `v0.144.0` 安全下限，修复 `ValidationHandler.Load()` 默认认证函数导致的 fail-open 绕过和无 schema content 参数触发的未认证 panic，并由依赖契约阻止回退。
 - CI 与生产 builder 统一升级到 digest 固定的 Go 1.26.5，修复 `crypto/tls`、`crypto/x509`、`mime` 与 `net/textproto` 标准库可达漏洞。
 - 取消或编译失败在缺少可信 case 计量时扣除完整日额度 reservation；只有平台基础设施失败和过期执行 lease 退款，避免客户端主动中止绕过额度。
 - MySQL 1205/1213 作为可恢复竞争重试，不再导致整个 worker Pod 退出；schema v6 启动后置校验覆盖额度/attempt/source/audit 约束与索引属性。
