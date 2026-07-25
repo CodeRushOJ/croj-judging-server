@@ -188,12 +188,19 @@ func main() {
 		}
 		registry := service.NewTaskRegistry(cfg.JudgeResult.CacheCapacity, cacheTTL)
 		judgeService := service.NewJudgeService(legacyDatabase, executionPipeline, resultClient, registry)
-		rocketmqConsumer, err := consumer.NewRocketMQConsumer(cfg.RocketMQ, judgeService)
+		newConsumer := func() (legacyConsumer, error) {
+			return consumer.NewRocketMQConsumer(cfg.RocketMQ, judgeService)
+		}
+		rocketmqConsumer, err := newConsumer()
 		if err != nil {
 			return nil, fmt.Errorf("create RocketMQ consumer: %w", err)
 		}
 		keepDatabase = true
-		return &legacyRuntime{database: legacyDatabase, consumer: rocketmqConsumer}, nil
+		return &legacyRuntime{
+			database:        legacyDatabase,
+			initialConsumer: rocketmqConsumer,
+			newConsumer:     newConsumer,
+		}, nil
 	})
 	if err != nil {
 		log.Fatalf("Failed to initialize legacy judge adapter: %v", err)
@@ -203,8 +210,7 @@ func main() {
 			log.Printf("Failed to close legacy backend database: %v", err)
 		}
 	}()
-	rocketmqConsumer := legacy.consumer
-	if rocketmqConsumer != nil {
+	if cfg.LegacyJudge.Enabled {
 		fmt.Println("Legacy backend database and RocketMQ judge adapter initialized.")
 	}
 
@@ -220,13 +226,13 @@ func main() {
 		externalDone = startExternalRuntime(ctx, external.runtime, cancel)
 	}
 
-	if rocketmqConsumer != nil {
+	var legacyDone <-chan error
+	if cfg.LegacyJudge.Enabled {
+		done := make(chan error, 1)
+		legacyDone = done
 		go func() {
-			fmt.Println("Starting legacy RocketMQ consumer...")
-			if err := rocketmqConsumer.Start(); err != nil {
-				log.Printf("RocketMQ consumer error: %v", err)
-				cancel()
-			}
+			fmt.Println("Starting supervised legacy RocketMQ consumer...")
+			done <- legacy.Run(ctx)
 		}()
 	}
 
@@ -251,19 +257,14 @@ func main() {
 		fmt.Println("External durable workers and REST API stopped.")
 	}
 
-	if rocketmqConsumer != nil {
-		if err := rocketmqConsumer.Shutdown(); err != nil {
-			log.Printf("Failed to shutdown RocketMQ consumer: %v", err)
+	if legacyDone != nil {
+		if err := <-legacyDone; err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("Legacy RocketMQ consumer shutdown error: %v", err)
 		}
 		fmt.Println("Legacy RocketMQ consumer stopped.")
 	}
 
 	fmt.Println("Server gracefully stopped.")
-}
-
-type legacyRuntime struct {
-	database *database.Database
-	consumer *consumer.RocketMQConsumer
 }
 
 // initializeLegacyRuntime is the process boundary for every Backend DB,
@@ -277,11 +278,4 @@ func initializeLegacyRuntime(enabled bool, initializer func() (*legacyRuntime, e
 		return nil, fmt.Errorf("legacy runtime initializer is required")
 	}
 	return initializer()
-}
-
-func (runtime *legacyRuntime) Close() error {
-	if runtime == nil || runtime.database == nil {
-		return nil
-	}
-	return runtime.database.Close()
 }

@@ -74,7 +74,7 @@ func TestExternalOnlyModeDoesNotInitializeLegacyDependencies(t *testing.T) {
 	if called {
 		t.Fatal("external-only mode touched legacy Backend DB/callback/RocketMQ initialization")
 	}
-	if runtime == nil || runtime.database != nil || runtime.consumer != nil {
+	if runtime == nil || runtime.database != nil || runtime.initialConsumer != nil || runtime.newConsumer != nil {
 		t.Fatalf("external-only legacy runtime = %+v", runtime)
 	}
 }

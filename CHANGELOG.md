@@ -6,6 +6,7 @@
 
 ### Added
 
+- 增加 legacy RocketMQ consumer 启动监督：NameServer 尚未传播 topic route 时丢弃不可复用的 client、重建 consumer 并持续重试；瞬时 bootstrap 竞争不再取消异步 REST listener 或触发 Pod CrashLoop。
 - 增加 immutable bundle manifest v2：`ACM`/`OI`、exact/token/special checker、正权重总分不变量与 v1 永久兼容。
 - 增加隔离特殊判题 ABI：checker 源码由 bundle 路径与 SHA-256 固定，通过第二个 `ExecuteBatchV1` 编译一次并逐 case 判定，任何畸形输出或 checker 故障 fail closed。
 - 增加 OI 全 case 确定性计分，以及内部 callback、外部异步 REST、持久 job/webhook 的可选总分/分项分数契约。
