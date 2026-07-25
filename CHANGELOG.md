@@ -92,6 +92,7 @@
 
 ### Fixed
 
+- 修复 release job 在 annotated tag push 时因旧版 checkout 将 runner 本地标签覆盖为 peeled commit、导致 `^{tag}` 校验失败的问题。
 - 升级 gRPC、`x/crypto`、`x/net` 与 Edwards25519 到不低于 GitHub Advisory 首个修复版本，清除默认分支依赖图中的 8 个 critical、3 个 high、5 个 medium 与 1 个 low 告警。
 - 租户自带 special checker 的编译、运行、协议或资源边界故障现在直接终态失败并扣满本 attempt 的选手+checker reservation；平台基础设施故障仍退款重试，daily ledger 与 attempt 审计保持同一 consumed 值。
 - bundle 上传默认 read/write deadline 从不兼容 512 MiB 上限的 30 秒调整为 15/20 分钟；启动时按最低 1 MiB/s、2 分钟 framing 余量和 5 分钟发布响应余量校验，防止对象已提交但客户端收到 EOF 后重试。
