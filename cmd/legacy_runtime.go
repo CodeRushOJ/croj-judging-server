@@ -28,6 +28,19 @@ type legacyRuntime struct {
 	retryDelay      time.Duration
 }
 
+func newSupervisedLegacyRuntime(
+	database *database.Database,
+	newConsumer func() (legacyConsumer, error),
+) (*legacyRuntime, error) {
+	if database == nil {
+		return nil, fmt.Errorf("legacy database is required")
+	}
+	if newConsumer == nil {
+		return nil, fmt.Errorf("legacy consumer factory is required")
+	}
+	return &legacyRuntime{database: database, newConsumer: newConsumer}, nil
+}
+
 func (runtime *legacyRuntime) Run(ctx context.Context) error {
 	if runtime == nil || runtime.newConsumer == nil {
 		return fmt.Errorf("legacy consumer factory is required")

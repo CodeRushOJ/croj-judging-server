@@ -7,9 +7,11 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/CodeRushOJ/croj-judging-server/internal/database"
 	"github.com/CodeRushOJ/croj-judging-server/pkg/config"
 )
 
@@ -59,6 +61,51 @@ func TestStartExternalRuntimeDoneJoinsRuntimeShutdown(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("runtime shutdown was not joinable")
+	}
+}
+
+func TestExternalRuntimeRemainsAvailableWhileLegacyConsumerInitializationRetries(t *testing.T) {
+	external := &joiningRuntime{started: make(chan struct{}), stopped: make(chan struct{})}
+	factoryFailed := make(chan struct{})
+	var failedOnce sync.Once
+	legacy, err := newSupervisedLegacyRuntime(
+		&database.Database{},
+		func() (legacyConsumer, error) {
+			failedOnce.Do(func() { close(factoryFailed) })
+			return nil, errors.New("RocketMQ DNS is temporarily unavailable")
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy.retryDelay = time.Hour
+
+	ctx, cancel := context.WithCancel(context.Background())
+	externalDone := startExternalRuntime(ctx, external, cancel)
+	legacyDone := make(chan error, 1)
+	go func() { legacyDone <- legacy.Run(ctx) }()
+	<-external.started
+	<-factoryFailed
+
+	select {
+	case <-external.stopped:
+		t.Fatal("legacy consumer initialization failure stopped the external REST runtime")
+	default:
+	}
+
+	cancel()
+	for name, done := range map[string]<-chan error{
+		"external": externalDone,
+		"legacy":   legacyDone,
+	} {
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("%s runtime error = %v", name, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("%s runtime did not join shutdown", name)
+		}
 	}
 }
 

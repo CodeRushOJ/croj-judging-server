@@ -191,16 +191,12 @@ func main() {
 		newConsumer := func() (legacyConsumer, error) {
 			return consumer.NewRocketMQConsumer(cfg.RocketMQ, judgeService)
 		}
-		rocketmqConsumer, err := newConsumer()
+		runtime, err := newSupervisedLegacyRuntime(legacyDatabase, newConsumer)
 		if err != nil {
-			return nil, fmt.Errorf("create RocketMQ consumer: %w", err)
+			return nil, err
 		}
 		keepDatabase = true
-		return &legacyRuntime{
-			database:        legacyDatabase,
-			initialConsumer: rocketmqConsumer,
-			newConsumer:     newConsumer,
-		}, nil
+		return runtime, nil
 	})
 	if err != nil {
 		log.Fatalf("Failed to initialize legacy judge adapter: %v", err)
