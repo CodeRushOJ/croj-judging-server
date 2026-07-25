@@ -4,6 +4,11 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
+	"sort"
+	"strings"
+	"sync"
+	"time"
 
 	"github.com/CodeRushOJ/croj-judging-server/internal/callback"
 	"github.com/CodeRushOJ/croj-judging-server/pkg/config"
@@ -24,12 +29,126 @@ type EventProcessor interface {
 	ProcessEvent(context.Context, model.SubmissionRequested) error
 }
 
+type hostLookup interface {
+	LookupHost(context.Context, string) ([]string, error)
+}
+
+type nameServerEndpoint struct {
+	host      string
+	port      string
+	ipLiteral bool
+}
+
+// rocketMQNameServerResolver allows RocketMQ to consume Kubernetes Service DNS
+// names while still giving the client the IP:port values required by v2.1.2.
+// RocketMQ refreshes NsResolver in the background, so a Service endpoint change
+// is picked up without restarting the judge.
+type rocketMQNameServerResolver struct {
+	endpoints   []nameServerEndpoint
+	lookup      hostLookup
+	timeout     time.Duration
+	description string
+
+	mu       sync.RWMutex
+	lastGood []string
+}
+
+func newRocketMQNameServerResolver(raw string, lookup hostLookup) (*rocketMQNameServerResolver, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, fmt.Errorf("rocketmq name-server is not configured")
+	}
+	if lookup == nil {
+		lookup = net.DefaultResolver
+	}
+
+	parts := strings.Split(raw, ";")
+	endpoints := make([]nameServerEndpoint, 0, len(parts))
+	for _, part := range parts {
+		address := strings.TrimSpace(part)
+		if address == "" {
+			return nil, fmt.Errorf("rocketmq name-server contains an empty endpoint")
+		}
+		host, port, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, fmt.Errorf("invalid rocketmq name-server endpoint %q: %w", address, err)
+		}
+		if host == "" || port == "" {
+			return nil, fmt.Errorf("invalid rocketmq name-server endpoint %q", address)
+		}
+		endpoints = append(endpoints, nameServerEndpoint{
+			host:      host,
+			port:      port,
+			ipLiteral: net.ParseIP(host) != nil,
+		})
+	}
+
+	return &rocketMQNameServerResolver{
+		endpoints:   endpoints,
+		lookup:      lookup,
+		timeout:     5 * time.Second,
+		description: "DNS-aware RocketMQ name-server resolver",
+	}, nil
+}
+
+func (resolver *rocketMQNameServerResolver) Resolve() []string {
+	ctx, cancel := context.WithTimeout(context.Background(), resolver.timeout)
+	defer cancel()
+
+	resolved := make(map[string]struct{})
+	for _, endpoint := range resolver.endpoints {
+		if endpoint.ipLiteral {
+			resolved[net.JoinHostPort(endpoint.host, endpoint.port)] = struct{}{}
+			continue
+		}
+
+		addresses, err := resolver.lookup.LookupHost(ctx, endpoint.host)
+		if err != nil {
+			log.Printf("rocketmq name-server DNS refresh failed for %s: %v", endpoint.host, err)
+			return resolver.lastKnownGood()
+		}
+		if len(addresses) == 0 {
+			log.Printf("rocketmq name-server DNS refresh returned no addresses for %s", endpoint.host)
+			return resolver.lastKnownGood()
+		}
+		for _, address := range addresses {
+			ip := net.ParseIP(strings.TrimSpace(address))
+			if ip == nil {
+				log.Printf("rocketmq name-server DNS refresh returned invalid IP for %s", endpoint.host)
+				return resolver.lastKnownGood()
+			}
+			resolved[net.JoinHostPort(ip.String(), endpoint.port)] = struct{}{}
+		}
+	}
+
+	if len(resolved) == 0 {
+		return resolver.lastKnownGood()
+	}
+	addresses := make([]string, 0, len(resolved))
+	for address := range resolved {
+		addresses = append(addresses, address)
+	}
+	sort.Strings(addresses)
+
+	resolver.mu.Lock()
+	resolver.lastGood = append(resolver.lastGood[:0], addresses...)
+	resolver.mu.Unlock()
+	return append([]string(nil), addresses...)
+}
+
+func (resolver *rocketMQNameServerResolver) Description() string {
+	return resolver.description
+}
+
+func (resolver *rocketMQNameServerResolver) lastKnownGood() []string {
+	resolver.mu.RLock()
+	defer resolver.mu.RUnlock()
+	return append([]string(nil), resolver.lastGood...)
+}
+
 // NewRocketMQConsumer 创建一个新的 RocketMQ 消费者
 func NewRocketMQConsumer(cfg config.RocketMQConfig, processor EventProcessor) (*RocketMQConsumer, error) {
 	fmt.Println("Initializing RocketMQ Consumer...")
 
-	// 注意：NameServer 地址需要是 []string 类型
-	namesrvAddr := []string{cfg.NameServer}
 	if cfg.NameServer == "" {
 		return nil, fmt.Errorf("rocketmq name-server is not configured")
 	}
@@ -45,9 +164,13 @@ func NewRocketMQConsumer(cfg config.RocketMQConfig, processor EventProcessor) (*
 	if cfg.Consumer.MaxReconsumeTimes <= 0 {
 		return nil, fmt.Errorf("rocketmq max reconsume times must be positive")
 	}
+	namesrvResolver, err := newRocketMQNameServerResolver(cfg.NameServer, net.DefaultResolver)
+	if err != nil {
+		return nil, err
+	}
 
 	c, err := rocketmq.NewPushConsumer(
-		consumer.WithNameServer(namesrvAddr),
+		consumer.WithNsResolver(namesrvResolver),
 		consumer.WithGroupName(cfg.Consumer.Group), // 使用嵌套的 Group
 		consumer.WithMaxReconsumeTimes(cfg.Consumer.MaxReconsumeTimes),
 	)

@@ -130,7 +130,7 @@ checker 的 stdin 是单个有界 JSON：`schemaVersion`、`caseId`、`input`、
 | --- | --- | --- |
 | `DATABASE_HOST` / `DATABASE_PORT` | MySQL 地址 | YAML |
 | `DATABASE_USERNAME` / `DATABASE_PASSWORD` / `DATABASE_NAME` | MySQL 只读凭据和库名 | YAML / Secret |
-| `ROCKETMQ_NAME_SERVER` | NameServer 地址 | YAML |
+| `ROCKETMQ_NAME_SERVER` | NameServer 地址；支持以分号分隔的 IP 或 Kubernetes Service DNS `host:port` | YAML |
 | `SUBMISSION_TOPIC` / `ROCKETMQ_CONSUMER_GROUP` | 消费主题和消费组 | YAML |
 | `ROCKETMQ_MAX_RECONSUME_TIMES` | 临时失败最大重试次数，超限进入 `%DLQ%<consumer-group>` | YAML |
 | `BACKEND_INTERNAL_URL` | 后端内部地址，必须包含 `/api` | YAML |
@@ -349,7 +349,7 @@ kubectl auth can-i list endpointslices.discovery.k8s.io \
 - `DeadlineExceeded` / `Unavailable`：检查 sandbox gRPC health、`SANDBOX_EXECUTE_TIMEOUT` 和 Pod 是否正在终止；消息会进入重试路径。
 - `forbidden: endpointslices is forbidden`：确认 Deployment 使用正确 ServiceAccount，并应用 RBAC。
 - 集群外无法读取 API：检查 `KUBECONFIG` 指向容器内可见路径，必要时以只读方式挂载 kubeconfig。
-- RocketMQ 消费失败：核对 NameServer、topic 和 consumer group；消息体必须符合上面的 v1 JSON 契约。启动阶段 topic route 尚未传播时进程会重建 consumer 并自动重试，不会关闭已经可用的异步 REST；若持续重试，优先检查 topic 是否由平台 bootstrap job 成功创建。
+- RocketMQ 消费失败：核对 NameServer、topic 和 consumer group；消息体必须符合上面的 v1 JSON 契约。`ROCKETMQ_NAME_SERVER` 可直接使用 Kubernetes Service DNS，Judge 会解析全部 A/AAAA 记录为 RocketMQ client 所需的 `IP:port`，去重排序并随 client 周期刷新；临时 DNS 故障会保留最后一次成功结果，首次解析失败则 fail closed。启动阶段 topic route 尚未传播时进程会重建 consumer 并自动重试，不会关闭已经可用的异步 REST；若持续重试，优先检查 topic 是否由平台 bootstrap job 成功创建。
 - 回调持续 `401`：确认 judging-server 与 backend 引用同一个 `JUDGE_RESULT_SERVICE_TOKEN` Secret；该错误会按 RocketMQ 低频退避并最终进入 DLQ，应配置告警，服务不会记录 token。
 - 回调 `5xx`：消息会重试并复用已缓存结果；检查 backend 健康状态和 `BACKEND_INTERNAL_URL` 的 `/api` context path。
 - MySQL 连接失败：确认只读运行时 Secret 已注入，且数据库结构已由后端 Flyway 迁移完成。

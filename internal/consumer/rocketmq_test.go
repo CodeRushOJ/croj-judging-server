@@ -3,6 +3,7 @@ package consumer
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/CodeRushOJ/croj-judging-server/internal/callback"
@@ -10,6 +11,108 @@ import (
 	rocketconsumer "github.com/apache/rocketmq-client-go/v2/consumer"
 	"github.com/apache/rocketmq-client-go/v2/primitive"
 )
+
+type fakeNameServerResolver struct {
+	addresses map[string][]string
+	err       error
+	lookups   []string
+}
+
+func (resolver *fakeNameServerResolver) LookupHost(_ context.Context, host string) ([]string, error) {
+	resolver.lookups = append(resolver.lookups, host)
+	if resolver.err != nil {
+		return nil, resolver.err
+	}
+	return resolver.addresses[host], nil
+}
+
+func TestResolveRocketMQNameServersExpandsEveryDNSAddressDeterministically(t *testing.T) {
+	resolver := &fakeNameServerResolver{addresses: map[string][]string{
+		"rocketmq.coderushoj.svc": {
+			"2001:db8::2",
+			"10.0.0.12",
+			"10.0.0.11",
+			"10.0.0.12",
+		},
+	}}
+
+	nameservers, err := newRocketMQNameServerResolver(
+		"rocketmq.coderushoj.svc:9876",
+		resolver,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addresses := nameservers.Resolve()
+	expected := []string{"10.0.0.11:9876", "10.0.0.12:9876", "[2001:db8::2]:9876"}
+	if !reflect.DeepEqual(expected, addresses) {
+		t.Fatalf("addresses = %v, want %v", addresses, expected)
+	}
+	if _, err := primitive.NewNamesrvAddr(addresses...); err != nil {
+		t.Fatalf("resolved addresses are rejected by RocketMQ: %v", err)
+	}
+}
+
+func TestResolveRocketMQNameServersPreservesIPInputsWithoutDNS(t *testing.T) {
+	resolver := &fakeNameServerResolver{}
+	nameservers, err := newRocketMQNameServerResolver(
+		"10.0.0.9:9876;[2001:db8::9]:9876",
+		resolver,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addresses := nameservers.Resolve()
+	expected := []string{"10.0.0.9:9876", "[2001:db8::9]:9876"}
+	if !reflect.DeepEqual(expected, addresses) {
+		t.Fatalf("addresses = %v, want %v", addresses, expected)
+	}
+	if len(resolver.lookups) != 0 {
+		t.Fatalf("IP literals unexpectedly used DNS: %v", resolver.lookups)
+	}
+}
+
+func TestResolveRocketMQNameServersFailsClosedWithoutALastKnownGoodAnswer(t *testing.T) {
+	for name, resolver := range map[string]*fakeNameServerResolver{
+		"lookup error": {err: errors.New("DNS unavailable")},
+		"empty answer": {addresses: map[string][]string{}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			nameservers, err := newRocketMQNameServerResolver(
+				"rocketmq.coderushoj.svc:9876",
+				resolver,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if addresses := nameservers.Resolve(); len(addresses) != 0 {
+				t.Fatalf("addresses = %v, want no unsafe fallback", addresses)
+			}
+		})
+	}
+}
+
+func TestResolveRocketMQNameServersRetainsLastKnownGoodOnRefreshFailure(t *testing.T) {
+	resolver := &fakeNameServerResolver{addresses: map[string][]string{
+		"rocketmq.coderushoj.svc": {"10.0.0.11"},
+	}}
+	nameservers, err := newRocketMQNameServerResolver(
+		"rocketmq.coderushoj.svc:9876",
+		resolver,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := []string{"10.0.0.11:9876"}
+	if actual := nameservers.Resolve(); !reflect.DeepEqual(expected, actual) {
+		t.Fatalf("first resolve = %v, want %v", actual, expected)
+	}
+
+	resolver.err = errors.New("temporary DNS failure")
+	if actual := nameservers.Resolve(); !reflect.DeepEqual(expected, actual) {
+		t.Fatalf("failed refresh = %v, want last-known-good %v", actual, expected)
+	}
+}
 
 type fakeEventProcessor struct {
 	event model.SubmissionRequested
