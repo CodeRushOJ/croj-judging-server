@@ -47,3 +47,23 @@ func TestAnnotatedTagPublishesOidcAttestedMultiArchitectureImage(t *testing.T) {
 		t.Error("release workflow must use keyless OIDC provenance instead of requiring a local tag signing key")
 	}
 }
+
+func TestBuildUsesPatchedPinnedGoToolchain(t *testing.T) {
+	workflowBytes, err := os.ReadFile("../../.github/workflows/ci.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dockerfileBytes, err := os.ReadFile("../../Dockerfile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(workflowBytes), "go-version: 1.26.5") {
+		t.Error("CI must use the patched Go 1.26.5 standard library")
+	}
+	if !strings.Contains(
+		string(dockerfileBytes),
+		"FROM golang:1.26.5-bookworm@sha256:1ecb7edf62a0408027bd5729dfd6b1b8766e578e8df93995b225dfd0944eb651 AS build",
+	) {
+		t.Error("production builder must pin the patched multi-architecture Go index")
+	}
+}

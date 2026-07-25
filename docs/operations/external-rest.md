@@ -70,7 +70,7 @@ docker run --rm -d --name croj-judge-mysql84 \
 
 docker run --rm --link croj-judge-mysql84:mysql \
   -e JUDGE_TEST_MYSQL_DSN='root:test-root@tcp(mysql:3306)/judge_test?parseTime=true&loc=UTC' \
-  -v "$PWD:/workspace" -w /workspace golang:1.26.3 \
+  -v "$PWD:/workspace" -w /workspace golang:1.26.5 \
   go test -race ./internal/external ./internal/httpapi ./internal/integration
 
 docker stop croj-judge-mysql84

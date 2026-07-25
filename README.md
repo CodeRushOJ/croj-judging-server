@@ -160,7 +160,7 @@ checker 的 stdin 是单个有界 JSON：`schemaVersion`、`caseId`、`input`、
 docker run --rm \
   -v "$PWD:/workspace" \
   -v coderushoj-go-cache:/go/pkg/mod \
-  -w /workspace golang:1.26.3 \
+  -w /workspace golang:1.26.5 \
   go test -race ./...
 ```
 
@@ -182,7 +182,7 @@ GOPROXY=https://proxy.golang.org,direct go test ./...
 docker run --rm \
   -v "$PWD:/workspace" \
   -v coderushoj-go-cache:/go/pkg/mod \
-  -w /workspace golang:1.26.3 \
+  -w /workspace golang:1.26.5 \
   sh -c 'go vet ./... && CGO_ENABLED=0 go build -trimpath -o /tmp/judging-server ./cmd'
 ```
 
@@ -259,7 +259,7 @@ scripts/ci/test-webhook-mysql84-contract.sh
 scripts/ci/test-webhook-mysql84-contract-self-test.sh
 ```
 
-本机可直接启动带健康检查和独立端口的一次性 MySQL，再运行同一 selector（需要本机 Go 1.26.3）：
+本机可直接启动带健康检查和独立端口的一次性 MySQL，再运行同一 selector（需要本机 Go 1.26.5）：
 
 ```bash
 docker run -d --name croj-webhook-mysql84 -p 33061:3306 \
@@ -316,7 +316,7 @@ docker run --rm -d --name croj-job-mysql \
 
 docker run --rm --link croj-job-mysql:mysql \
   -e JUDGE_TEST_MYSQL_DSN='judge:judge-test@tcp(mysql:3306)/judge_test?parseTime=true&loc=UTC&charset=utf8mb4' \
-  -v "$PWD:/workspace" -w /workspace golang:1.26.3 \
+  -v "$PWD:/workspace" -w /workspace golang:1.26.5 \
   go test -race ./internal/external
 
 docker stop croj-job-mysql
